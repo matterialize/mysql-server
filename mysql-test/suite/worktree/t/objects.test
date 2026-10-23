@@ -75,6 +75,10 @@ CREATE TRIGGER src.t_ai2 AFTER INSERT ON src.t FOR EACH ROW FOLLOWS t_ai
   INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))|
 DELIMITER ;|
 CREATE EVENT src.e1 ON SCHEDULE EVERY 1 HOUR STARTS '2030-01-01 00:00:00' DO DELETE FROM src.audit;
+# A `src.` literal that is not PREPAREd, in each other kind of object.
+CREATE VIEW src.v_lit AS SELECT 'see src.t' AS note;
+CREATE TRIGGER src.t_ad AFTER DELETE ON src.t FOR EACH ROW INSERT INTO audit (msg) VALUES ('deleted from src.t');
+CREATE EVENT src.e_lit ON SCHEDULE EVERY 1 DAY DISABLE DO INSERT INTO src.audit (msg) VALUES ('ran src.e_lit');
 
 CREATE WORKTREE wt FROM src;
 SHOW WARNINGS;

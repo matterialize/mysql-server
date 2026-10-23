@@ -69,16 +69,25 @@ END|
 CREATE TRIGGER src.t_ai2 AFTER INSERT ON src.t FOR EACH ROW FOLLOWS t_ai
 INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))|
 CREATE EVENT src.e1 ON SCHEDULE EVERY 1 HOUR STARTS '2030-01-01 00:00:00' DO DELETE FROM src.audit;
+CREATE VIEW src.v_lit AS SELECT 'see src.t' AS note;
+CREATE TRIGGER src.t_ad AFTER DELETE ON src.t FOR EACH ROW INSERT INTO audit (msg) VALUES ('deleted from src.t');
+CREATE EVENT src.e_lit ON SCHEDULE EVERY 1 DAY DISABLE DO INSERT INTO src.audit (msg) VALUES ('ran src.e_lit');
 CREATE WORKTREE wt FROM src;
 Warnings:
+Warning	1105	CREATE WORKTREE: trigger wt.t_ad has `src.` inside a string literal that is not PREPAREd; it still refers to src
+Warning	1105	CREATE WORKTREE: view wt.v_lit has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_concat uses the schema name 'src' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
 Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
+Warning	1105	CREATE WORKTREE: event wt.e_lit has `src.` inside a string literal that is not PREPAREd; it still refers to src
 SHOW WARNINGS;
 Level	Code	Message
+Warning	1105	CREATE WORKTREE: trigger wt.t_ad has `src.` inside a string literal that is not PREPAREd; it still refers to src
+Warning	1105	CREATE WORKTREE: view wt.v_lit has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_concat uses the schema name 'src' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
 Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
+Warning	1105	CREATE WORKTREE: event wt.e_lit has `src.` inside a string literal that is not PREPAREd; it still refers to src
 SHOW FULL TABLES FROM wt;
 Tables_in_wt	Table_type
 audit	BASE TABLE
@@ -89,6 +98,7 @@ v2	VIEW
 v3	VIEW
 v4	VIEW
 v5	VIEW
+v_lit	VIEW
 SHOW CREATE VIEW wt.v1;
 View	Create View	character_set_client	collation_connection
 v1	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v1` AS select `wt`.`t`.`id` AS `id`,`wt`.`t`.`v` AS `v` from `wt`.`t`	utf8mb4	utf8mb4_0900_ai_ci
@@ -169,12 +179,15 @@ t_ai	AFTER	1	BEGIN
 INSERT INTO wt.audit (msg) VALUES (CONCAT('ins ', NEW.id));
 UPDATE wt.counter SET n = n + 1;
 END
+t_ad	AFTER	1	INSERT INTO audit (msg) VALUES ('deleted from src.t')
 t_ai2	AFTER	2	INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))
 SELECT EVENT_NAME, STATUS, EVENT_DEFINITION FROM INFORMATION_SCHEMA.EVENTS
 WHERE EVENT_SCHEMA IN ('src', 'wt') ORDER BY EVENT_SCHEMA;
 EVENT_NAME	STATUS	EVENT_DEFINITION
 e1	ENABLED	DELETE FROM src.audit
+e_lit	DISABLED	INSERT INTO src.audit (msg) VALUES ('ran src.e_lit')
 e1	DISABLED	DELETE FROM wt.audit
+e_lit	DISABLED	INSERT INTO wt.audit (msg) VALUES ('ran src.e_lit')
 # The two sides diverge; triggers and routines act on their own side.
 INSERT INTO src.t VALUES (3, 'c');
 INSERT INTO wt.t VALUES (10, 'x'), (11, 'y'), (12, 'z');
@@ -328,13 +341,16 @@ id	msg
 SELECT EVENT_NAME, STATUS FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt';
 EVENT_NAME	STATUS
 e1	DISABLED
+e_lit	DISABLED
 # A cloned event is enabled by hand, on the worktree only.
 ALTER EVENT wt.e1 ENABLE;
 SELECT EVENT_SCHEMA, EVENT_NAME, STATUS, EVENT_DEFINITION FROM INFORMATION_SCHEMA.EVENTS
 WHERE EVENT_SCHEMA IN ('src', 'wt') ORDER BY EVENT_SCHEMA;
 EVENT_SCHEMA	EVENT_NAME	STATUS	EVENT_DEFINITION
 src	e1	ENABLED	DELETE FROM src.audit
+src	e_lit	DISABLED	INSERT INTO src.audit (msg) VALUES ('ran src.e_lit')
 wt	e1	ENABLED	DELETE FROM wt.audit
+wt	e_lit	DISABLED	INSERT INTO wt.audit (msg) VALUES ('ran src.e_lit')
 DROP DATABASE wt2;
 DROP DATABASE wt;
 DROP DATABASE src;
