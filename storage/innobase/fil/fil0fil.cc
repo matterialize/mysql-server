@@ -2940,15 +2940,18 @@ bool Fil_shard::open_file(fil_node_t *file) {
     if (space->purpose == FIL_TYPE_TABLESPACE && file == &space->files.front() &&
         fsp_is_file_per_table(space->id, space->flags)) {
       /* Worktree map: must be known before any page of the space is read. */
-      auto page0 = static_cast<byte *>(
-          ut::aligned_alloc(UNIV_PAGE_SIZE_MAX, UNIV_PAGE_SIZE_MAX));
       const page_size_t page_size(space->flags);
+      const ulint len = page_size.physical();
+      auto pages = static_cast<byte *>(ut::aligned_alloc(2 * len, len));
       IORequest request(IORequest::READ);
-      if (os_file_read(request, file->name, file->handle, page0, 0,
-                       page_size.physical()) == DB_SUCCESS) {
-        fil_wt_load(space, page0);
+      if (os_file_read(request, file->name, file->handle, pages, 0, len) ==
+          DB_SUCCESS) {
+        const bool have1 = os_file_get_size(file->handle) >= 2 * len &&
+                           os_file_read(request, file->name, file->handle,
+                                        pages + len, len, len) == DB_SUCCESS;
+        fil_wt_load(space, pages, have1 ? pages + len : nullptr);
       }
-      ut::aligned_free(page0);
+      ut::aligned_free(pages);
     } else {
       space->wt_map_loaded = true;
     }
@@ -9854,6 +9857,15 @@ bool Dirs_in_datadir::contains(const std::string &discovered_dir) const {
 /** Lookup the tablespace ID.
 @param[in]      space_id                Tablespace ID to lookup
 @return true if the space ID is known. */
+bool fil_space_scanned_elsewhere(space_id_t space_id, const std::string &path) {
+  const auto result = fil_system->get_scanned_filename_by_space_id(space_id);
+  if (result.second == nullptr) return false;
+  for (const auto &name : *result.second) {
+    if (Fil_path::is_same_as(result.first + name, path)) return false;
+  }
+  return true;
+}
+
 bool fil_tablespace_lookup_for_recovery(space_id_t space_id) {
   return fil_system->lookup_for_recovery(space_id);
 }

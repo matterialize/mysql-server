@@ -36,6 +36,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "dict0dd.h"
 #include "fil0fil.h"
 #include "fsp0file.h"
+#include "fil0wt.h"
 #include "fsp0sysspace.h"
 #include "fsp0types.h"
 #include "os0file.h"
@@ -816,6 +817,20 @@ dberr_t Datafile::find_space_id() {
         compressed_ok = !reporter.is_corrupted();
       }
 
+      /* A worktree's untouched pages carry an ancestor's id, so a vote would
+      pick the ancestor and restore the ancestor's page 0 over ours. The map
+      copy in page 1 names the file's own id (fork-design.md §10.1 item 4). */
+      space_id_t wt_self;
+      std::vector<space_id_t> wt_ancestors;
+      if (j == 1 && noncompressed_ok &&
+          wt_page1_self(page, univ_page_size, &wt_self, &wt_ancestors)) {
+        ib::info() << "Datafile '" << m_filepath << "' is a worktree; its "
+                   << "own space id " << wt_self << " is taken from page 1";
+        ut::aligned_free(page);
+        m_space_id = wt_self;
+        return DB_SUCCESS;
+      }
+
       if (noncompressed_ok || compressed_ok || encrypted) {
         space_id_t space_id = mach_read_from_4(page + FIL_PAGE_SPACE_ID);
 
@@ -845,6 +860,15 @@ dberr_t Datafile::find_space_id() {
             << "space_id:" << it->first
             << ", Number of pages matched: " << it->second << "/" << valid_pages
             << " (" << page_size << ")";
+
+        /* Without the page-1 copy, never pick an id that belongs to another
+        file: in a worktree that is the ancestor. */
+        if (it->second == (valid_pages - missed) &&
+            fil_space_scanned_elsewhere(it->first, m_filepath)) {
+          ib::warn() << "Datafile '" << m_filepath << "': space id "
+                     << it->first << " belongs to another file; not chosen";
+          continue;
+        }
 
         if (it->second == (valid_pages - missed)) {
           ib::info(ER_IB_MSG_411) << "Chosen space:" << it->first;

@@ -27,6 +27,24 @@
 #include "sql/dd/types/schema.h"
 #include "sql/dd/types/table.h"
 #include "sql/dd/types/view.h"
+#include "sql/dd/impl/types/column_impl.h"
+#include "sql/dd/impl/types/event_impl.h"
+#include "sql/dd/impl/types/parameter_impl.h"
+#include "sql/dd/impl/types/routine_impl.h"
+#include "sql/dd/impl/types/view_impl.h"
+#include "sql/dd/types/function.h"
+#include "sql/dd/types/parameter.h"
+#include "sql/dd/types/procedure.h"
+#include "sql/dd/types/trigger.h"
+#include "sql/dd/types/view_routine.h"
+#include "sql/dd/types/view_table.h"
+#include "scope_guard.h"
+#include "sql/auth/sql_security_ctx.h"
+#include "sql/derror.h"
+#include "sql/sp_head.h"
+#include "sql/sp_rcontext.h"
+#include "sql/sql_error.h"
+#include "sql/system_variables.h"
 #include "sql/handler.h"
 #include "sql/mdl.h"
 #include "sql/mysqld.h"
@@ -82,6 +100,220 @@ Table_names in_schema(const char *db, const std::vector<std::string> &names) {
   return tables;
 }
 
+bool same_schema_name(const std::string &a, const char *b) {
+  return lower_case_table_names == 0
+             ? a == b
+             : my_strcasecmp(system_charset_info, a.c_str(), b) == 0;
+}
+
+}  // namespace
+
+Remap_result remap_schema(const std::string &in, const char *src,
+                          const char *dst, ulonglong sql_mode,
+                          const std::function<bool(const std::string &)> &exists) {
+  enum Kind { IDENT, QIDENT, STRING, DOT, OTHER };
+  struct Tok {
+    size_t b, e;
+    Kind kind;
+    std::string value;  // unquoted
+    char quote;
+  };
+  const bool ansi = sql_mode & MODE_ANSI_QUOTES;
+  const bool no_bs = sql_mode & MODE_NO_BACKSLASH_ESCAPES;
+  const auto ident_char = [](unsigned char c) {
+    return isalnum(c) || c == '_' || c == '$' || c >= 0x80;
+  };
+
+  std::vector<Tok> toks;
+  const size_t n = in.size();
+  bool in_versioned = false;  // inside /*! ... */, which is executed SQL
+  for (size_t i = 0; i < n;) {
+    const char c = in[i];
+    if (isspace(static_cast<unsigned char>(c))) {
+      ++i;
+    } else if (c == '#' ||
+               (c == '-' && i + 2 <= n && in[i + 1] == '-' &&
+                (i + 2 == n || isspace(static_cast<unsigned char>(in[i + 2])) ||
+                 iscntrl(static_cast<unsigned char>(in[i + 2]))))) {
+      while (i < n && in[i] != '\n') ++i;
+    } else if (c == '/' && i + 1 < n && in[i + 1] == '*') {
+      if (i + 2 < n && (in[i + 2] == '!' || in[i + 2] == '+')) {
+        i += 3;
+        while (i < n && isdigit(static_cast<unsigned char>(in[i]))) ++i;
+        in_versioned = true;
+      } else {
+        const size_t end = in.find("*/", i + 2);
+        i = end == std::string::npos ? n : end + 2;
+      }
+    } else if (in_versioned && c == '*' && i + 1 < n && in[i + 1] == '/') {
+      in_versioned = false;
+      i += 2;
+    } else if (c == '`' || (ansi && c == '"')) {
+      Tok t{i, 0, QIDENT, "", c};
+      for (++i; i < n; ++i) {
+        if (in[i] == c) {
+          if (i + 1 < n && in[i + 1] == c) {
+            t.value += c;
+            ++i;
+            continue;
+          }
+          break;
+        }
+        t.value += in[i];
+      }
+      t.e = ++i;
+      toks.push_back(t);
+    } else if (c == '\'' || c == '"') {
+      Tok t{i, 0, STRING, "", c};
+      for (++i; i < n; ++i) {
+        if (in[i] == '\\' && !no_bs && i + 1 < n) {
+          t.value += in[++i];
+          continue;
+        }
+        if (in[i] == c) {
+          if (i + 1 < n && in[i + 1] == c) {
+            t.value += c;
+            ++i;
+            continue;
+          }
+          break;
+        }
+        t.value += in[i];
+      }
+      t.e = ++i;
+      toks.push_back(t);
+    } else if (ident_char(static_cast<unsigned char>(c))) {
+      Tok t{i, 0, IDENT, "", 0};
+      while (i < n && ident_char(static_cast<unsigned char>(in[i]))) t.value += in[i++];
+      t.e = i;
+      toks.push_back(t);
+    } else {
+      toks.push_back(Tok{i, i + 1, c == '.' ? DOT : OTHER, std::string(1, c), 0});
+      ++i;
+    }
+  }
+
+  Remap_result r;
+  const std::string src_dot = std::string(src) + ".";
+  std::vector<std::pair<size_t, size_t>> spans;  // tokens to replace
+  for (size_t k = 0; k < toks.size(); ++k) {
+    const Tok &t = toks[k];
+    if (t.kind == STRING) {
+      std::string lower = t.value, needle = src_dot;
+      for (auto &ch : lower) ch = tolower(static_cast<unsigned char>(ch));
+      for (auto &ch : needle) ch = tolower(static_cast<unsigned char>(ch));
+      if (lower.find(needle) != std::string::npos ||
+          lower.find("`" + needle.substr(0, needle.size() - 1) + "`.") !=
+              std::string::npos)
+        r.literal_with_src = true;
+      else if (same_schema_name(t.value, src))
+        r.literal_is_src = true;
+      continue;
+    }
+    if ((t.kind != IDENT && t.kind != QIDENT) || !same_schema_name(t.value, src))
+      continue;
+    const bool qualifies = k + 2 < toks.size() && toks[k + 1].kind == DOT &&
+                           (toks[k + 2].kind == IDENT || toks[k + 2].kind == QIDENT);
+    const bool after_dot = k > 0 && toks[k - 1].kind == DOT;
+    if (!qualifies || after_dot) {
+      r.src_as_name = true;  // a table, column or alias that is also named src
+      continue;
+    }
+    if (exists && !exists(toks[k + 2].value)) continue;
+    spans.emplace_back(k, 0);
+  }
+
+  std::string quoted_dst;
+  bool plain = *dst != 0 && !isdigit(static_cast<unsigned char>(*dst));
+  for (const char *p = dst; *p; ++p) plain &= ident_char(static_cast<unsigned char>(*p));
+  size_t pos = 0;
+  for (auto &[k, unused] : spans) {
+    const Tok &t = toks[k];
+    r.text.append(in, pos, t.b - pos);
+    const char q = t.kind == QIDENT ? t.quote : (plain ? 0 : '`');
+    if (q == 0) {
+      r.text += dst;
+    } else {
+      r.text += q;
+      for (const char *p = dst; *p; ++p) {
+        if (*p == q) r.text += q;
+        r.text += *p;
+      }
+      r.text += q;
+    }
+    pos = t.e;
+    ++r.remapped;
+  }
+  r.text.append(in, pos, std::string::npos);
+  return r;
+}
+
+namespace {
+
+/** Remap one stored body, reporting what clone-time remapping cannot cover. */
+dd::String_type remap_body(THD *thd, const char *kind, const char *wt,
+                           const dd::String_type &name, const dd::String_type &body,
+                           ulonglong sql_mode, const char *src, bool *warned) {
+  const Remap_result r = remap_schema(body.c_str(), src, wt, sql_mode);
+  if (!*warned) {
+    const std::string lower = [&] {
+      std::string l(body.c_str());
+      for (auto &ch : l) ch = tolower(static_cast<unsigned char>(ch));
+      return l;
+    }();
+    const bool prepares = lower.find("prepare") != std::string::npos;
+    if (r.literal_with_src && !prepares) {
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+          "CREATE WORKTREE: %s %s.%s has `%s.` inside a string literal that is "
+          "not PREPAREd; it still refers to %s",
+          kind, wt, name.c_str(), src, src);
+      *warned = true;
+    } else if (r.literal_is_src) {
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+          "CREATE WORKTREE: %s %s.%s uses the schema name '%s' as data (e.g. "
+          "compared with DATABASE() or *_SCHEMA); it is not remapped",
+          kind, wt, name.c_str(), src);
+      *warned = true;
+    } else if (r.src_as_name) {
+      push_warning_printf(
+          thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+          "CREATE WORKTREE: %s %s.%s also uses `%s` as a table, column or alias "
+          "name; check its remapped references",
+          kind, wt, name.c_str(), src);
+      *warned = true;
+    }
+  }
+  return dd::String_type(r.text.c_str(), r.text.size());
+}
+
+/** Cloned objects keep their definer. Creating an object for someone else
+needs SET_ANY_DEFINER (or SUPER), as CREATE ... DEFINER= does. */
+bool check_definer(THD *thd, const dd::String_type &user,
+                   const dd::String_type &host) {
+  Security_context *sctx = thd->security_context();
+  if (strcmp(sctx->priv_user().str, user.c_str()) == 0 &&
+      my_strcasecmp(system_charset_info, sctx->priv_host().str, host.c_str()) == 0)
+    return false;
+  if (sctx->has_global_grant(STRING_WITH_LEN("SET_ANY_DEFINER")).first ||
+      sctx->check_access(SUPER_ACL))
+    return false;
+  my_error(ER_SPECIFIC_ACCESS_DENIED_ERROR, MYF(0), "SET_ANY_DEFINER");
+  return true;
+}
+
+bool lock_objects(THD *thd, const std::vector<MDL_key> &keys) {
+  MDL_request_list reqs;
+  for (const auto &key : keys) {
+    auto *r = new (thd->mem_root) MDL_request;
+    if (r == nullptr) return true;
+    MDL_REQUEST_INIT_BY_KEY(r, &key, MDL_EXCLUSIVE, MDL_TRANSACTION);
+    reqs.push_front(r);
+  }
+  return thd->mdl_context.acquire_locks(&reqs, thd->variables.lock_wait_timeout);
+}
+
 }  // namespace
 
 bool Sql_cmd_create_worktree::execute(THD *thd) {
@@ -126,22 +358,34 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     return true;
   }
 
-  /* Views, routines, events and triggers can name the source schema in their
-  bodies; remapping them is not implemented yet (fork-design.md §10.6). */
-  {
-    std::vector<const dd::View *> views;
-    std::vector<const dd::Routine *> routines;
-    std::vector<dd::String_type> events;
-    if (dc.fetch_schema_components(src_schema, &views) ||
-        dc.fetch_schema_components(src_schema, &routines) ||
-        dc.fetch_schema_component_names<dd::Event>(src_schema, &events))
-      return true;
-    if (!views.empty())
-      return unsupported("CREATE WORKTREE of a schema with views");
-    if (!routines.empty())
-      return unsupported("CREATE WORKTREE of a schema with stored routines");
-    if (!events.empty())
-      return unsupported("CREATE WORKTREE of a schema with events");
+  /* Views, routines and events are cloned with `src.` references remapped
+(fork-design.md §10.6); the S lock above keeps them stable. */
+  std::vector<const dd::View *> views;
+  std::vector<const dd::Routine *> routines;
+  std::vector<const dd::Event *> events;
+  if (dc.fetch_schema_components(src_schema, &views) ||
+      dc.fetch_schema_components(src_schema, &routines) ||
+      dc.fetch_schema_components(src_schema, &events))
+    return true;
+  const auto need = [&](Access_bitmask acl) {
+    return check_access(thd, acl, wt, nullptr, nullptr, true, false);
+  };
+  if ((!views.empty() && (need(CREATE_VIEW_ACL) ||
+                          check_access(thd, SHOW_VIEW_ACL, src, nullptr,
+                                       nullptr, true, false))) ||
+      (!routines.empty() && need(CREATE_PROC_ACL)) ||
+      (!events.empty() && need(EVENT_ACL)))
+    return true;
+  for (const dd::View *v : views) {
+    if (check_definer(thd, v->definer_user(), v->definer_host())) return true;
+  }
+  for (const dd::Routine *r : routines) {
+    if (r->type() == dd::Routine::RT_LIBRARY)
+      return unsupported("CREATE WORKTREE of a schema with JavaScript libraries");
+    if (check_definer(thd, r->definer_user(), r->definer_host())) return true;
+  }
+  for (const dd::Event *e : events) {
+    if (check_definer(thd, e->definer_user(), e->definer_host())) return true;
   }
 
   std::vector<std::string> names;
@@ -182,10 +426,13 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     assert(t != nullptr);
     if (my_strcasecmp(system_charset_info, t->engine().c_str(), "InnoDB") != 0)
       return unsupported("CREATE WORKTREE of a schema with non-InnoDB tables");
-    if (t->partition_type() != dd::Table::PT_NONE)
-      return unsupported("CREATE WORKTREE of partitioned tables");
-    if (t->has_trigger())
-      return unsupported("CREATE WORKTREE of a schema with triggers");
+    if (t->has_trigger()) {
+      if (need(TRIGGER_ACL)) return true;
+      for (const dd::Trigger *tr : t->triggers()) {
+        if (check_definer(thd, tr->definer_user(), tr->definer_host()))
+          return true;
+      }
+    }
     src_tables.push_back(t);
   }
 
@@ -244,8 +491,102 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
         return unsupported("CREATE WORKTREE for this storage engine");
       if (hton->clone_table(hton, thd, *src_table, dst.get(), wt)) return true;
 
+      /* Triggers are not in the SDI; copy them (with fresh ids) and remap. */
+      if (src_table->has_trigger()) {
+        dst->copy_triggers(src_table);
+        for (dd::Trigger *tr : *dst->triggers()) {
+          bool warned = false;
+          tr->set_action_statement(remap_body(thd, "trigger", wt, tr->name(),
+                                              tr->action_statement(),
+                                              tr->sql_mode(), src, &warned));
+          tr->set_action_statement_utf8(remap_body(
+              thd, "trigger", wt, tr->name(), tr->action_statement_utf8(),
+              tr->sql_mode(), src, &warned));
+        }
+      }
+
       if (dc.store(dst.get())) return true;
     }
+
+    std::vector<MDL_key> keys;
+    for (const dd::View *v : views) {
+      keys.emplace_back();
+      keys.back().mdl_key_init(MDL_key::TABLE, mdl_name(thd, wt),
+                               mdl_name(thd, v->name().c_str()));
+    }
+    for (const dd::Routine *r : routines) {
+      keys.emplace_back();
+      dd::Routine::create_mdl_key(r->type(), wt, r->name(), &keys.back());
+    }
+    for (const dd::Event *e : events) {
+      keys.emplace_back();
+      dd::Event::create_mdl_key(wt, e->name(), &keys.back());
+    }
+    if (lock_objects(thd, keys)) return true;
+
+    /* Deep copies with fresh object ids (clone() keeps them), moved to wt,
+    with `src.` references spliced to `wt.` at their exact token positions. */
+    for (const dd::View *src_view : views) {
+      std::unique_ptr<dd::View> v(src_view->clone());
+      dynamic_cast<dd::View_impl *>(v.get())->set_id(dd::INVALID_OBJECT_ID);
+      for (dd::Column *c : *v->columns())
+        dynamic_cast<dd::Column_impl *>(c)->set_id(dd::INVALID_OBJECT_ID);
+      v->set_schema_id(wt_schema->id());
+      bool warned = false;
+      const ulonglong mode = thd->variables.sql_mode & ~MODE_ANSI_QUOTES;
+      v->set_definition(remap_body(thd, "view", wt, v->name(), v->definition(),
+                                   mode, src, &warned));
+      v->set_definition_utf8(remap_body(thd, "view", wt, v->name(),
+                                        v->definition_utf8(), mode, src, &warned));
+      for (const dd::View_table *vt : v->tables()) {
+        if (same_schema_name(vt->table_schema().c_str(), src))
+          const_cast<dd::View_table *>(vt)->set_table_schema(wt);
+      }
+      for (const dd::View_routine *vr : v->routines()) {
+        if (same_schema_name(vr->routine_schema().c_str(), src))
+          const_cast<dd::View_routine *>(vr)->set_routine_schema(wt);
+      }
+      if (dc.store(v.get())) return true;
+    }
+    for (const dd::Routine *src_routine : routines) {
+      std::unique_ptr<dd::Routine> r(src_routine->clone());
+      dynamic_cast<dd::Routine_impl *>(r.get())->set_id(dd::INVALID_OBJECT_ID);
+      for (const dd::Parameter *prm : r->parameters())
+        dynamic_cast<dd::Parameter_impl *>(const_cast<dd::Parameter *>(prm))
+            ->set_id(dd::INVALID_OBJECT_ID);
+      r->set_schema_id(wt_schema->id());
+      bool warned = false;
+      r->set_definition(remap_body(thd, "routine", wt, r->name(), r->definition(),
+                                   r->sql_mode(), src, &warned));
+      r->set_definition_utf8(remap_body(thd, "routine", wt, r->name(),
+                                        r->definition_utf8(), r->sql_mode(), src,
+                                        &warned));
+      const bool fail = r->type() == dd::Routine::RT_FUNCTION
+                            ? dc.store(dynamic_cast<dd::Function *>(r.get()))
+                            : dc.store(dynamic_cast<dd::Procedure *>(r.get()));
+      if (fail) return true;
+    }
+    for (const dd::Event *src_event : events) {
+      std::unique_ptr<dd::Event> e(src_event->clone());
+      dynamic_cast<dd::Event_impl *>(e.get())->set_id(dd::INVALID_OBJECT_ID);
+      e->set_schema_id(wt_schema->id());
+      /* Never run a copy of the source's jobs by surprise (§10.6). */
+      e->set_event_status(dd::Event::ES_DISABLED);
+      bool warned = false;
+      e->set_definition(remap_body(thd, "event", wt, e->name(), e->definition(),
+                                   e->sql_mode(), src, &warned));
+      e->set_definition_utf8(remap_body(thd, "event", wt, e->name(),
+                                        e->definition_utf8(), e->sql_mode(), src,
+                                        &warned));
+      if (dc.store(e.get())) return true;
+    }
+
+    /* Lineage: the runtime remap of dynamic SQL inside cloned objects. */
+    dd::Schema *wt_mod = nullptr;
+    if (dc.acquire_for_modification(wt, &wt_mod) || wt_mod == nullptr)
+      return true;
+    wt_mod->options().set("worktree_of", src);
+    if (dc.update(wt_mod)) return true;
 
     /* The deserialized parents do not know about their (also new) children
     yet; rebuild that from the stored foreign keys. */
@@ -279,4 +620,60 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
 
   DBUG_EXECUTE_IF("wt_crash_after_commit", DBUG_SUICIDE(););
   return false;
+}
+
+const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
+                                       size_t *query_len) {
+  /* Only PREPARE issued inside a stored program of a worktree; top-level user
+  SQL is never remapped (fork-design.md §10.6). */
+  if (thd->sp_runtime_ctx == nullptr || thd->sp_runtime_ctx->sp == nullptr)
+    return query;
+  const LEX_STRING &db = thd->sp_runtime_ctx->sp->m_db;
+  if (db.length == 0) return query;
+
+  /* The lock must outlive the releaser of the DD objects acquired under it. */
+  MDL_ticket *ticket = nullptr;
+  auto release = create_scope_guard([&]() {
+    if (ticket != nullptr) thd->mdl_context.release_lock(ticket);
+  });
+  if (dd::mdl_lock_schema(thd, db.str, MDL_EXPLICIT, &ticket)) {
+    thd->clear_error();
+    return query;
+  }
+  dd::cache::Dictionary_client &dc = *thd->dd_client();
+  const dd::cache::Dictionary_client::Auto_releaser releaser(&dc);
+  const dd::Schema *schema = nullptr;
+  dd::String_type src;
+  if (dc.acquire(db.str, &schema) || schema == nullptr ||
+      !schema->options().exists("worktree_of") ||
+      schema->options().get("worktree_of", &src)) {
+    thd->clear_error();
+    return query;
+  }
+
+  /* Remap src.x only if the worktree has x (a table, view or routine). */
+  std::vector<dd::String_type> names, procs, funcs;
+  if (dc.fetch_schema_component_names<dd::Abstract_table>(schema, &names) ||
+      dc.fetch_schema_component_names<dd::Procedure>(schema, &procs) ||
+      dc.fetch_schema_component_names<dd::Function>(schema, &funcs)) {
+    thd->clear_error();
+    return query;
+  }
+  names.insert(names.end(), procs.begin(), procs.end());
+  names.insert(names.end(), funcs.begin(), funcs.end());
+  const auto exists = [&](const std::string &name) {
+    for (const auto &n : names) {
+      if (my_strcasecmp(table_alias_charset, n.c_str(), name.c_str()) == 0)
+        return true;
+    }
+    return false;
+  };
+  const Remap_result r = remap_schema(std::string(query, *query_len),
+                                      src.c_str(), db.str,
+                                      thd->variables.sql_mode, exists);
+  if (r.remapped == 0) return query;
+  char *out = thd->strmake(r.text.c_str(), r.text.size());
+  if (out == nullptr) return query;
+  *query_len = r.text.size();
+  return out;
 }

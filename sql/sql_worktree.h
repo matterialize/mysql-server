@@ -11,7 +11,38 @@
 #include "my_sqlcommand.h"
 #include "sql/sql_cmd_ddl.h"
 
+#include <functional>
+#include <string>
+
 class THD;
+
+/** Result of splicing a schema name in SQL text. */
+struct Remap_result {
+  std::string text;
+  int remapped{0};
+  bool literal_with_src{false};  ///< "src." inside a string literal
+  bool literal_is_src{false};    ///< the literal 'src' (schema name as data)
+  bool src_as_name{false};       ///< `src` used other than as a qualifier
+};
+
+/**
+  Replace every identifier naming schema src that qualifies another identifier
+  (src.t, `src`.`t`.`c`) with dst, keeping its quoting. String literals and
+  comments are not touched (versioned comments are code). If exists is given,
+  only src.x with exists(x) is remapped.
+*/
+Remap_result remap_schema(
+    const std::string &in, const char *src, const char *dst,
+    unsigned long long sql_mode,
+    const std::function<bool(const std::string &)> &exists = nullptr);
+
+/**
+  PREPARE inside a stored program of a worktree: remap src. references to
+  objects the worktree has. Returns query, or a remapped copy on thd's
+  mem_root (query_len updated).
+*/
+const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
+                                       size_t *query_len);
 
 /**
   CREATE WORKTREE wt FROM src: a new schema whose tables are copy-on-write

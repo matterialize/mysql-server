@@ -27,6 +27,9 @@ Free Software Foundation.
 #include "api0misc.h"
 #include "dict0boot.h"
 #include "dict0dd.h"
+#include "fts0fts.h"
+#include "fts0priv.h"
+#include "fts0types.h"
 #include "fil0wt.h"
 #include "fsp0fsp.h"
 #include "ha_innodb.h"
@@ -36,13 +39,23 @@ Free Software Foundation.
 #include "my_dbug.h"
 #include "mysqld_error.h"
 #include "scope_guard.h"
+#include "sql/dd/dd.h"
+#include "sql/dd/dictionary.h"
+#include "sql/dd/impl/sdi.h"
 #include "sql/dd/types/column.h"
+#include "sql/dd/types/partition.h"
+#include "sql/dd/types/partition_index.h"
+#include "sql/dd/types/schema.h"
+#include "sql/dd/types/table.h"
 #include "sql/dd/types/foreign_key.h"
 #include "sql/dd/types/index.h"
 #include "sql/sql_table.h"
 #include "srv0start.h"
 #include "trx0purge.h"
 #include "ut0new.h"
+
+/** FTS common auxiliary table suffixes (fts0fts.cc). */
+extern const char *fts_common_tables[];
 
 namespace {
 
@@ -89,28 +102,37 @@ int sync_path(const char *path, int flags) {
   return ret;
 }
 
-/** Rewrite page 0 of the clone: new space id and the ancestor map. */
-bool rewrite_page0(const std::string &path, space_id_t space_id,
-                   space_id_t src_space_id, const page_size_t &page_size,
-                   const std::vector<std::pair<space_index_t, space_index_t>> &ids,
-                   const std::vector<page_no_t> &roots) {
+using Id_map = std::vector<std::pair<space_index_t, space_index_t>>;
+
+/** Rewrite the two header pages of a clone: page 0 (new space id, primary
+ancestor map) and page 1 (the change buffer bitmap: re-stamped, redundant map
+copy, §12.1 H5). Both are fsynced before the file may get its .ibd name. */
+bool rewrite_header_pages(const std::string &path, space_id_t space_id,
+                          space_id_t src_space_id, const page_size_t &page_size,
+                          const Id_map &ids, const std::vector<page_no_t> &roots) {
   int fd = open(path.c_str(), O_RDWR);
   if (fd < 0) return wt_os_error("open", path);
   auto guard = create_scope_guard([fd]() { close(fd); });
 
   const ulint len = page_size.physical();
-  auto page = static_cast<byte *>(ut::aligned_alloc(len, len));
-  auto free_guard = create_scope_guard([page]() { ut::aligned_free(page); });
-  if (pread(fd, page, len, 0) != static_cast<ssize_t>(len))
-    return wt_os_error("read page 0 of", path);
-  ut_a(fsp_header_get_space_id(page) == src_space_id);
+  auto pages = static_cast<byte *>(ut::aligned_alloc(2 * len, len));
+  auto free_guard = create_scope_guard([pages]() { ut::aligned_free(pages); });
+  byte *page0 = pages;
+  byte *page1 = pages + len;
+  if (pread(fd, pages, 2 * len, 0) != static_cast<ssize_t>(2 * len))
+    return wt_os_error("read header pages of", path);
+  ut_a(fsp_header_get_space_id(page0) == src_space_id);
+  ut_a(fil_page_get_type(page1) == FIL_PAGE_IBUF_BITMAP);
 
   /* A worktree of a worktree inherits its source's ancestors; their index ids
   map straight to ours. */
   wt_map_t src_map;
-  const bool src_is_wt = wt_map_read(page, page_size, &src_map);
+  const bool src_is_wt = wt_map_read(page0, page_size, &src_map) ||
+                         wt_map_read(page1, page_size, &src_map);
 
   wt_map_t map;
+  map.self = space_id;
+  map.generation = 1;
   map.ancestors.push_back(src_space_id);
   map.index_map = ids;
   map.roots = roots;
@@ -124,17 +146,264 @@ bool rewrite_page0(const std::string &path, space_id_t space_id,
   }
   std::sort(map.index_map.begin(), map.index_map.end());
 
-  mach_write_to_4(page + FIL_PAGE_SPACE_ID, space_id);
-  mach_write_to_4(page + FSP_HEADER_OFFSET + FSP_SPACE_ID, space_id);
-  if (!wt_map_write(map, page, page_size)) {
-    return wt_error("CREATE WORKTREE: ancestor chain or index count too large");
+  for (byte *page : {page0, page1}) {
+    mach_write_to_4(page + FIL_PAGE_SPACE_ID, space_id);
+    if (!wt_map_write(map, page, page_size)) {
+      return wt_error("CREATE WORKTREE: ancestor chain or index count too large");
+    }
   }
-  wt_page_recalc_checksum(page, page_size);
+  mach_write_to_4(page0 + FSP_HEADER_OFFSET + FSP_SPACE_ID, space_id);
+  wt_page_recalc_checksum(page0, page_size);
+  wt_page_recalc_checksum(page1, page_size);
 
-  if (pwrite(fd, page, len, 0) != static_cast<ssize_t>(len))
-    return wt_os_error("write page 0 of", path);
+  if (pwrite(fd, pages, 2 * len, 0) != static_cast<ssize_t>(2 * len))
+    return wt_os_error("write header pages of", path);
   if (fsync(fd) != 0) return wt_os_error("fsync", path);
   return false;
+}
+
+/** Refuse what the reflink core cannot clone (fork-design.md §10). */
+bool check_clonable(dict_table_t *src) {
+  if (!dict_table_is_file_per_table(src))
+    return wt_error(
+        "CREATE WORKTREE of tables in shared or general tablespaces");
+  if (DICT_TF_GET_ZIP_SSIZE(src->flags) != 0)
+    return wt_error("CREATE WORKTREE of ROW_FORMAT=COMPRESSED tables");
+  if (dd_is_table_in_encrypted_tablespace(src))
+    return wt_error("CREATE WORKTREE of encrypted tables");
+  if (DICT_TF_HAS_DATA_DIR(src->flags))
+    return wt_error("CREATE WORKTREE of tables with DATA DIRECTORY");
+  if (src->ibd_file_missing || dict_table_is_discarded(src) ||
+      src->is_corrupted())
+    return wt_error("CREATE WORKTREE of discarded or corrupted tables");
+  fil_space_t *space = fil_space_acquire(src->space);
+  if (space == nullptr) return wt_error("CREATE WORKTREE: missing tablespace");
+  const bool page_compressed = space->compression_type != Compression::NONE;
+  fil_space_release(space);
+  if (page_compressed)
+    return wt_error("CREATE WORKTREE of tables with COMPRESSION=");
+  return false;
+}
+
+/** What the clone of one InnoDB table (a table, a partition, or an FTS
+auxiliary table) needs for its DD entries. */
+struct Space_clone {
+  dict_table_t *src{};
+  std::string name;  ///< InnoDB name of the clone, "<db>/<table>"
+  table_id_t table_id{};
+  space_id_t space_id{};
+  Id_map ids;  ///< source index id -> clone index id
+  std::vector<page_no_t> roots;
+  std::string path, tmp_path, src_path;
+  dd::Object_id dd_space_id{dd::INVALID_OBJECT_ID};
+};
+
+/** Phase 1 (before the quiesce): new identities and the DDL log entries that
+delete both file names if we roll back or crash before the commit. */
+bool prepare_clone(trx_t *trx, dict_table_t *src, const std::string &name,
+                   Space_clone *c) {
+  if (check_clonable(src)) return true;
+  c->src = src;
+  c->name = name;
+  dict_hdr_get_new_id(&c->table_id, nullptr, &c->space_id, nullptr, false);
+  if (c->space_id == SPACE_UNKNOWN) return wt_error("CREATE WORKTREE: no space id");
+  for (const dict_index_t *index = src->first_index(); index != nullptr;
+       index = index->next()) {
+    space_index_t new_id;
+    dict_hdr_get_new_id(nullptr, &new_id, nullptr, nullptr, false);
+    c->ids.emplace_back(index->id, new_id);
+    c->roots.push_back(index->page);
+  }
+
+  char *path = Fil_path::make_ibd_from_table_name(name);
+  c->path = path;
+  ut::free(path);
+  c->tmp_path = c->path + ".wtclone";
+  char *src_path = fil_space_get_first_path(src->space);
+  c->src_path = src_path;
+  ut::free(src_path);
+
+  for (const auto &p : {c->path, c->tmp_path}) {
+    if (access(p.c_str(), F_OK) == 0) {
+      my_error(ER_TABLESPACE_EXISTS, MYF(0), p.c_str());
+      return true;
+    }
+  }
+  for (const auto &p : {c->tmp_path, c->path}) {
+    if (log_ddl->write_delete_space_log(trx, nullptr, c->space_id, p.c_str(),
+                                        false, false) != DB_SUCCESS) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: DDL log");
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Phase 2 (quiesced): merge the change buffer and flush the source so its
+file is a complete image, then reflink it under the temporary name. */
+bool snapshot_clone(trx_t *trx, Space_clone *c) {
+  const space_id_t space = c->src->space;
+  while (ibuf_merge_space(space) != 0) {
+  }
+  buf_LRU_flush_or_remove_pages(space, BUF_REMOVE_FLUSH_WRITE, trx);
+  fil_flush(space);
+
+  /* The SDI root also has segment headers carrying the space id. */
+  mtr_t mtr;
+  mtr_start(&mtr);
+  c->roots.push_back(
+      fsp_sdi_get_root_page_num(space, page_size_t(c->src->flags), &mtr));
+  mtr_commit(&mtr);
+
+  if (reflink(c->src_path.c_str(), c->tmp_path.c_str()) != 0)
+    return wt_os_error("reflink (APFS clonefile / FICLONE) to", c->tmp_path);
+  return false;
+}
+
+/** Phase 3 (source released): stamp the clone, publish it as an .ibd,
+register it, and create its DD tablespace. */
+bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
+                   dd::Object_id src_dd_space_id, Space_clone *c) {
+  fil_space_t *src_space = fil_space_acquire(c->src->space);
+  const uint32_t fsp_flags = src_space->flags;
+  fil_space_release(src_space);
+  const page_size_t page_size(fsp_flags);
+
+  if (rewrite_header_pages(c->tmp_path, c->space_id, c->src->space, page_size,
+                           c->ids, c->roots))
+    return true;
+  DBUG_EXECUTE_IF("wt_crash_after_page0", DBUG_SUICIDE(););
+  DBUG_EXECUTE_IF("wt_fail_after_page0", {
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+    return true;
+  });
+
+  /* Only now may the startup scan see it as an .ibd (no duplicate space id). */
+  if (rename(c->tmp_path.c_str(), c->path.c_str()) != 0)
+    return wt_os_error("rename", c->tmp_path);
+  const std::string dir = c->path.substr(0, c->path.rfind('/'));
+  if (sync_path(dir.c_str(), O_RDONLY) != 0) return wt_os_error("fsync", dir);
+  DBUG_EXECUTE_IF("wt_crash_after_rename", DBUG_SUICIDE(););
+
+  std::string space_name(c->name);
+  dict_name::convert_to_space(space_name);
+  if (fil_ibd_open(true, FIL_TYPE_TABLESPACE, c->space_id, fsp_flags,
+                   space_name.c_str(), c->path.c_str(), true, false) !=
+      DB_SUCCESS) {
+    my_error(ER_TABLESPACE_MISSING, MYF(0), c->path.c_str());
+    return true;
+  }
+
+  /* The clone still carries the source's SDI records (they name the source
+  schema); drop them. The clone's own are written when its DD objects are
+  stored. FTS auxiliary tables have no SDI. */
+  for (const sdi_key_t &key : {sdi_key_t{SDI_TYPE_TABLE, src_dd_table_id},
+                               sdi_key_t{SDI_TYPE_TABLESPACE, src_dd_space_id}}) {
+    ib_sdi_key_t ib_key;
+    ib_key.sdi_key = &key;
+    const dberr_t err = ib_sdi_delete(c->space_id, &ib_key, trx);
+    if (err != DB_SUCCESS && err != DB_RECORD_NOT_FOUND) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
+      return true;
+    }
+  }
+
+  return dd_create_implicit_tablespace(dd::get_dd_client(thd), c->space_id,
+                                       c->name.c_str(), c->path.c_str(), false,
+                                       c->dd_space_id);
+}
+
+/** SE private data of one clone's indexes: new ids, same roots. Index trx_id =
+this trx, so read views older than the clone get ER_TABLE_DEF_CHANGED instead
+of following roll pointers into undo written for the source table (H1). */
+template <typename Index_collection>
+void set_index_data(Index_collection *indexes, const Space_clone &c,
+                    trx_id_t trx_id) {
+  for (auto *dd_index : *indexes) {
+    dd::Properties &p = dd_index->se_private_data();
+    space_index_t old_id;
+    if (p.get(dd_index_key_strings[DD_INDEX_ID], &old_id)) continue;
+    for (auto &id : c.ids) {
+      if (id.first == old_id) p.set(dd_index_key_strings[DD_INDEX_ID], id.second);
+    }
+    dd_index->set_tablespace_id(c.dd_space_id);
+    p.set(dd_index_key_strings[DD_INDEX_SPACE_ID], c.space_id);
+    p.set(dd_index_key_strings[DD_TABLE_ID], c.table_id);
+    p.set(dd_index_key_strings[DD_INDEX_TRX_ID], trx_id);
+  }
+}
+
+void set_column_table_id(dd::Table *dd_table, table_id_t table_id) {
+  for (dd::Column *col : *dd_table->columns()) {
+    if (col->se_private_data().exists(dd_index_key_strings[DD_TABLE_ID])) {
+      col->se_private_data().set(dd_index_key_strings[DD_TABLE_ID], table_id);
+    }
+  }
+}
+
+uint64_t next_autoinc(dict_table_t *src) {
+  dict_table_autoinc_lock(src);
+  const uint64_t next = std::max<uint64_t>(dict_table_autoinc_read(src),
+                                           src->autoinc_persisted + 1);
+  dict_table_autoinc_unlock(src);
+  return next;
+}
+
+dd::Object_id first_index_space(const dd::Table &t) {
+  for (const dd::Index *i : t.indexes()) return i->tablespace_id();
+  return dd::INVALID_OBJECT_ID;
+}
+
+dd::Object_id first_index_space(const dd::Partition &p) {
+  for (const dd::Partition_index *i : p.indexes()) return i->tablespace_id();
+  return dd::INVALID_OBJECT_ID;
+}
+
+/** "<dst_db>/<rest of src name>", filename-encoded. */
+std::string clone_name(const char *dst_db, const dict_table_t *src) {
+  char db_buf[FN_REFLEN];
+  tablename_to_filename(dst_db, db_buf, sizeof(db_buf));
+  const char *tname = strchr(src->name.m_name, '/');
+  ut_a(tname != nullptr);
+  return std::string(db_buf) + tname;
+}
+
+/** An FTS auxiliary table to clone: its source dict table and DD object, and
+the names it gets in the clone. */
+struct Fts_aux {
+  dict_table_t *src{};
+  std::string src_dd_name;
+  std::string dst_name;  ///< InnoDB name
+  Space_clone clone;
+};
+
+/** Auxiliary table names of an FTS table (fts0sql.cc naming), for the given
+parent name, parent id and FTS index ids. */
+std::vector<std::string> fts_aux_names(
+    const dict_table_t *table, const char *parent, table_id_t table_id,
+    const std::vector<space_index_t> &fts_index_ids) {
+  std::vector<std::string> names;
+  char name[MAX_FULL_NAME_LEN];
+  fts_table_t ft{};
+  ft.table = table;  // only checked for non-null; the name uses the ids below
+  ft.parent = parent;
+  ft.table_id = table_id;
+  ft.type = FTS_COMMON_TABLE;
+  for (const char **suffix = fts_common_tables; *suffix != nullptr; ++suffix) {
+    ft.suffix = *suffix;
+    fts_get_table_name(&ft, name);
+    names.emplace_back(name);
+  }
+  ft.type = FTS_INDEX_TABLE;
+  for (auto index_id : fts_index_ids) {
+    ft.index_id = index_id;
+    for (ulint i = 0; fts_index_selector[i].value != 0; ++i) {
+      ft.suffix = fts_index_selector[i].suffix;
+      fts_get_table_name(&ft, name);
+      names.emplace_back(name);
+    }
+  }
+  return names;
 }
 
 }  // namespace
@@ -147,189 +416,148 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   trx_t *trx = check_trx_exists(thd);
   innobase_register_trx(hton, thd, trx);
   trx_start_if_not_started(trx, true, UT_LOCATION_HERE);
+  dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
 
-  /* The caller holds MDL SNW on the source table. */
-  dict_table_t *src =
-      dd_table_open_on_id(src_dd.se_private_id(), thd, nullptr, false, true);
-  if (src == nullptr) {
-    my_error(ER_NO_SUCH_TABLE, MYF(0), src_dd.name().c_str(), "");
-    return true;
+  /* One clone per InnoDB table behind this DD table: the table itself or each
+  leaf partition, plus FTS auxiliary tables. The caller holds MDL SNW on the
+  source table, so none of them can change underneath us. */
+  std::vector<dict_table_t *> opened;
+  auto close_guard = create_scope_guard([&]() {
+    for (auto *t : opened) dd_table_close(t, thd, nullptr, false);
+  });
+  const auto open_src = [&](dd::Object_id id) -> dict_table_t * {
+    dict_table_t *t = dd_table_open_on_id(id, thd, nullptr, false, true);
+    if (t == nullptr) {
+      my_error(ER_NO_SUCH_TABLE, MYF(0), src_dd.name().c_str(), "");
+    } else {
+      opened.push_back(t);
+    }
+    return t;
+  };
+
+  const bool partitioned = src_dd.partition_type() != dd::Table::PT_NONE;
+  std::vector<Space_clone> clones;
+  std::vector<dd::Partition *> dst_parts;
+  std::vector<const dd::Partition *> src_parts;
+  if (partitioned) {
+    for (const dd::Partition *p : src_dd.leaf_partitions()) src_parts.push_back(p);
+    for (dd::Partition *p : *dst_dd->leaf_partitions()) dst_parts.push_back(p);
+    ut_a(src_parts.size() == dst_parts.size());
+    clones.resize(src_parts.size());
+    for (size_t i = 0; i < src_parts.size(); ++i) {
+      dict_table_t *t = open_src(src_parts[i]->se_private_id());
+      if (t == nullptr ||
+          prepare_clone(trx, t, clone_name(dst_db, t), &clones[i]))
+        return true;
+    }
+  } else {
+    clones.resize(1);
+    dict_table_t *t = open_src(src_dd.se_private_id());
+    if (t == nullptr || prepare_clone(trx, t, clone_name(dst_db, t), &clones[0]))
+      return true;
   }
-  auto close_guard =
-      create_scope_guard([&]() { dd_table_close(src, thd, nullptr, false); });
 
-  /* Outside the reflink core (fork-design.md §10): refuse clearly. */
-  if (!dict_table_is_file_per_table(src))
-    return wt_error(
-        "CREATE WORKTREE of tables in shared or general tablespaces");
-  if (dict_table_has_fts_index(src) ||
-      DICT_TF2_FLAG_IS_SET(src, DICT_TF2_FTS_HAS_DOC_ID))
-    return wt_error("CREATE WORKTREE of tables with FULLTEXT indexes");
-  if (DICT_TF_GET_ZIP_SSIZE(src->flags) != 0)
-    return wt_error("CREATE WORKTREE of ROW_FORMAT=COMPRESSED tables");
-  if (dd_is_table_in_encrypted_tablespace(src))
-    return wt_error("CREATE WORKTREE of encrypted tables");
-  if (DICT_TF_HAS_DATA_DIR(src->flags))
-    return wt_error("CREATE WORKTREE of tables with DATA DIRECTORY");
-  if (src->ibd_file_missing || dict_table_is_discarded(src) ||
-      src->is_corrupted())
-    return wt_error("CREATE WORKTREE of discarded or corrupted tables");
+  /* FULLTEXT (§10.3): the auxiliary tables are hidden InnoDB tables with their
+  own files, named after the parent and FTS index ids; they are cloned under
+  the names derived from the clone's new ids. */
+  dict_table_t *fts_src = partitioned ? nullptr : clones[0].src;
+  std::vector<Fts_aux> aux;
+  const bool has_fts =
+      fts_src != nullptr && fts_src->fts != nullptr &&
+      (dict_table_has_fts_index(fts_src) ||
+       DICT_TF2_FLAG_IS_SET(fts_src, DICT_TF2_FTS_HAS_DOC_ID));
+  if (has_fts) {
+    std::vector<space_index_t> src_fts_ids, dst_fts_ids;
+    for (const dict_index_t *index = fts_src->first_index(); index != nullptr;
+         index = index->next()) {
+      if (!(index->type & DICT_FTS)) continue;
+      src_fts_ids.push_back(index->id);
+      for (auto &id : clones[0].ids) {
+        if (id.first == index->id) dst_fts_ids.push_back(id.second);
+      }
+    }
+    const auto src_names =
+        fts_aux_names(fts_src, fts_src->name.m_name, fts_src->id, src_fts_ids);
+    const auto dst_names = fts_aux_names(fts_src, clones[0].name.c_str(),
+                                         clones[0].table_id, dst_fts_ids);
+    aux.resize(src_names.size());
+    for (size_t i = 0; i < src_names.size(); ++i) {
+      aux[i].src = dd_table_open_on_name(thd, nullptr, src_names[i].c_str(),
+                                         false, DICT_ERR_IGNORE_NONE);
+      if (aux[i].src == nullptr && src_fts_ids.empty()) {
+        /* FTS_DOC_ID without any FULLTEXT index: no auxiliary tables. */
+        aux.clear();
+        break;
+      }
+      if (aux[i].src == nullptr) {
+        my_error(ER_NO_SUCH_TABLE, MYF(0), src_names[i].c_str(), "");
+        return true;
+      }
+      opened.push_back(aux[i].src);
+      aux[i].src_dd_name = strchr(src_names[i].c_str(), '/') + 1;
+      aux[i].dst_name = dst_names[i];
+      if (prepare_clone(trx, aux[i].src, dst_names[i], &aux[i].clone))
+        return true;
+    }
 
-  fil_space_t *src_space = fil_space_acquire(src->space);
-  if (src_space == nullptr) return wt_error("CREATE WORKTREE: missing tablespace");
-  const uint32_t fsp_flags = src_space->flags;
-  const bool page_compressed =
-      src_space->compression_type != Compression::NONE;
-  fil_space_release(src_space);
-  if (page_compressed)
-    return wt_error("CREATE WORKTREE of tables with COMPRESSION=");
-
-  /* New identities: table id, space id, one id per index. Roots stay. */
-  table_id_t table_id;
-  space_id_t space_id;
-  dict_hdr_get_new_id(&table_id, nullptr, &space_id, nullptr, false);
-  if (space_id == SPACE_UNKNOWN) return wt_error("CREATE WORKTREE: no space id");
-
-  std::vector<std::pair<space_index_t, space_index_t>> ids;
-  std::vector<page_no_t> roots;
-  for (const dict_index_t *index = src->first_index(); index != nullptr;
-       index = index->next()) {
-    space_index_t new_id;
-    dict_hdr_get_new_id(nullptr, &new_id, nullptr, nullptr, false);
-    ids.emplace_back(index->id, new_id);
-    roots.push_back(index->page);
-  }
-  const page_size_t page_size(fsp_flags);
-
-  /* InnoDB name of the clone: "<dst_db>/<table>", filename-encoded. */
-  char db_buf[FN_REFLEN];
-  tablename_to_filename(dst_db, db_buf, sizeof(db_buf));
-  const char *tname = strchr(src->name.m_name, '/');
-  ut_a(tname != nullptr);
-  const std::string name = std::string(db_buf) + tname;
-
-  char *path_c = Fil_path::make_ibd_from_table_name(name);
-  const std::string path(path_c);
-  ut::free(path_c);
-  const std::string tmp_path = path + ".wtclone";
-  char *src_path_c = fil_space_get_first_path(src->space);
-  const std::string src_path(src_path_c);
-  ut::free(src_path_c);
-
-  for (const auto &p : {path, tmp_path}) {
-    if (access(p.c_str(), F_OK) == 0) {
-      my_error(ER_TABLESPACE_EXISTS, MYF(0), p.c_str());
+    /* Quiesce additions: keep the optimize thread away from the table and
+    write the FTS cache out, so documents committed out of order are not
+    missed by the clone. */
+    fts_optimize_remove_table(fts_src);
+    if (fts_src->fts->cache != nullptr &&
+        fts_sync_table(fts_src, false, true, false) != DB_SUCCESS) {
+      dict_sys_mutex_enter();
+      fts_optimize_add_table(fts_src);
+      dict_sys_mutex_exit();
+      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: FTS sync");
       return true;
     }
   }
-
-  /* On rollback or crash before commit, recovery deletes both names. */
-  for (const auto &p : {tmp_path, path}) {
-    if (log_ddl->write_delete_space_log(trx, nullptr, space_id, p.c_str(),
-                                        false, false) != DB_SUCCESS) {
-      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: DDL log");
-      return true;
+  auto fts_guard = create_scope_guard([&]() {
+    if (has_fts) {
+      dict_sys_mutex_enter();
+      fts_optimize_add_table(fts_src);
+      dict_sys_mutex_exit();
     }
-  }
+  });
   DBUG_EXECUTE_IF("wt_crash_after_ddl_log", DBUG_SUICIDE(););
 
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
-  by MDL; stop purge, merge the change buffer, then flush every dirty page so
-  the file on disk is a complete image. Purge is instance-wide: keep short. */
-  /* trx_purge_stop() is reference counted: concurrent clones each hold it. */
-  const bool purge_stopped = trx_purge_state() != PURGE_STATE_DISABLED;
-  if (purge_stopped) trx_purge_stop();
-  auto purge_guard = create_scope_guard([&]() {
-    if (purge_stopped) trx_purge_run();
-  });
-
-  while (ibuf_merge_space(src->space) != 0) {
-  }
-  buf_LRU_flush_or_remove_pages(src->space, BUF_REMOVE_FLUSH_WRITE, trx);
-  fil_flush(src->space);
-
-  /* The SDI root also has segment headers carrying the space id. */
+  by MDL; stop purge (instance-wide, reference counted, so keep it short),
+  then snapshot every file of this table. */
   {
-    mtr_t mtr;
-    mtr_start(&mtr);
-    roots.push_back(fsp_sdi_get_root_page_num(src->space, page_size, &mtr));
-    mtr_commit(&mtr);
+    const bool purge_stopped = trx_purge_state() != PURGE_STATE_DISABLED;
+    if (purge_stopped) trx_purge_stop();
+    auto purge_guard = create_scope_guard([&]() {
+      if (purge_stopped) trx_purge_run();
+    });
+    for (auto &c : clones) {
+      if (snapshot_clone(trx, &c)) return true;
+    }
+    for (auto &a : aux) {
+      if (snapshot_clone(trx, &a.clone)) return true;
+    }
   }
-
-  if (reflink(src_path.c_str(), tmp_path.c_str()) != 0)
-    return wt_os_error("reflink (APFS clonefile / FICLONE) to", tmp_path);
-  purge_guard.reset();
   DBUG_EXECUTE_IF("wt_crash_after_reflink", DBUG_SUICIDE(););
 
-  if (rewrite_page0(tmp_path, space_id, src->space, page_size, ids, roots))
-    return true;
-  DBUG_EXECUTE_IF("wt_crash_after_page0", DBUG_SUICIDE(););
-  DBUG_EXECUTE_IF("wt_fail_after_page0", {
-    my_error(ER_UNKNOWN_ERROR, MYF(0));
-    return true;
-  });
-
-  /* Only now may the startup scan see it as an .ibd (no duplicate space id). */
-  if (rename(tmp_path.c_str(), path.c_str()) != 0)
-    return wt_os_error("rename", tmp_path);
-  const std::string dir = path.substr(0, path.rfind('/'));
-  if (sync_path(dir.c_str(), O_RDONLY) != 0) return wt_os_error("fsync", dir);
-  DBUG_EXECUTE_IF("wt_crash_after_rename", DBUG_SUICIDE(););
-
-  std::string space_name(name);
-  dict_name::convert_to_space(space_name);
-  if (fil_ibd_open(true, FIL_TYPE_TABLESPACE, space_id, fsp_flags,
-                   space_name.c_str(), path.c_str(), true, false) !=
-      DB_SUCCESS) {
-    my_error(ER_TABLESPACE_MISSING, MYF(0), path.c_str());
-    return true;
+  for (size_t i = 0; i < clones.size(); ++i) {
+    const dd::Object_id src_space =
+        partitioned ? first_index_space(*src_parts[i]) : first_index_space(src_dd);
+    if (publish_clone(thd, trx, src_dd.id(), src_space, &clones[i])) return true;
   }
 
-  /* The clone still carries the source's SDI records (they name the source
-  schema); drop them. The clone's own are written when its DD objects are
-  stored. */
-  dd::Object_id src_dd_space_id = dd::INVALID_OBJECT_ID;
-  for (const dd::Index *dd_index : src_dd.indexes()) {
-    src_dd_space_id = dd_index->tablespace_id();
-    break;
-  }
-  for (const sdi_key_t &key : {sdi_key_t{SDI_TYPE_TABLE, src_dd.id()},
-                               sdi_key_t{SDI_TYPE_TABLESPACE, src_dd_space_id}}) {
-    ib_sdi_key_t ib_key;
-    ib_key.sdi_key = &key;
-    const dberr_t err = ib_sdi_delete(space_id, &ib_key, trx);
-    if (err != DB_SUCCESS && err != DB_RECORD_NOT_FOUND) {
-      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
-      return true;
+  /* DD entries. */
+  if (partitioned) {
+    for (size_t i = 0; i < clones.size(); ++i) {
+      dst_parts[i]->set_se_private_id(clones[i].table_id);
+      set_index_data(dst_parts[i]->indexes(), clones[i], trx->id);
     }
-  }
-
-  dd::cache::Dictionary_client *client = dd::get_dd_client(thd);
-  dd::Object_id dd_space_id = dd::INVALID_OBJECT_ID;
-  if (dd_create_implicit_tablespace(client, space_id, name.c_str(),
-                                    path.c_str(), false, dd_space_id))
-    return true;
-
-  /* SE private data: new ids, same roots. Index trx_id = this trx, so read
-  views older than the clone get ER_TABLE_DEF_CHANGED instead of following
-  roll pointers into undo written for the source table id (§12.1 H1). */
-  dst_dd->set_se_private_id(table_id);
-  for (dd::Index *dd_index : *dst_dd->indexes()) {
-    dd::Properties &p = dd_index->se_private_data();
-    space_index_t old_id;
-    if (p.get(dd_index_key_strings[DD_INDEX_ID], &old_id)) continue;
-    for (auto &id : ids) {
-      if (id.first == old_id) p.set(dd_index_key_strings[DD_INDEX_ID], id.second);
-    }
-    dd_index->set_tablespace_id(dd_space_id);
-    p.set(dd_index_key_strings[DD_INDEX_SPACE_ID], space_id);
-    p.set(dd_index_key_strings[DD_TABLE_ID], table_id);
-    p.set(dd_index_key_strings[DD_INDEX_TRX_ID], trx->id);
-  }
-  for (dd::Column *col : *dst_dd->columns()) {
-    if (col->se_private_data().exists(dd_index_key_strings[DD_TABLE_ID])) {
-      col->se_private_data().set(dd_index_key_strings[DD_TABLE_ID], table_id);
-    }
+    /* Partitioned tables keep the first partition's id on the columns. */
+    set_column_table_id(dst_dd, clones[0].table_id);
+  } else {
+    dst_dd->set_se_private_id(clones[0].table_id);
+    set_index_data(dst_dd->indexes(), clones[0], trx->id);
+    set_column_table_id(dst_dd, clones[0].table_id);
   }
 
   /* The source's next counter value. InnoDB knows the autoinc column only
@@ -340,11 +568,60 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
     has_autoinc |= col->is_auto_increment();
   }
   if (has_autoinc) {
-    dict_table_autoinc_lock(src);
-    const uint64_t next = std::max<uint64_t>(dict_table_autoinc_read(src),
-                                             src->autoinc_persisted + 1);
-    dict_table_autoinc_unlock(src);
+    uint64_t next = 0;
+    for (auto &c : clones) next = std::max(next, next_autoinc(c.src));
     dd_set_autoinc(dst_dd->se_private_data(), next);
+  }
+
+  /* FTS auxiliary DD tables: deep copies (SDI round trip) under the new names,
+  stored in the same DD transaction as the parent. */
+  if (!aux.empty()) {
+    char src_db[FN_REFLEN], src_db_enc[FN_REFLEN];
+    const char *slash = strchr(fts_src->name.m_name, '/');
+    snprintf(src_db_enc, sizeof(src_db_enc), "%.*s",
+             static_cast<int>(slash - fts_src->name.m_name),
+             fts_src->name.m_name);
+    filename_to_tablename(src_db_enc, src_db, sizeof(src_db));
+    const dd::Schema *dst_schema = nullptr;
+    if (client->acquire(dst_db, &dst_schema) || dst_schema == nullptr)
+      return true;
+
+    for (auto &a : aux) {
+      const char *dst_tname = strchr(a.dst_name.c_str(), '/') + 1;
+      /* Statement-long locks: the DD objects acquired below stay cached
+      until the statement ends. */
+      MDL_ticket *dst_mdl = nullptr;
+      MDL_request src_req;
+      MDL_REQUEST_INIT(&src_req, MDL_key::TABLE, src_db, a.src_dd_name.c_str(),
+                       MDL_SHARED, MDL_TRANSACTION);
+      if (dd::acquire_exclusive_table_mdl(thd, dst_db, dst_tname, false,
+                                          &dst_mdl) ||
+          thd->mdl_context.acquire_lock(&src_req,
+                                        thd->variables.lock_wait_timeout))
+        return true;
+      const dd::Table *src_aux_dd = nullptr;
+      if (client->acquire(src_db, a.src_dd_name.c_str(), &src_aux_dd) ||
+          src_aux_dd == nullptr) {
+        my_error(ER_NO_SUCH_TABLE, MYF(0), src_db, a.src_dd_name.c_str());
+        return true;
+      }
+      if (publish_clone(thd, trx, src_aux_dd->id(),
+                        first_index_space(*src_aux_dd), &a.clone))
+        return true;
+
+      const dd::Sdi_type sdi = dd::serialize(thd, *src_aux_dd, src_db);
+      std::unique_ptr<dd::Table> dst_aux(dd::create_object<dd::Table>());
+      if (dd::deserialize(thd, sdi, dst_aux.get(), dd::CheckDefaultCompatibility,
+                          nullptr))
+        return true;
+      dst_aux->set_name(dst_tname);
+      dst_aux->set_schema_id(dst_schema->id());
+      dst_aux->set_hidden(src_aux_dd->hidden());
+      dst_aux->set_se_private_id(a.clone.table_id);
+      set_index_data(dst_aux->indexes(), a.clone, trx->id);
+      set_column_table_id(dst_aux.get(), a.clone.table_id);
+      if (client->store(dst_aux.get())) return true;
+    }
   }
 
   return false;

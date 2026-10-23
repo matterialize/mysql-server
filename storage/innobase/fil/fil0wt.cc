@@ -29,10 +29,14 @@ constexpr ulint WT_HDR_N_ANCESTORS = 4;
 constexpr ulint WT_HDR_N_INDEXES = 8;
 constexpr ulint WT_HDR_N_ROOTS = 12;
 constexpr ulint WT_HDR_CRC = 16;
-constexpr ulint WT_HDR_SIZE = 20;
+/* Covered by the CRC from here on. */
+constexpr ulint WT_HDR_SELF = 20;
+constexpr ulint WT_HDR_GENERATION = 24;
+constexpr ulint WT_HDR_SIZE = 32;
 
-/** Map area: the last quarter of page 0, which InnoDB never uses (the XDES
-array, encryption info and SDI root pointer end well before it). */
+/** Map area: the last quarter of the page. On page 0, InnoDB never uses it
+(the XDES array, encryption info and SDI root pointer end well before it); on
+page 1 (the change buffer bitmap) the bitmap ends at about half the page. */
 ulint wt_map_size(const page_size_t &page_size) {
   return page_size.physical() / 4;
 }
@@ -70,10 +74,13 @@ bool wt_map_read(const byte *page0, const page_size_t &page_size,
   const ulint len = n_anc * 4 + n_idx * 16 + n_roots * 4;
   if (n_anc == 0 || n_anc > WT_MAX_ANCESTORS ||
       WT_HDR_SIZE + len > wt_map_size(page_size) ||
-      mach_read_from_4(p + WT_HDR_CRC) != ut_crc32(p + WT_HDR_SIZE, len)) {
+      mach_read_from_4(p + WT_HDR_CRC) !=
+          ut_crc32(p + WT_HDR_SELF, WT_HDR_SIZE - WT_HDR_SELF + len)) {
     return false;
   }
 
+  map->self = mach_read_from_4(p + WT_HDR_SELF);
+  map->generation = mach_read_from_8(p + WT_HDR_GENERATION);
   map->ancestors.clear();
   map->index_map.clear();
   map->roots.clear();
@@ -120,23 +127,47 @@ bool wt_map_write(const wt_map_t &map, byte *page0,
   mach_write_to_4(p + WT_HDR_N_ANCESTORS, map.ancestors.size());
   mach_write_to_4(p + WT_HDR_N_INDEXES, map.index_map.size());
   mach_write_to_4(p + WT_HDR_N_ROOTS, map.roots.size());
-  mach_write_to_4(p + WT_HDR_CRC, ut_crc32(p + WT_HDR_SIZE, len));
+  mach_write_to_4(p + WT_HDR_SELF, map.self);
+  mach_write_to_8(p + WT_HDR_GENERATION, map.generation);
+  mach_write_to_4(p + WT_HDR_CRC,
+                  ut_crc32(p + WT_HDR_SELF, WT_HDR_SIZE - WT_HDR_SELF + len));
   return true;
 }
 
-void fil_wt_load(fil_space_t *space, const byte *page0) {
+void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1) {
   if (space->wt_map_loaded) return;
   space->wt_map_loaded = true;
 
   const page_size_t page_size(space->flags);
   if (page_size.is_compressed()) return;
 
+  /* Two copies (page 0, page 1); use the newest valid one that is ours. A
+  copy whose self id is not this space belongs to an ancestor's file. */
   auto map = ut::new_withkey<wt_map_t>(UT_NEW_THIS_FILE_PSI_KEY);
-  if (wt_map_read(page0, page_size, map)) {
-    space->wt_map = map;
-  } else {
+  wt_map_t copy;
+  const bool ok0 = wt_map_read(page0, page_size, map) && map->self == space->id;
+  const bool ok1 = page1 != nullptr && wt_map_read(page1, page_size, &copy) &&
+                   copy.self == space->id;
+  if (ok1 && (!ok0 || copy.generation > map->generation)) {
+    if (!ok0 && mach_read_from_4(page0 + wt_map_offset(page_size)) != 0) {
+      ib::warn() << "Worktree map in page 0 of tablespace " << space->name
+                 << " is damaged; using the copy in page 1.";
+    }
+    *map = copy;
+  } else if (!ok0) {
     ut::delete_(map);
+    return;
   }
+  space->wt_map = map;
+}
+
+bool wt_page1_self(const byte *page1, const page_size_t &page_size,
+                   space_id_t *self, std::vector<space_id_t> *ancestors) {
+  wt_map_t map;
+  if (!wt_map_read(page1, page_size, &map)) return false;
+  *self = map.self;
+  *ancestors = map.ancestors;
+  return true;
 }
 
 const wt_map_t *fil_wt_map(const fil_space_t *space) {

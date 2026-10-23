@@ -32,11 +32,17 @@ constexpr uint32_t WT_MAP_MAGIC = 0x57544D31;
 /** Longest ancestor chain a worktree may have. */
 constexpr size_t WT_MAX_ANCESTORS = 16;
 
-/** Ancestor map of a worktree tablespace, stored in the unused tail of page 0.
-On disk (big-endian): magic, n_ancestors, n_indexes, n_roots, crc32 of the
-rest, then ancestor space ids (4 bytes each), (old index id, new index id)
-pairs (8 + 8 bytes), and B-tree root page numbers incl. the SDI root (4). */
+/** Ancestor map of a worktree tablespace, stored in the unused tail of page 0
+and, as a redundant copy, of page 1 (§12.1 H5). On disk (big-endian): magic,
+n_ancestors, n_indexes, n_roots, crc32 of the rest, self space id,
+generation, then ancestor space ids (4 bytes each), (old index id, new index
+id) pairs (8 + 8 bytes), and B-tree root page numbers incl. the SDI root (4). */
 struct wt_map_t {
+  /** The tablespace this map belongs to (lets startup tell a worktree's own
+  copy from an ancestor's, and identify a file whose page 0 is lost). */
+  space_id_t self{};
+  /** Bumped on every rewrite; the newer of the two copies wins. */
+  uint64_t generation{};
   /** Space ids whose pages this tablespace still contains. */
   std::vector<space_id_t> ancestors;
   /** Ancestor index id -> this tablespace's index id, sorted by the first. */
@@ -68,7 +74,16 @@ bool wt_map_read(const byte *page0, const page_size_t &page_size,
 file of the tablespace is opened, before any page of it is read.
 @param[in,out]  space  tablespace
 @param[in]  page0  page 0 as read from disk */
-void fil_wt_load(fil_space_t *space, const byte *page0);
+void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1);
+
+/** Read the map copy in page 1 of a file whose page 0 may be lost.
+@param[in]  page1  page 1 as read from disk (checksum already validated)
+@param[in]  page_size  page size
+@param[out] self  the file's own space id
+@param[out] ancestors  ancestor space ids (never a valid id for this file)
+@return true if page 1 carries a valid map copy */
+bool wt_page1_self(const byte *page1, const page_size_t &page_size,
+                   space_id_t *self, std::vector<space_id_t> *ancestors);
 
 /** @return the ancestor map of a tablespace, or nullptr if it is not a
 worktree. Valid while the caller holds a reference to the space. */

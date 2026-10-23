@@ -179,6 +179,7 @@ When one supplies long data for a placeholder:
 #include "sql/sql_lex.h"
 #include "sql/sql_list.h"
 #include "sql/sql_parse.h"  // sql_command_flags
+#include "sql/sql_worktree.h"
 #include "sql/sql_profile.h"
 #include "sql/sql_query_rewrite.h"
 #include "sql/sql_rewrite.h"  // mysql_rewrite_query
@@ -1784,6 +1785,7 @@ void mysql_sql_stmt_prepare(THD *thd) {
   size_t query_len = 0;
   const char *query = get_dynamic_sql_string(lex, &query_len);
   if (query == nullptr) return; /* out of memory */
+  query = worktree_remap_dynamic_sql(thd, query, &query_len);
 
   stmt = new Prepared_statement(thd);
   if (stmt == nullptr) return; /* out of memory */

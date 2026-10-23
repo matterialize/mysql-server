@@ -1461,6 +1461,10 @@ value returned.
         or not found. */
 [[nodiscard]] char *fil_space_get_first_path(space_id_t space_id);
 
+/** @return true if the startup scan found space_id in a file other than path
+(used so a damaged worktree file is never identified as its ancestor). */
+bool fil_space_scanned_elsewhere(space_id_t space_id, const std::string &path);
+
 /** Returns the size of the space in pages. The tablespace must be cached
 in the memory cache.
 @param[in]      space_id        Tablespace ID

@@ -73,7 +73,8 @@ using dd::tables::Tables;
 
 namespace dd {
 
-static const std::set<String_type> default_valid_option_keys = {"read_only"};
+static const std::set<String_type> default_valid_option_keys = {
+    "read_only", "worktree_of"};
 
 ///////////////////////////////////////////////////////////////////////////
 // Schema_impl implementation.
