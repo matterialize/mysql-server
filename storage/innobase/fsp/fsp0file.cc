@@ -491,6 +491,18 @@ dberr_t Datafile::validate_for_recovery(space_id_t space_id) {
         return (err);
       }
 
+      /* Never restore another tablespace's page 0 into this file. A vote can
+      elect an id that is not this file's (a worktree's untouched pages carry
+      its ancestor's id, which may no longer exist anywhere else); stock code
+      would write that page 0 here and only then notice the mismatch. */
+      if (space_id != SPACE_UNKNOWN && m_space_id != space_id) {
+        ib::error() << "Datafile '" << m_filepath << "' is expected to be space "
+                    << space_id << " but its pages identify space "
+                    << m_space_id
+                    << "; not restoring page 0 from the doublewrite buffer";
+        return DB_CORRUPTION;
+      }
+
       err = restore_from_doublewrite(0);
 
       if (err != DB_SUCCESS) {
@@ -867,6 +879,15 @@ dberr_t Datafile::find_space_id() {
             fil_space_scanned_elsewhere(it->first, m_filepath)) {
           ib::warn() << "Datafile '" << m_filepath << "': space id "
                      << it->first << " belongs to another file; not chosen";
+          continue;
+        }
+
+        /* An ancestor of a worktree is only ever the id of its own file. */
+        if (it->second == (valid_pages - missed) &&
+            !wt_ancestors_allow(it->first, m_filepath)) {
+          ib::warn() << "Datafile '" << m_filepath << "': space id "
+                     << it->first << " is a worktree ancestor and this is not "
+                     << "its file; not chosen";
           continue;
         }
 

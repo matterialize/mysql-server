@@ -280,6 +280,31 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
     return true;
   });
 
+  /* Before the file can be found by the startup scan, record which ids it
+  inherits pages from, and where those ancestors' own files are. */
+  {
+    std::vector<std::pair<space_id_t, std::string>> ancestors{
+        {c->src->space, c->src_path}};
+    fil_space_t *space = fil_space_acquire(c->src->space);
+    const wt_map_t *src_map = fil_wt_map(space);
+    std::vector<space_id_t> older;
+    if (src_map != nullptr) older = src_map->ancestors;
+    fil_space_release(space);
+    {
+      for (auto anc : older) {
+        char *p = fil_space_get_first_path(anc);
+        if (p != nullptr) {
+          ancestors.emplace_back(anc, p);
+          ut::free(p);
+        } else {
+          ancestors.emplace_back(anc, "");  // gone: no file may claim it
+        }
+      }
+    }
+    if (wt_ancestors_record(ancestors))
+      return wt_os_error("record ancestors in", "#wt_ancestors");
+  }
+
   /* Only now may the startup scan see it as an .ibd (no duplicate space id). */
   if (rename(c->tmp_path.c_str(), c->path.c_str()) != 0)
     return wt_os_error("rename", c->tmp_path);

@@ -93,6 +93,19 @@ const wt_map_t *fil_wt_map(const fil_space_t *space);
 space_id (equal or ancestor). */
 bool fil_wt_is_same_or_ancestor(space_id_t space_id, space_id_t ancestor);
 
+/** Durable record of worktree ancestors, "#wt_ancestors" in the datadir: one
+line "<ancestor space id> <path of the ancestor's own file>" per ancestor of
+every worktree ever created. Appended and fsynced before a clone's file gets
+its .ibd name. Startup uses it so that a file whose identity pages are lost is
+never identified as an ancestor (fork-design.md §10.1 item 4).
+@return false on success */
+[[nodiscard]] bool wt_ancestors_record(
+    const std::vector<std::pair<space_id_t, std::string>> &ancestors);
+
+/** May a file at path that votes for space_id be identified as space_id?
+False if space_id is a worktree ancestor and path is not its own file. */
+bool wt_ancestors_allow(space_id_t space_id, const std::string &path);
+
 /** Translate a page read from an ancestor into this tablespace's identity, in
 RAM only: header space id, index id, root segment headers, then checksum. The
 caller has already validated the checksum of the bytes read from disk.

@@ -12,7 +12,7 @@ let SRC_IBD = $datadir/src/big.ibd;
 let $error_log = $MYSQLTEST_VARDIR/log/mysqld.1.err;
 
 call mtr.add_suppression("Worktree map in page 0 of tablespace wt/big is damaged");
-call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/big.ibd");
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./(wt|src)/big.ibd");
 
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
@@ -152,6 +152,67 @@ EOF
 --let $restart_parameters = restart
 --source include/start_mysqld.inc
 SELECT COUNT(*) FROM wt.big;
+DROP DATABASE wt;
+
+--echo #
+--echo # E. The source's own torn page 0 is still restored from the doublewrite
+--echo #    buffer, as in stock: #wt_ancestors records ./src/big.ibd as the
+--echo #    file of space 2's id, so the vote may pick it for that file.
+CREATE WORKTREE wt FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.big WITH RECURSIVE s(n) AS (SELECT 20000 UNION ALL SELECT n + 1 FROM s WHERE n < 28000) SELECT n, 'z' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE src.big SET pad = 'src-after-checkpoint' WHERE id = 5;
+--source include/kill_mysqld.inc
+perl;
+  my $f = $ENV{SRC_IBD}; open(my $fh, '+<:raw', $f) or die "$f: $!";
+  sysseek($fh, 0, 0); syswrite($fh, "\0" x 16384); close($fh);
+EOF
+--let $restart_parameters = restart: --log-error-verbosity=3
+--source include/start_mysqld.inc
+SELECT pad FROM src.big WHERE id = 5;
+SELECT COUNT(*) FROM src.big;
+CHECK TABLE src.big, wt.big;
+let SEARCH_FILE = $error_log;
+--let SEARCH_PATTERN = Restoring page \[page id: space=[0-9]+, page number=0\] of datafile './src/big.ibd' from the doublewrite buffer
+--source include/search_pattern.inc
+
+--echo #
+--echo # F. As C, but the source is dropped first, so no other file claims its
+--echo #    id: the vote still never picks the ancestor (#wt_ancestors), and the
+--echo #    ancestor's page 0 is not written into the worktree.
+INSERT INTO src.big VALUES (99999, 'last');
+SET GLOBAL innodb_log_checkpoint_now = ON;
+DROP DATABASE src;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.big SET pad = 'wt-after-drop' WHERE id = 5;
+--source include/kill_mysqld.inc
+--copy_file $WT_IBD $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved
+perl;
+  my $f = $ENV{WT_IBD}; open(my $fh, '+<:raw', $f) or die "$f: $!";
+  sysseek($fh, 0, 0); syswrite($fh, "\0" x 32768); close($fh);
+EOF
+let $f_log = $MYSQLTEST_VARDIR/log/page0_case_f.err;
+--error 1
+--exec $MYSQLD_CMD --log-error=$f_log --log-error-verbosity=3 > /dev/null 2>&1
+let SEARCH_FILE = $f_log;
+--let SEARCH_PATTERN = Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen
+--source include/search_pattern.inc
+perl;
+  my $f = $ENV{WT_IBD}; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 32768);
+  print "pages 0 and 1 of the worktree are still all zero: ", ($p eq ("\0" x 32768) ? "yes" : "NO"), "\n";
+EOF
+--remove_file $WT_IBD
+--copy_file $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved $WT_IBD
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved
+--remove_file $f_log
+--let $restart_parameters = restart
+--source include/start_mysqld.inc
+SELECT pad FROM wt.big WHERE id = 5;
+CHECK TABLE wt.big;
 
 DROP DATABASE wt;
-DROP DATABASE src;

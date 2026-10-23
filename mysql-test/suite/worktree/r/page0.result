@@ -3,7 +3,7 @@
 # file's own space id, and startup never identifies a worktree file as
 # its ancestor.
 call mtr.add_suppression("Worktree map in page 0 of tablespace wt/big is damaged");
-call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/big.ibd");
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./(wt|src)/big.ibd");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
 CREATE TABLE src.big (id INT PRIMARY KEY, pad CHAR(200));
@@ -105,4 +105,49 @@ SELECT COUNT(*) FROM wt.big;
 COUNT(*)
 8901
 DROP DATABASE wt;
+#
+# E. The source's own torn page 0 is still restored from the doublewrite
+#    buffer, as in stock: #wt_ancestors records ./src/big.ibd as the
+#    file of space 2's id, so the vote may pick it for that file.
+CREATE WORKTREE wt FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.big WITH RECURSIVE s(n) AS (SELECT 20000 UNION ALL SELECT n + 1 FROM s WHERE n < 28000) SELECT n, 'z' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE src.big SET pad = 'src-after-checkpoint' WHERE id = 5;
+# Kill the server
+# restart: --log-error-verbosity=3
+SELECT pad FROM src.big WHERE id = 5;
+pad
+src-after-checkpoint
+SELECT COUNT(*) FROM src.big;
+COUNT(*)
+16902
+CHECK TABLE src.big, wt.big;
+Table	Op	Msg_type	Msg_text
+src.big	check	status	OK
+wt.big	check	status	OK
+Pattern "Restoring page \[page id: space=[0-9]+, page number=0\] of datafile './src/big.ibd' from the doublewrite buffer" found
+#
+# F. As C, but the source is dropped first, so no other file claims its
+#    id: the vote still never picks the ancestor (#wt_ancestors), and the
+#    ancestor's page 0 is not written into the worktree.
+INSERT INTO src.big VALUES (99999, 'last');
+SET GLOBAL innodb_log_checkpoint_now = ON;
 DROP DATABASE src;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.big SET pad = 'wt-after-drop' WHERE id = 5;
+# Kill the server
+Pattern "Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen" found
+pages 0 and 1 of the worktree are still all zero: yes
+# restart
+SELECT pad FROM wt.big WHERE id = 5;
+pad
+wt-after-drop
+CHECK TABLE wt.big;
+Table	Op	Msg_type	Msg_text
+wt.big	check	status	OK
+DROP DATABASE wt;

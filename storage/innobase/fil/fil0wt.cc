@@ -13,7 +13,14 @@ Free Software Foundation.
 
 #include "fil0wt.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <sstream>
 
 #include "buf0checksum.h"
 #include "dict0dict.h"
@@ -231,4 +238,43 @@ void wt_translate_page(const wt_map_t &map, space_id_t space_id, byte *frame) {
   }
 
   wt_page_recalc_checksum(frame, univ_page_size);
+}
+
+namespace {
+constexpr const char *WT_ANCESTORS_FILE = "#wt_ancestors";
+std::mutex wt_ancestors_mutex;
+}  // namespace
+
+bool wt_ancestors_record(
+    const std::vector<std::pair<space_id_t, std::string>> &ancestors) {
+  std::string text;
+  for (const auto &[id, path] : ancestors) {
+    text += std::to_string(id) + " " + path + "\n";
+  }
+  const std::lock_guard<std::mutex> guard(wt_ancestors_mutex);
+  const int fd = open(WT_ANCESTORS_FILE, O_WRONLY | O_CREAT | O_APPEND, 0640);
+  if (fd < 0) return true;
+  const bool fail = write(fd, text.data(), text.size()) !=
+                        static_cast<ssize_t>(text.size()) ||
+                    fsync(fd) != 0;
+  close(fd);
+  return fail;
+}
+
+bool wt_ancestors_allow(space_id_t space_id, const std::string &path) {
+  /* Read on every call: this only runs for a file whose page 0 is unreadable. */
+  const std::lock_guard<std::mutex> guard(wt_ancestors_mutex);
+  std::ifstream in(WT_ANCESTORS_FILE);
+  bool is_ancestor = false;
+  std::string line;
+  while (std::getline(in, line)) {
+    std::istringstream fields(line);
+    space_id_t id;
+    std::string own_path;
+    if (!(fields >> id) || id != space_id) continue;
+    std::getline(fields >> std::ws, own_path);
+    if (Fil_path::is_same_as(own_path, path)) return true;  // its own file
+    is_ancestor = true;
+  }
+  return !is_ancestor;
 }
