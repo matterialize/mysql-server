@@ -1,0 +1,139 @@
+# CREATE WORKTREE: a copy-on-write schema clone; isolation both ways.
+CREATE DATABASE golden;
+CREATE TABLE golden.users (id INT PRIMARY KEY, email VARCHAR(64), KEY(email));
+CREATE TABLE golden.empty_t (a INT);
+INSERT INTO golden.users VALUES (7, 'old@x.com'), (8, 'b@x.com'), (9, 'c@x.com');
+CREATE WORKTREE wt FROM golden;
+SHOW TABLES FROM wt;
+Tables_in_wt
+empty_t
+users
+SHOW CREATE TABLE wt.users;
+Table	Create Table
+users	CREATE TABLE `users` (
+  `id` int NOT NULL,
+  `email` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `email` (`email`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SELECT * FROM wt.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	c@x.com
+# Worktree changes stay in the worktree.
+UPDATE wt.users SET email = 'new@x.com' WHERE id = 7;
+DELETE FROM wt.users WHERE id = 8;
+INSERT INTO wt.users VALUES (10, 'wt@x.com');
+SELECT email FROM golden.users WHERE id = 7;
+email
+old@x.com
+SELECT email FROM wt.users WHERE id = 7;
+email
+new@x.com
+SELECT * FROM golden.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	c@x.com
+SELECT * FROM wt.users ORDER BY id;
+id	email
+7	new@x.com
+9	c@x.com
+10	wt@x.com
+SELECT * FROM wt.users FORCE INDEX(email) ORDER BY email;
+id	email
+9	c@x.com
+7	new@x.com
+10	wt@x.com
+# Source changes after the clone do not reach the worktree.
+INSERT INTO golden.users VALUES (11, 'later@x.com');
+UPDATE golden.users SET email = 'gold@x.com' WHERE id = 9;
+SELECT * FROM golden.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	gold@x.com
+11	later@x.com
+SELECT * FROM wt.users ORDER BY id;
+id	email
+7	new@x.com
+9	c@x.com
+10	wt@x.com
+# DDL on one side only.
+ALTER TABLE wt.users ADD COLUMN note VARCHAR(10) DEFAULT 'n';
+ALTER TABLE wt.users ADD INDEX (note), ALGORITHM=INPLACE;
+SELECT * FROM wt.users ORDER BY id;
+id	email	note
+7	new@x.com	n
+9	c@x.com	n
+10	wt@x.com	n
+SHOW CREATE TABLE golden.users;
+Table	Create Table
+users	CREATE TABLE `users` (
+  `id` int NOT NULL,
+  `email` varchar(64) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `email` (`email`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+OPTIMIZE TABLE wt.users;
+Table	Op	Msg_type	Msg_text
+wt.users	optimize	note	Table does not support optimize, doing recreate + analyze instead
+wt.users	optimize	status	OK
+SELECT * FROM wt.users ORDER BY id;
+id	email	note
+7	new@x.com	n
+9	c@x.com	n
+10	wt@x.com	n
+INSERT INTO wt.empty_t VALUES (1);
+SELECT * FROM golden.empty_t;
+a
+CHECK TABLE golden.users, wt.users, wt.empty_t;
+Table	Op	Msg_type	Msg_text
+golden.users	check	status	OK
+wt.users	check	status	OK
+wt.empty_t	check	status	OK
+# A restart keeps both sides.
+# restart
+SELECT * FROM golden.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	gold@x.com
+11	later@x.com
+SELECT * FROM wt.users ORDER BY id;
+id	email	note
+7	new@x.com	n
+9	c@x.com	n
+10	wt@x.com	n
+# One .ibd per table, no .cfg/.cfp or leftover clone files.
+empty_t.ibd
+users.ibd
+# Errors.
+CREATE WORKTREE wt FROM golden;
+ERROR HY000: Can't create database 'wt'; database exists
+CREATE WORKTREE golden FROM golden;
+ERROR HY000: Can't create database 'golden'; database exists
+CREATE WORKTREE wt9 FROM no_such_db;
+ERROR 42000: Unknown database 'no_such_db'
+CREATE WORKTREE wt9 FROM mysql;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE from a system schema'
+SHOW DATABASES LIKE 'wt%';
+Database (wt%)
+wt
+DROP DATABASE wt;
+SELECT * FROM golden.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	gold@x.com
+11	later@x.com
+CREATE WORKTREE wt FROM golden;
+SELECT * FROM wt.users ORDER BY id;
+id	email
+7	old@x.com
+8	b@x.com
+9	gold@x.com
+11	later@x.com
+DROP DATABASE wt;
+DROP DATABASE golden;

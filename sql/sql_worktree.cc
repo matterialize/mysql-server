@@ -30,6 +30,7 @@
 #include "sql/handler.h"
 #include "sql/mdl.h"
 #include "sql/mysqld.h"
+#include "sql/error_handler.h"
 #include "sql/sql_base.h"
 #include "sql/sql_class.h"
 #include "sql/sql_db.h"
@@ -54,14 +55,15 @@ const char *mdl_name(THD *thd, const char *name) {
   return buf;
 }
 
-/** Lock tables db.names with the given MDL type for the statement. */
-bool lock_tables(THD *thd, const char *db, const std::vector<std::string> &names,
-                 enum_mdl_type type) {
-  if (names.empty()) return false;
+using Table_names = std::vector<std::pair<std::string, std::string>>;
+
+/** Lock tables (db, name) with the given MDL type for the statement. */
+bool lock_tables(THD *thd, const Table_names &tables, enum_mdl_type type) {
+  if (tables.empty()) return false;
   Table_ref *first = nullptr;
   Table_ref **next = &first;
-  const char *mdl_db = mdl_name(thd, db);
-  for (const auto &name : names) {
+  for (const auto &[db, name] : tables) {
+    const char *mdl_db = mdl_name(thd, db.c_str());
     const char *tname = mdl_name(thd, name.c_str());
     auto *tl = new (thd->mem_root)
         Table_ref(mdl_db, strlen(mdl_db), tname, strlen(tname), tname, TL_IGNORE);
@@ -72,6 +74,12 @@ bool lock_tables(THD *thd, const char *db, const std::vector<std::string> &names
   }
   return lock_table_names(thd, first, nullptr,
                           thd->variables.lock_wait_timeout, 0);
+}
+
+Table_names in_schema(const char *db, const std::vector<std::string> &names) {
+  Table_names tables;
+  for (const auto &name : names) tables.emplace_back(db, name);
+  return tables;
 }
 
 }  // namespace
@@ -148,7 +156,7 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
 
   /* Block writers to the source tables for the whole statement. Waiting for
   SNW also waits for open transactions that wrote them to finish. */
-  if (lock_tables(thd, src, names, MDL_SHARED_NO_WRITE)) return true;
+  if (lock_tables(thd, in_schema(src, names), MDL_SHARED_NO_WRITE)) return true;
 
   std::vector<const dd::Table *> src_tables;
   for (const auto &name : names) {
@@ -164,6 +172,21 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     src_tables.push_back(t);
   }
 
+  /* FK parents outside the source schema gain the clones as children: their
+  DD objects are updated, so they need X locks, and their caches are
+  invalidated after the commit (as for CREATE TABLE with a foreign key). */
+  Table_names ext_parents;
+  for (const dd::Table *t : src_tables) {
+    for (const dd::Foreign_key *fk : t->foreign_keys()) {
+      if (my_strcasecmp(table_alias_charset,
+                        fk->referenced_table_schema_name().c_str(), src) != 0) {
+        ext_parents.emplace_back(fk->referenced_table_schema_name().c_str(),
+                                 fk->referenced_table_name().c_str());
+      }
+    }
+  }
+  if (lock_tables(thd, ext_parents, MDL_EXCLUSIVE)) return true;
+
   HA_CREATE_INFO create_info;
   create_info.default_table_charset =
       get_charset(src_schema->default_collation_id(), MYF(0));
@@ -172,7 +195,7 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   }
 
   const auto populate = [&]() -> bool {
-    if (lock_tables(thd, wt, names, MDL_EXCLUSIVE)) return true;
+    if (lock_tables(thd, in_schema(wt, names), MDL_EXCLUSIVE)) return true;
 
     const dd::Schema *wt_schema = nullptr;
     if (dc.acquire(wt, &wt_schema)) return true;
@@ -218,6 +241,24 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   };
 
   if (mysql_create_db(thd, wt, &create_info, populate)) return true;
+
+  /* Still under X MDL: drop cached definitions of the external parents so
+  they are reloaded with their new children (TDC, DD cache and SE cache). */
+  for (const auto &[db, name] : ext_parents) {
+    close_all_tables_for_name(thd, db.c_str(), name.c_str(), false);
+    Dummy_error_handler error_handler;
+    thd->push_internal_handler(&error_handler);
+    std::ignore = dc.invalidate(db.c_str(), name.c_str());
+    thd->pop_internal_handler();
+    handlerton *hton = nullptr;
+    const dd::Table *parent = nullptr;
+    if (!dc.acquire(db.c_str(), name.c_str(), &parent) && parent != nullptr &&
+        !dd::table_storage_engine(thd, parent, &hton) &&
+        hton->dict_cache_reset != nullptr) {
+      hton->dict_cache_reset(mdl_name(thd, db.c_str()),
+                             mdl_name(thd, name.c_str()));
+    }
+  }
 
   DBUG_EXECUTE_IF("wt_crash_after_commit", DBUG_SUICIDE(););
   return false;

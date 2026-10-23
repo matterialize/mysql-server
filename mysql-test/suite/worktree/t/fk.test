@@ -1,0 +1,73 @@
+--echo # Foreign keys inside the source are remapped to the worktree;
+--echo # foreign keys to other schemas keep pointing there.
+
+CREATE DATABASE other;
+CREATE TABLE other.country (code CHAR(2) PRIMARY KEY);
+INSERT INTO other.country VALUES ('US'), ('CA');
+
+CREATE DATABASE src;
+CREATE TABLE src.p (id INT PRIMARY KEY, cc CHAR(2),
+  FOREIGN KEY (cc) REFERENCES other.country(code));
+CREATE TABLE src.c (id INT PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES src.p(id) ON DELETE CASCADE);
+CREATE TABLE src.r (id INT PRIMARY KEY, pid INT,
+  FOREIGN KEY (pid) REFERENCES src.p(id));
+INSERT INTO src.p VALUES (1, 'US'), (2, 'CA'), (3, 'US');
+INSERT INTO src.c VALUES (10, 1), (11, 1), (12, 2);
+INSERT INTO src.r VALUES (20, 3);
+
+CREATE WORKTREE wt FROM src;
+SHOW CREATE TABLE wt.c;
+SHOW CREATE TABLE wt.p;
+SELECT TABLE_SCHEMA, TABLE_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME
+  FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = 'wt' AND REFERENCED_TABLE_NAME IS NOT NULL
+  ORDER BY TABLE_NAME;
+
+--echo # Cascade inside the worktree only.
+DELETE FROM wt.p WHERE id = 1;
+SELECT * FROM wt.c ORDER BY id;
+SELECT * FROM src.c ORDER BY id;
+
+--echo # Restrict inside the worktree.
+--error ER_ROW_IS_REFERENCED_2
+DELETE FROM wt.p WHERE id = 3;
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO wt.c VALUES (13, 99);
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO wt.p VALUES (4, 'ZZ');
+
+--echo # A worktree parent is not the source's parent.
+DELETE FROM wt.r;
+DELETE FROM wt.p WHERE id = 3;
+--error ER_ROW_IS_REFERENCED_2
+DELETE FROM src.p WHERE id = 3;
+INSERT INTO wt.p VALUES (5, 'CA');
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO src.c VALUES (14, 5);
+SELECT * FROM src.p ORDER BY id;
+SELECT * FROM wt.p ORDER BY id;
+
+--echo # The external parent enforces its new worktree child (its cached
+--echo # definitions were reloaded with the new child).
+INSERT INTO other.country VALUES ('MX');
+INSERT INTO wt.p VALUES (6, 'MX');
+--error ER_ROW_IS_REFERENCED_2
+DELETE FROM other.country WHERE code = 'MX';
+--error ER_ROW_IS_REFERENCED_2
+UPDATE other.country SET code = 'XX' WHERE code = 'MX';
+DELETE FROM wt.p WHERE id = 6;
+DELETE FROM other.country WHERE code = 'MX';
+
+--echo # Dropping the source does not orphan the worktree's FKs.
+SET foreign_key_checks = 0;
+DROP DATABASE src;
+SET foreign_key_checks = 1;
+--source include/restart_mysqld.inc
+DELETE FROM wt.p WHERE id = 2;
+SELECT * FROM wt.c ORDER BY id;
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO wt.c VALUES (15, 2);
+
+DROP DATABASE wt;
+DROP DATABASE other;

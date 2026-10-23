@@ -1,0 +1,39 @@
+--echo # Crash recovery applies redo to worktree pages that are still stamped
+--echo # with the ancestor's id on disk, and never to the ancestor.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(20), pad CHAR(200), b LONGTEXT, KEY(v));
+INSERT INTO src.t SELECT seq, CONCAT('v', seq), 'p', IF(seq % 100 = 0, REPEAT('L', 20000), NULL)
+  FROM (WITH RECURSIVE s(seq) AS (SELECT 1 UNION ALL SELECT seq+1 FROM s WHERE seq < 5000) SELECT seq FROM s) x;
+CREATE WORKTREE wt FROM src;
+CREATE WORKTREE wt2 FROM wt;
+
+--echo # Keep every change in redo only: no checkpoint, no page flushing.
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+
+UPDATE wt.t SET v = CONCAT('w', id) WHERE id % 7 = 0;
+DELETE FROM wt.t WHERE id BETWEEN 1000 AND 1999;
+INSERT INTO wt.t VALUES (9001, 'new', 'p', REPEAT('N', 30000));
+UPDATE wt.t SET b = REPEAT('U', 25000) WHERE id = 100;
+UPDATE src.t SET v = CONCAT('s', id) WHERE id % 11 = 0;
+UPDATE wt2.t SET v = 'two' WHERE id = 1;
+BEGIN; UPDATE wt.t SET v = 'uncommitted' WHERE id = 3;
+
+--source include/kill_and_restart_mysqld.inc
+
+SELECT COUNT(*), SUM(id), SUM(v LIKE 'w%'), SUM(v = 'uncommitted') FROM wt.t;
+SELECT COUNT(*), SUM(v LIKE 's%'), SUM(v LIKE 'w%') FROM src.t;
+SELECT id, v FROM wt2.t WHERE id IN (1, 7);
+SELECT id, v, LENGTH(b), LEFT(b, 1) FROM wt.t WHERE id IN (100, 9001);
+SELECT id, LENGTH(b), LEFT(b, 1) FROM src.t WHERE id = 100;
+SELECT COUNT(*) FROM wt.t FORCE INDEX (v) WHERE v LIKE 'w%';
+CHECK TABLE src.t, wt.t, wt2.t;
+
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;

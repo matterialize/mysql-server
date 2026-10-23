@@ -1,0 +1,38 @@
+--echo # LOB pages are located through the index's tablespace, never the
+--echo # (ancestor) space id stored in the LOB reference.
+
+CREATE DATABASE src;
+CREATE TABLE src.d (id INT PRIMARY KEY, t LONGTEXT, b LONGBLOB, j JSON);
+INSERT INTO src.d VALUES
+  (1, REPEAT('a', 100000), REPEAT('A', 300000), JSON_OBJECT('k', REPEAT('j', 50000))),
+  (2, REPEAT('b', 20000),  NULL,                JSON_ARRAY(1,2,3)),
+  (3, 'short',             REPEAT('C', 9000),   JSON_OBJECT('k', REPEAT('q', 30000)));
+
+CREATE WORKTREE wt FROM src;
+SELECT id, LENGTH(t), LENGTH(b), LENGTH(j->>'$.k'), SHA2(t, 256), SHA2(b, 256) FROM wt.d ORDER BY id;
+
+--echo # Rewrite, partially update, and delete LOBs in the worktree.
+UPDATE wt.d SET t = REPEAT('x', 120000) WHERE id = 1;
+UPDATE wt.d SET j = JSON_SET(j, '$.k', 'tiny') WHERE id = 3;
+UPDATE wt.d SET b = CONCAT(b, 'tail') WHERE id = 1;
+DELETE FROM wt.d WHERE id = 2;
+INSERT INTO wt.d VALUES (4, REPEAT('n', 70000), REPEAT('N', 70000), NULL);
+
+--echo # And in the source.
+UPDATE src.d SET b = REPEAT('S', 250000) WHERE id = 3;
+DELETE FROM src.d WHERE id = 1;
+
+--echo # Purge frees the old LOB pages on each side, in its own file.
+SET GLOBAL innodb_purge_run_now = ON;
+--source include/wait_innodb_all_purged.inc
+
+SELECT id, LENGTH(t), LENGTH(b), LENGTH(j->>'$.k'), SHA2(t, 256), SHA2(b, 256) FROM src.d ORDER BY id;
+SELECT id, LENGTH(t), LENGTH(b), LENGTH(j->>'$.k'), SHA2(t, 256), SHA2(b, 256) FROM wt.d ORDER BY id;
+CHECK TABLE src.d, wt.d;
+
+--source include/restart_mysqld.inc
+SELECT id, LENGTH(t), LENGTH(b), SHA2(t, 256), SHA2(b, 256) FROM src.d ORDER BY id;
+SELECT id, LENGTH(t), LENGTH(b), SHA2(t, 256), SHA2(b, 256) FROM wt.d ORDER BY id;
+
+DROP DATABASE wt;
+DROP DATABASE src;

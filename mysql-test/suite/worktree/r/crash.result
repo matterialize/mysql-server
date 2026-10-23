@@ -1,0 +1,92 @@
+# kill -9 at every phase of CREATE WORKTREE (fork-design.md §12.2):
+# before the commit nothing survives and the statement can be re-run;
+# after it the worktree is complete.
+CREATE DATABASE src;
+CREATE TABLE src.a (id INT PRIMARY KEY, v VARCHAR(20), b LONGBLOB);
+CREATE TABLE src.b (id INT PRIMARY KEY, aid INT, FOREIGN KEY (aid) REFERENCES src.a(id));
+INSERT INTO src.a VALUES (1, 'one', REPEAT('1', 40000)), (2, 'two', NULL);
+INSERT INTO src.b VALUES (1, 1);
+# Crash at wt_crash_after_ddl_log
+SET SESSION debug = '+d,wt_crash_after_ddl_log';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_reflink
+SET SESSION debug = '+d,wt_crash_after_reflink';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_page0
+SET SESSION debug = '+d,wt_crash_after_page0';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_rename
+SET SESSION debug = '+d,wt_crash_after_rename';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_before_commit
+SET SESSION debug = '+d,wt_crash_before_commit';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash right after the commit: the worktree is complete.
+SET SESSION debug = '+d,wt_crash_after_commit';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW TABLES FROM wt;
+Tables_in_wt
+a
+b
+SELECT id, v, LENGTH(b) FROM wt.a ORDER BY id;
+id	v	LENGTH(b)
+1	one	40000
+2	two	NULL
+SELECT * FROM wt.b;
+id	aid
+1	1
+CHECK TABLE wt.a, wt.b;
+Table	Op	Msg_type	Msg_text
+wt.a	check	status	OK
+wt.b	check	status	OK
+DROP DATABASE wt;
+# After all that, a normal clone works.
+CREATE WORKTREE wt FROM src;
+SELECT id, v, LENGTH(b) FROM wt.a ORDER BY id;
+id	v	LENGTH(b)
+1	one	40000
+2	two	NULL
+DROP DATABASE wt;
+DROP DATABASE src;

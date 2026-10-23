@@ -1,0 +1,44 @@
+--echo # A read view older than the clone cannot follow roll pointers into
+--echo # undo written for the source table: it gets ER_TABLE_DEF_CHANGED.
+
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v INT);
+INSERT INTO src.t VALUES (1, 1), (2, 2);
+
+--connect (old, localhost, root)
+START TRANSACTION WITH CONSISTENT SNAPSHOT;
+SELECT * FROM src.t ORDER BY id;
+
+--connection default
+UPDATE src.t SET v = 100 WHERE id = 1;
+CREATE WORKTREE wt FROM src;
+
+--connection old
+--error ER_TABLE_DEF_CHANGED
+SELECT * FROM wt.t;
+SELECT * FROM src.t ORDER BY id;
+COMMIT;
+SELECT * FROM wt.t ORDER BY id;
+--disconnect old
+
+--connection default
+--echo # A writer holding a source table delays the clone (MDL SNW) until it ends.
+--connect (writer, localhost, root)
+BEGIN;
+INSERT INTO src.t VALUES (3, 3);
+--connection default
+SET SESSION lock_wait_timeout = 1;
+--error ER_LOCK_WAIT_TIMEOUT
+CREATE WORKTREE wt2 FROM src;
+SHOW DATABASES LIKE 'wt2';
+--connection writer
+COMMIT;
+--disconnect writer
+--connection default
+SET SESSION lock_wait_timeout = DEFAULT;
+CREATE WORKTREE wt2 FROM src;
+SELECT * FROM wt2.t ORDER BY id;
+
+DROP DATABASE wt;
+DROP DATABASE wt2;
+DROP DATABASE src;

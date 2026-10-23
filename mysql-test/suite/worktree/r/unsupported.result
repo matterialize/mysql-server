@@ -1,0 +1,64 @@
+# Cases outside the reflink core are refused with a clear error and
+# leave nothing behind.
+CREATE DATABASE src;
+CREATE TABLE src.ok (id INT PRIMARY KEY);
+CREATE TABLE src.f (id INT PRIMARY KEY, txt TEXT, FULLTEXT(txt));
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of tables with FULLTEXT indexes'
+DROP TABLE src.f;
+CREATE TABLE src.z (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of ROW_FORMAT=COMPRESSED tables'
+DROP TABLE src.z;
+CREATE TABLE src.m (id INT PRIMARY KEY) ENGINE=MyISAM;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with non-InnoDB tables'
+DROP TABLE src.m;
+CREATE TABLE src.pt (id INT PRIMARY KEY) PARTITION BY HASH(id) PARTITIONS 2;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of partitioned tables'
+DROP TABLE src.pt;
+CREATE TABLESPACE ts1 ADD DATAFILE 'ts1.ibd';
+CREATE TABLE src.g (id INT PRIMARY KEY) TABLESPACE ts1;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of tables in shared or general tablespaces'
+DROP TABLE src.g;
+DROP TABLESPACE ts1;
+CREATE TABLE src.s (id INT PRIMARY KEY) TABLESPACE innodb_system;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of tables in shared or general tablespaces'
+DROP TABLE src.s;
+CREATE VIEW src.v AS SELECT * FROM src.ok;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with views'
+DROP VIEW src.v;
+CREATE PROCEDURE src.pr() SELECT 1;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with stored routines'
+DROP PROCEDURE src.pr;
+CREATE TRIGGER src.tr BEFORE INSERT ON src.ok FOR EACH ROW SET NEW.id = NEW.id;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with triggers'
+DROP TRIGGER src.tr;
+CREATE EVENT src.ev ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1;
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with events'
+DROP EVENT src.ev;
+# Nothing was left behind by the refusals.
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# An error after files were cloned rolls everything back.
+CREATE TABLE src.ok2 (id INT PRIMARY KEY);
+SET SESSION debug = '+d,wt_fail_after_page0';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Unknown error
+SET SESSION debug = '-d,wt_fail_after_page0';
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+CREATE WORKTREE wt FROM src;
+SHOW TABLES FROM wt;
+Tables_in_wt
+ok
+ok2
+DROP DATABASE wt;
+DROP DATABASE src;

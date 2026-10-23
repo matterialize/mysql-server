@@ -1,0 +1,68 @@
+# AUTO_INCREMENT continues from the source's counter, including values
+# used by deleted or rolled-back rows, and survives restarts.
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT AUTO_INCREMENT PRIMARY KEY, v CHAR(2));
+CREATE TABLE src.n (id INT PRIMARY KEY);
+INSERT INTO src.t (v) VALUES ('a'), ('b'), ('c'), ('d');
+DELETE FROM src.t WHERE id = 4;
+BEGIN;
+INSERT INTO src.t (v) VALUES ('r');
+ROLLBACK;
+# Counter known only from persisted metadata (table not opened yet).
+# restart
+CREATE WORKTREE wt FROM src;
+INSERT INTO wt.t (v) VALUES ('w');
+INSERT INTO src.t (v) VALUES ('s');
+SELECT * FROM wt.t ORDER BY id;
+id	v
+1	a
+2	b
+3	c
+6	w
+SELECT * FROM src.t ORDER BY id;
+id	v
+1	a
+2	b
+3	c
+6	s
+# Counter live in memory.
+INSERT INTO src.t (v) VALUES ('m');
+CREATE WORKTREE wt2 FROM src;
+INSERT INTO wt2.t (v) VALUES ('x');
+SELECT * FROM wt2.t ORDER BY id;
+id	v
+1	a
+2	b
+3	c
+6	s
+7	m
+8	x
+# restart
+INSERT INTO wt.t (v) VALUES ('w2');
+INSERT INTO wt2.t (v) VALUES ('x2');
+SELECT * FROM wt.t ORDER BY id;
+id	v
+1	a
+2	b
+3	c
+6	w
+7	w2
+SELECT * FROM wt2.t ORDER BY id;
+id	v
+1	a
+2	b
+3	c
+6	s
+7	m
+8	x
+9	x2
+SHOW CREATE TABLE wt2.t;
+Table	Create Table
+t	CREATE TABLE `t` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `v` char(2) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=10 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+DROP DATABASE wt;
+DROP DATABASE wt2;
+DROP DATABASE src;

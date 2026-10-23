@@ -1,0 +1,48 @@
+--echo # kill -9 at every phase of CREATE WORKTREE (fork-design.md §12.2):
+--echo # before the commit nothing survives and the statement can be re-run;
+--echo # after it the worktree is complete.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+
+CREATE DATABASE src;
+CREATE TABLE src.a (id INT PRIMARY KEY, v VARCHAR(20), b LONGBLOB);
+CREATE TABLE src.b (id INT PRIMARY KEY, aid INT, FOREIGN KEY (aid) REFERENCES src.a(id));
+INSERT INTO src.a VALUES (1, 'one', REPEAT('1', 40000)), (2, 'two', NULL);
+INSERT INTO src.b VALUES (1, 1);
+let $datadir= `SELECT @@datadir`;
+
+let $points = wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_before_commit;
+while ($points)
+{
+  let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
+  let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
+  --echo # Crash at $point
+  --source include/expect_crash.inc
+  eval SET SESSION debug = '+d,$point';
+  --error CR_SERVER_LOST
+  CREATE WORKTREE wt FROM src;
+  --source include/start_mysqld.inc
+  SHOW DATABASES LIKE 'wt';
+  --echo # no schema directory, no clone files
+  --error 1
+  --file_exists $datadir/wt
+  SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+}
+
+--echo # Crash right after the commit: the worktree is complete.
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_after_commit';
+--error CR_SERVER_LOST
+CREATE WORKTREE wt FROM src;
+--source include/start_mysqld.inc
+SHOW TABLES FROM wt;
+SELECT id, v, LENGTH(b) FROM wt.a ORDER BY id;
+SELECT * FROM wt.b;
+CHECK TABLE wt.a, wt.b;
+DROP DATABASE wt;
+
+--echo # After all that, a normal clone works.
+CREATE WORKTREE wt FROM src;
+SELECT id, v, LENGTH(b) FROM wt.a ORDER BY id;
+DROP DATABASE wt;
+DROP DATABASE src;

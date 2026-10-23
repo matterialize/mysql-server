@@ -1,0 +1,98 @@
+# Foreign keys inside the source are remapped to the worktree;
+# foreign keys to other schemas keep pointing there.
+CREATE DATABASE other;
+CREATE TABLE other.country (code CHAR(2) PRIMARY KEY);
+INSERT INTO other.country VALUES ('US'), ('CA');
+CREATE DATABASE src;
+CREATE TABLE src.p (id INT PRIMARY KEY, cc CHAR(2),
+FOREIGN KEY (cc) REFERENCES other.country(code));
+CREATE TABLE src.c (id INT PRIMARY KEY, pid INT,
+FOREIGN KEY (pid) REFERENCES src.p(id) ON DELETE CASCADE);
+CREATE TABLE src.r (id INT PRIMARY KEY, pid INT,
+FOREIGN KEY (pid) REFERENCES src.p(id));
+INSERT INTO src.p VALUES (1, 'US'), (2, 'CA'), (3, 'US');
+INSERT INTO src.c VALUES (10, 1), (11, 1), (12, 2);
+INSERT INTO src.r VALUES (20, 3);
+CREATE WORKTREE wt FROM src;
+SHOW CREATE TABLE wt.c;
+Table	Create Table
+c	CREATE TABLE `c` (
+  `id` int NOT NULL,
+  `pid` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `pid` (`pid`),
+  CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SHOW CREATE TABLE wt.p;
+Table	Create Table
+p	CREATE TABLE `p` (
+  `id` int NOT NULL,
+  `cc` char(2) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `cc` (`cc`),
+  CONSTRAINT `p_ibfk_1` FOREIGN KEY (`cc`) REFERENCES `other`.`country` (`code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+SELECT TABLE_SCHEMA, TABLE_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME
+FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = 'wt' AND REFERENCED_TABLE_NAME IS NOT NULL
+ORDER BY TABLE_NAME;
+TABLE_SCHEMA	TABLE_NAME	REFERENCED_TABLE_SCHEMA	REFERENCED_TABLE_NAME
+wt	c	wt	p
+wt	p	other	country
+wt	r	wt	p
+# Cascade inside the worktree only.
+DELETE FROM wt.p WHERE id = 1;
+SELECT * FROM wt.c ORDER BY id;
+id	pid
+12	2
+SELECT * FROM src.c ORDER BY id;
+id	pid
+10	1
+11	1
+12	2
+# Restrict inside the worktree.
+DELETE FROM wt.p WHERE id = 3;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`wt`.`r`, CONSTRAINT `r_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`))
+INSERT INTO wt.c VALUES (13, 99);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`wt`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`) ON DELETE CASCADE)
+INSERT INTO wt.p VALUES (4, 'ZZ');
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`wt`.`p`, CONSTRAINT `p_ibfk_1` FOREIGN KEY (`cc`) REFERENCES `other`.`country` (`code`))
+# A worktree parent is not the source's parent.
+DELETE FROM wt.r;
+DELETE FROM wt.p WHERE id = 3;
+DELETE FROM src.p WHERE id = 3;
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`src`.`r`, CONSTRAINT `r_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`))
+INSERT INTO wt.p VALUES (5, 'CA');
+INSERT INTO src.c VALUES (14, 5);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`src`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`) ON DELETE CASCADE)
+SELECT * FROM src.p ORDER BY id;
+id	cc
+1	US
+2	CA
+3	US
+SELECT * FROM wt.p ORDER BY id;
+id	cc
+2	CA
+5	CA
+# The external parent enforces its new worktree child (its cached
+# definitions were reloaded with the new child).
+INSERT INTO other.country VALUES ('MX');
+INSERT INTO wt.p VALUES (6, 'MX');
+DELETE FROM other.country WHERE code = 'MX';
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`wt`.`p`, CONSTRAINT `p_ibfk_1` FOREIGN KEY (`cc`) REFERENCES `other`.`country` (`code`))
+UPDATE other.country SET code = 'XX' WHERE code = 'MX';
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`wt`.`p`, CONSTRAINT `p_ibfk_1` FOREIGN KEY (`cc`) REFERENCES `other`.`country` (`code`))
+DELETE FROM wt.p WHERE id = 6;
+DELETE FROM other.country WHERE code = 'MX';
+# Dropping the source does not orphan the worktree's FKs.
+SET foreign_key_checks = 0;
+DROP DATABASE src;
+SET foreign_key_checks = 1;
+# restart
+DELETE FROM wt.p WHERE id = 2;
+SELECT * FROM wt.c ORDER BY id;
+id	pid
+INSERT INTO wt.c VALUES (15, 2);
+ERROR 23000: Cannot add or update a child row: a foreign key constraint fails (`wt`.`c`, CONSTRAINT `c_ibfk_1` FOREIGN KEY (`pid`) REFERENCES `p` (`id`) ON DELETE CASCADE)
+DROP DATABASE wt;
+DROP DATABASE other;

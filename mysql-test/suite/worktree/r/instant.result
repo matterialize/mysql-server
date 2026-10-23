@@ -1,0 +1,68 @@
+# INSTANT ADD/DROP COLUMN row versions survive the clone: rows written
+# under each version still parse.
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, a INT, b VARCHAR(10));
+INSERT INTO src.t VALUES (1, 10, 'v0');
+ALTER TABLE src.t ADD COLUMN c INT DEFAULT 7, ALGORITHM=INSTANT;
+INSERT INTO src.t VALUES (2, 20, 'v1', 2);
+ALTER TABLE src.t DROP COLUMN a, ALGORITHM=INSTANT;
+INSERT INTO src.t VALUES (3, 'v2', 3);
+ALTER TABLE src.t ADD COLUMN d VARCHAR(10) DEFAULT 'dd' FIRST, ALGORITHM=INSTANT;
+INSERT INTO src.t VALUES ('x', 4, 'v3', 4);
+SELECT NAME, TOTAL_ROW_VERSIONS FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME = 'src/t';
+NAME	TOTAL_ROW_VERSIONS
+src/t	3
+CREATE WORKTREE wt FROM src;
+SELECT NAME, TOTAL_ROW_VERSIONS FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME = 'wt/t';
+NAME	TOTAL_ROW_VERSIONS
+wt/t	3
+SELECT * FROM src.t ORDER BY id;
+d	id	b	c
+dd	1	v0	7
+dd	2	v1	2
+dd	3	v2	3
+x	4	v3	4
+SELECT * FROM wt.t ORDER BY id;
+d	id	b	c
+dd	1	v0	7
+dd	2	v1	2
+dd	3	v2	3
+x	4	v3	4
+# Keep evolving the worktree only.
+ALTER TABLE wt.t ADD COLUMN e INT DEFAULT 99, ALGORITHM=INSTANT;
+UPDATE wt.t SET b = CONCAT(b, '+') WHERE id IN (1, 3);
+INSERT INTO wt.t VALUES ('y', 5, 'v4', 5, 55);
+ALTER TABLE wt.t DROP COLUMN c, ALGORITHM=INSTANT;
+SELECT * FROM wt.t ORDER BY id;
+d	id	b	e
+dd	1	v0+	99
+dd	2	v1	99
+dd	3	v2+	99
+x	4	v3	99
+y	5	v4	55
+SELECT * FROM src.t ORDER BY id;
+d	id	b	c
+dd	1	v0	7
+dd	2	v1	2
+dd	3	v2	3
+x	4	v3	4
+CHECK TABLE src.t, wt.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+wt.t	check	status	OK
+# restart
+SELECT * FROM wt.t ORDER BY id;
+d	id	b	e
+dd	1	v0+	99
+dd	2	v1	99
+dd	3	v2+	99
+x	4	v3	99
+y	5	v4	55
+SELECT * FROM src.t ORDER BY id;
+d	id	b	c
+dd	1	v0	7
+dd	2	v1	2
+dd	3	v2	3
+x	4	v3	4
+DROP DATABASE wt;
+DROP DATABASE src;

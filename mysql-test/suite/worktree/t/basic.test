@@ -1,0 +1,68 @@
+--echo # CREATE WORKTREE: a copy-on-write schema clone; isolation both ways.
+
+CREATE DATABASE golden;
+CREATE TABLE golden.users (id INT PRIMARY KEY, email VARCHAR(64), KEY(email));
+CREATE TABLE golden.empty_t (a INT);
+INSERT INTO golden.users VALUES (7, 'old@x.com'), (8, 'b@x.com'), (9, 'c@x.com');
+
+CREATE WORKTREE wt FROM golden;
+SHOW TABLES FROM wt;
+SHOW CREATE TABLE wt.users;
+SELECT * FROM wt.users ORDER BY id;
+
+--echo # Worktree changes stay in the worktree.
+UPDATE wt.users SET email = 'new@x.com' WHERE id = 7;
+DELETE FROM wt.users WHERE id = 8;
+INSERT INTO wt.users VALUES (10, 'wt@x.com');
+SELECT email FROM golden.users WHERE id = 7;
+SELECT email FROM wt.users WHERE id = 7;
+SELECT * FROM golden.users ORDER BY id;
+SELECT * FROM wt.users ORDER BY id;
+SELECT * FROM wt.users FORCE INDEX(email) ORDER BY email;
+
+--echo # Source changes after the clone do not reach the worktree.
+INSERT INTO golden.users VALUES (11, 'later@x.com');
+UPDATE golden.users SET email = 'gold@x.com' WHERE id = 9;
+SELECT * FROM golden.users ORDER BY id;
+SELECT * FROM wt.users ORDER BY id;
+
+--echo # DDL on one side only.
+ALTER TABLE wt.users ADD COLUMN note VARCHAR(10) DEFAULT 'n';
+ALTER TABLE wt.users ADD INDEX (note), ALGORITHM=INPLACE;
+SELECT * FROM wt.users ORDER BY id;
+SHOW CREATE TABLE golden.users;
+OPTIMIZE TABLE wt.users;
+SELECT * FROM wt.users ORDER BY id;
+INSERT INTO wt.empty_t VALUES (1);
+SELECT * FROM golden.empty_t;
+
+CHECK TABLE golden.users, wt.users, wt.empty_t;
+
+--echo # A restart keeps both sides.
+--source include/restart_mysqld.inc
+SELECT * FROM golden.users ORDER BY id;
+SELECT * FROM wt.users ORDER BY id;
+
+--echo # One .ibd per table, no .cfg/.cfp or leftover clone files.
+--let $datadir= `SELECT @@datadir`
+--list_files $datadir/wt
+
+--echo # Errors.
+--error ER_DB_CREATE_EXISTS
+CREATE WORKTREE wt FROM golden;
+--error ER_DB_CREATE_EXISTS
+CREATE WORKTREE golden FROM golden;
+--error ER_BAD_DB_ERROR
+CREATE WORKTREE wt9 FROM no_such_db;
+--error ER_NOT_SUPPORTED_YET
+CREATE WORKTREE wt9 FROM mysql;
+SHOW DATABASES LIKE 'wt%';
+
+DROP DATABASE wt;
+SELECT * FROM golden.users ORDER BY id;
+--error 1
+--file_exists $datadir/wt
+CREATE WORKTREE wt FROM golden;
+SELECT * FROM wt.users ORDER BY id;
+DROP DATABASE wt;
+DROP DATABASE golden;

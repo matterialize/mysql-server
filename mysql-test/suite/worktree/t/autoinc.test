@@ -1,0 +1,34 @@
+--echo # AUTO_INCREMENT continues from the source's counter, including values
+--echo # used by deleted or rolled-back rows, and survives restarts.
+
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT AUTO_INCREMENT PRIMARY KEY, v CHAR(2));
+CREATE TABLE src.n (id INT PRIMARY KEY);
+INSERT INTO src.t (v) VALUES ('a'), ('b'), ('c'), ('d');
+DELETE FROM src.t WHERE id = 4;
+BEGIN; INSERT INTO src.t (v) VALUES ('r'); ROLLBACK;
+
+--echo # Counter known only from persisted metadata (table not opened yet).
+--source include/restart_mysqld.inc
+CREATE WORKTREE wt FROM src;
+INSERT INTO wt.t (v) VALUES ('w');
+INSERT INTO src.t (v) VALUES ('s');
+SELECT * FROM wt.t ORDER BY id;
+SELECT * FROM src.t ORDER BY id;
+
+--echo # Counter live in memory.
+INSERT INTO src.t (v) VALUES ('m');
+CREATE WORKTREE wt2 FROM src;
+INSERT INTO wt2.t (v) VALUES ('x');
+SELECT * FROM wt2.t ORDER BY id;
+
+--source include/restart_mysqld.inc
+INSERT INTO wt.t (v) VALUES ('w2');
+INSERT INTO wt2.t (v) VALUES ('x2');
+SELECT * FROM wt.t ORDER BY id;
+SELECT * FROM wt2.t ORDER BY id;
+SHOW CREATE TABLE wt2.t;
+
+DROP DATABASE wt;
+DROP DATABASE wt2;
+DROP DATABASE src;

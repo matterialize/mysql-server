@@ -271,6 +271,10 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   if (rewrite_page0(tmp_path, space_id, src->space, page_size, ids, roots))
     return true;
   DBUG_EXECUTE_IF("wt_crash_after_page0", DBUG_SUICIDE(););
+  DBUG_EXECUTE_IF("wt_fail_after_page0", {
+    my_error(ER_UNKNOWN_ERROR, MYF(0));
+    return true;
+  });
 
   /* Only now may the startup scan see it as an .ibd (no duplicate space id). */
   if (rename(tmp_path.c_str(), path.c_str()) != 0)

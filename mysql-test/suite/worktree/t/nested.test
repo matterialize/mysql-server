@@ -1,0 +1,37 @@
+--echo # Worktree of a worktree: pages can carry any ancestor's stamp.
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(20), k INT, KEY(k));
+INSERT INTO src.t VALUES (1,'s1',1),(2,'s2',2),(3,'s3',3);
+# Enough rows to have several pages per index.
+INSERT INTO src.t SELECT seq, CONCAT('r', seq), seq % 97
+  FROM (WITH RECURSIVE s(seq) AS (SELECT 4 UNION ALL SELECT seq+1 FROM s WHERE seq < 20000) SELECT seq FROM s) x;
+
+CREATE WORKTREE wt1 FROM src;
+UPDATE wt1.t SET v = 'w1' WHERE id = 1;
+CREATE WORKTREE wt2 FROM wt1;
+UPDATE wt2.t SET v = 'w2' WHERE id = 2;
+CREATE WORKTREE wt3 FROM wt2;
+UPDATE wt3.t SET v = 'w3' WHERE id = 3;
+DELETE FROM wt3.t WHERE id > 10000;
+
+SELECT id, v FROM src.t WHERE id <= 3 ORDER BY id;
+SELECT id, v FROM wt1.t WHERE id <= 3 ORDER BY id;
+SELECT id, v FROM wt2.t WHERE id <= 3 ORDER BY id;
+SELECT id, v FROM wt3.t WHERE id <= 3 ORDER BY id;
+SELECT COUNT(*), SUM(k) FROM src.t;
+SELECT COUNT(*), SUM(k) FROM wt2.t FORCE INDEX(k);
+SELECT COUNT(*), SUM(k) FROM wt3.t FORCE INDEX(k);
+CHECK TABLE src.t, wt1.t, wt2.t, wt3.t;
+
+--echo # Dropping a middle worktree leaves its descendants intact.
+DROP DATABASE wt2;
+--source include/restart_mysqld.inc
+SELECT id, v FROM wt3.t WHERE id <= 3 ORDER BY id;
+SELECT COUNT(*) FROM wt3.t;
+CHECK TABLE wt1.t, wt3.t;
+
+DROP DATABASE wt1;
+DROP DATABASE wt3;
+DROP DATABASE src;
