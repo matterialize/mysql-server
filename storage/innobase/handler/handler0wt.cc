@@ -21,6 +21,8 @@ Free Software Foundation.
 #include <sys/ioctl.h>
 #endif
 
+#include <map>
+#include <mutex>
 #include <string>
 
 #include "api0api.h"
@@ -421,6 +423,22 @@ std::vector<std::string> fts_aux_names(
   return names;
 }
 
+/** Take (hold = true) or drop a clone's hold on an FTS table: the first
+hold removes it from the optimize thread, the last release adds it back. */
+void fts_hold(dict_table_t *table, bool hold) {
+  static std::mutex mutex;
+  static std::map<table_id_t, int> holds;
+  const std::lock_guard<std::mutex> guard(mutex);
+  if (hold) {
+    if (holds[table->id]++ == 0) fts_optimize_remove_table(table);
+  } else if (--holds[table->id] == 0) {
+    holds.erase(table->id);
+    dict_sys_mutex_enter();
+    fts_optimize_add_table(table);
+    dict_sys_mutex_exit();
+  }
+}
+
 }  // namespace
 
 bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
@@ -533,23 +551,17 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
 
     /* Quiesce additions: keep the optimize thread away from the table and
     write the FTS cache out, so documents committed out of order are not
-    missed by the clone. */
-    fts_optimize_remove_table(fts_src);
+    missed by the clone. Concurrent clones of one table share the hold. */
+    fts_hold(fts_src, true);
     if (fts_src->fts->cache != nullptr &&
         fts_sync_table(fts_src, false, true, false) != DB_SUCCESS) {
-      dict_sys_mutex_enter();
-      fts_optimize_add_table(fts_src);
-      dict_sys_mutex_exit();
+      fts_hold(fts_src, false);
       my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: FTS sync");
       return true;
     }
   }
   auto fts_guard = create_scope_guard([&]() {
-    if (has_fts) {
-      dict_sys_mutex_enter();
-      fts_optimize_add_table(fts_src);
-      dict_sys_mutex_exit();
-    }
+    if (has_fts) fts_hold(fts_src, false);
   });
   DBUG_EXECUTE_IF("wt_crash_after_ddl_log", DBUG_SUICIDE(););
 

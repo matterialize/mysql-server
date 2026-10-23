@@ -1786,6 +1786,7 @@ void mysql_sql_stmt_prepare(THD *thd) {
   const char *query = get_dynamic_sql_string(lex, &query_len);
   if (query == nullptr) return; /* out of memory */
   query = worktree_remap_dynamic_sql(thd, query, &query_len);
+  if (query == nullptr) return; /* error reported: never run it unremapped */
 
   stmt = new Prepared_statement(thd);
   if (stmt == nullptr) return; /* out of memory */

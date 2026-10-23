@@ -44,6 +44,11 @@ Remap_result remap_schema(
 const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
                                        size_t *query_len);
 
+/** Keep the cache of which schemas are worktrees current (CREATE WORKTREE,
+DROP DATABASE). worktree_remap_dynamic_sql() returns nullptr, with the error
+reported, when it cannot tell whether to remap: it fails closed. */
+void worktree_schema_changed(const char *db, bool is_worktree);
+
 /**
   CREATE WORKTREE wt FROM src: a new schema whose tables are copy-on-write
   clones of src's tables. The destination name is LEX::name, like CREATE

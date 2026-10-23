@@ -252,6 +252,17 @@ SELECT @o, @o2;
 CALL wt.p_literal();
 note
 src.t is where it came from
+# If the remap cannot run (here: its lock fails), PREPARE fails rather
+# than running the statement unremapped against the source.
+SET SESSION debug = '+d,wt_remap_lock_fails';
+CALL wt.p_dyn(@w);
+ERROR 40001: Deadlock found when trying to get lock; try restarting transaction
+SET SESSION debug = '-d,wt_remap_lock_fails';
+# Calls in an ordinary schema never take that path.
+CALL src.p_dyn(@s);
+SELECT @s;
+@s
+3
 # Top-level dynamic SQL is never remapped.
 USE wt;
 SET @q = 'SELECT COUNT(*) FROM src.t';

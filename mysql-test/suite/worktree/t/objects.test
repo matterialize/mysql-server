@@ -124,6 +124,22 @@ CALL wt.p_other(@o2);
 SELECT @o, @o2;
 CALL wt.p_literal();
 
+--echo # If the remap cannot run (here: its lock fails), PREPARE fails rather
+--echo # than running the statement unremapped against the source.
+--disable_query_log
+let $have_debug = `SELECT VERSION() LIKE '%debug%'`;
+--enable_query_log
+if ($have_debug)
+{
+  SET SESSION debug = '+d,wt_remap_lock_fails';
+  --error ER_LOCK_DEADLOCK
+  CALL wt.p_dyn(@w);
+  SET SESSION debug = '-d,wt_remap_lock_fails';
+}
+--echo # Calls in an ordinary schema never take that path.
+CALL src.p_dyn(@s);
+SELECT @s;
+
 --echo # Top-level dynamic SQL is never remapped.
 USE wt;
 SET @q = 'SELECT COUNT(*) FROM src.t';

@@ -7,6 +7,8 @@
 #include "sql/sql_worktree.h"
 
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -616,6 +618,7 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   };
 
   if (mysql_create_db(thd, wt, &create_info, populate)) return true;
+  worktree_schema_changed(wt, true);
 
   /* Still under X MDL: drop cached definitions of the external parents so
   they are reloaded with their new children (TDC, DD cache and SE cache). */
@@ -639,6 +642,28 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   return false;
 }
 
+namespace {
+/** Which schemas are worktrees: answers the common "no" without a lock.
+Set by CREATE WORKTREE, cleared by DROP DATABASE, filled lazily from the DD. */
+std::mutex wt_known_mutex;
+std::unordered_map<std::string, bool> wt_known;
+
+std::string wt_key(const char *db) {
+  std::string k(db);
+  if (lower_case_table_names != 0)
+    for (auto &ch : k) ch = tolower(static_cast<unsigned char>(ch));
+  return k;
+}
+}  // namespace
+
+void worktree_schema_changed(const char *db, bool is_worktree) {
+  const std::lock_guard<std::mutex> guard(wt_known_mutex);
+  if (is_worktree)
+    wt_known[wt_key(db)] = true;
+  else
+    wt_known.erase(wt_key(db));
+}
+
 const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
                                        size_t *query_len) {
   /* Only PREPARE issued inside a stored program of a worktree; top-level user
@@ -647,35 +672,48 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
     return query;
   const LEX_STRING &db = thd->sp_runtime_ctx->sp->m_db;
   if (db.length == 0) return query;
+  {
+    const std::lock_guard<std::mutex> guard(wt_known_mutex);
+    auto it = wt_known.find(wt_key(db.str));
+    if (it != wt_known.end() && !it->second) return query;
+  }
 
-  /* The lock must outlive the releaser of the DD objects acquired under it. */
+  /* Fail closed from here on: running the statement unremapped would run it
+  against the source. A lock conflict (e.g. a concurrent CREATE WORKTREE FROM
+  this worktree) fails the PREPARE; the caller's transaction can retry.
+  The lock must outlive the releaser of the DD objects acquired under it. */
   MDL_ticket *ticket = nullptr;
   auto release = create_scope_guard([&]() {
     if (ticket != nullptr) thd->mdl_context.release_lock(ticket);
   });
-  if (dd::mdl_lock_schema(thd, db.str, MDL_EXPLICIT, &ticket)) {
-    thd->clear_error();
-    return query;
-  }
+  DBUG_EXECUTE_IF("wt_remap_lock_fails", {
+    my_error(ER_LOCK_DEADLOCK, MYF(0));
+    return nullptr;
+  });
+  if (dd::mdl_lock_schema(thd, db.str, MDL_EXPLICIT, &ticket)) return nullptr;
   dd::cache::Dictionary_client &dc = *thd->dd_client();
   const dd::cache::Dictionary_client::Auto_releaser releaser(&dc);
   const dd::Schema *schema = nullptr;
+  if (dc.acquire(db.str, &schema)) return nullptr;
   dd::String_type src;
-  if (dc.acquire(db.str, &schema) || schema == nullptr ||
-      !schema->options().exists("worktree_of") ||
-      schema->options().get("worktree_of", &src)) {
-    thd->clear_error();
-    return query;
+  const bool is_worktree =
+      schema != nullptr && schema->options().exists("worktree_of");
+  {
+    const std::lock_guard<std::mutex> guard(wt_known_mutex);
+    if (schema != nullptr) wt_known[wt_key(db.str)] = is_worktree;
+  }
+  if (!is_worktree) return query;
+  if (schema->options().get("worktree_of", &src)) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: lineage");
+    return nullptr;
   }
 
   /* Remap src.x only if the worktree has x (a table, view or routine). */
   std::vector<dd::String_type> names, procs, funcs;
   if (dc.fetch_schema_component_names<dd::Abstract_table>(schema, &names) ||
       dc.fetch_schema_component_names<dd::Procedure>(schema, &procs) ||
-      dc.fetch_schema_component_names<dd::Function>(schema, &funcs)) {
-    thd->clear_error();
-    return query;
-  }
+      dc.fetch_schema_component_names<dd::Function>(schema, &funcs))
+    return nullptr;
   names.insert(names.end(), procs.begin(), procs.end());
   names.insert(names.end(), funcs.begin(), funcs.end());
   const auto exists = [&](const std::string &name) {
@@ -700,7 +738,7 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
   if (remapped == 0) return query;
   const Remap_result r{text, remapped};
   char *out = thd->strmake(r.text.c_str(), r.text.size());
-  if (out == nullptr) return query;
+  if (out == nullptr) return nullptr;  // OOM is reported by strmake
   *query_len = r.text.size();
   return out;
 }
