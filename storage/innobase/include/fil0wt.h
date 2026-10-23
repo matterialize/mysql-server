@@ -1,0 +1,92 @@
+/*****************************************************************************
+
+Copyright (c) 2026, MySQL worktrees contributors.
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License, version 2.0, as published by the
+Free Software Foundation.
+
+*****************************************************************************/
+
+/** @file include/fil0wt.h
+ Worktrees: copy-on-write clones of file-per-table tablespaces.
+
+ A worktree tablespace is a reflink of an ancestor's .ibd. Only page 0 is
+ rewritten at clone time (new space id plus the ancestor map below). Every
+ other page keeps the ancestor's space id and index ids on disk until it is
+ modified; it is translated in RAM when it is read into the buffer pool, and
+ reaches disk with its new identity only when it is really modified. */
+
+#ifndef fil0wt_h
+#define fil0wt_h
+
+#include <utility>
+#include <vector>
+
+#include "fil0fil.h"
+#include "page0size.h"
+
+/** "WTM1" */
+constexpr uint32_t WT_MAP_MAGIC = 0x57544D31;
+
+/** Longest ancestor chain a worktree may have. */
+constexpr size_t WT_MAX_ANCESTORS = 16;
+
+/** Ancestor map of a worktree tablespace, stored in the unused tail of page 0.
+On disk (big-endian): magic, n_ancestors, n_indexes, n_roots, crc32 of the
+rest, then ancestor space ids (4 bytes each), (old index id, new index id)
+pairs (8 + 8 bytes), and B-tree root page numbers incl. the SDI root (4). */
+struct wt_map_t {
+  /** Space ids whose pages this tablespace still contains. */
+  std::vector<space_id_t> ancestors;
+  /** Ancestor index id -> this tablespace's index id, sorted by the first. */
+  std::vector<std::pair<space_index_t, space_index_t>> index_map;
+  /** Root pages: their segment headers carry the space id too. */
+  std::vector<page_no_t> roots;
+
+  /** @return true if pages stamped with space_id belong to this tablespace */
+  bool is_ancestor(space_id_t space_id) const;
+
+  /** @return the index id to use for ancestor index id, or 0 if unmapped */
+  space_index_t map_index(space_index_t old_id) const;
+};
+
+/** Parse the ancestor map in page 0.
+@param[in]  page0  page 0 as read from disk
+@param[in]  page_size  tablespace page size
+@param[out] map  the map
+@return true if page 0 carries a valid map */
+bool wt_map_read(const byte *page0, const page_size_t &page_size,
+                 wt_map_t *map);
+
+/** Write the ancestor map into page 0 (the caller recomputes the checksum).
+@return false if the map does not fit */
+[[nodiscard]] bool wt_map_write(const wt_map_t &map, byte *page0,
+                                const page_size_t &page_size);
+
+/** Load a tablespace's ancestor map from page 0. Called once, when the first
+file of the tablespace is opened, before any page of it is read.
+@param[in,out]  space  tablespace
+@param[in]  page0  page 0 as read from disk */
+void fil_wt_load(fil_space_t *space, const byte *page0);
+
+/** @return the ancestor map of a tablespace, or nullptr if it is not a
+worktree. Valid while the caller holds a reference to the space. */
+const wt_map_t *fil_wt_map(const fil_space_t *space);
+
+/** @return true if LOB refs / pages stamped with ancestor are valid in
+space_id (equal or ancestor). */
+bool fil_wt_is_same_or_ancestor(space_id_t space_id, space_id_t ancestor);
+
+/** Translate a page read from an ancestor into this tablespace's identity, in
+RAM only: header space id, index id, root segment headers, then checksum. The
+caller has already validated the checksum of the bytes read from disk.
+@param[in]  map  ancestor map of the tablespace
+@param[in]  space_id  this tablespace
+@param[in,out]  frame  uncompressed page frame */
+void wt_translate_page(const wt_map_t &map, space_id_t space_id, byte *frame);
+
+/** Recompute the page checksum in RAM, the way a flush would. */
+void wt_page_recalc_checksum(byte *frame, const page_size_t &page_size);
+
+#endif /* fil0wt_h */

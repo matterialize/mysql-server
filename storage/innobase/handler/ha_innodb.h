@@ -842,6 +842,10 @@ typedef struct new_ft_info {
 @param[in]      trx     transaction to register. */
 void innobase_register_trx(handlerton *hton, THD *thd, trx_t *trx);
 
+/** CREATE WORKTREE: see clone_table_t in handler.h. */
+bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
+                          dd::Table *dst_dd, const char *dst_db);
+
 /**
 Allocates an InnoDB transaction for a MySQL handler object.
 @return InnoDB transaction handle */

@@ -67,7 +67,7 @@ ulint z_read(ReadContext *ctx, lob::ref_t ref, ulint offset, ulint len,
   fil_addr_t node_loc = fil_addr_null;
 
   ut_ad(ctx->m_index->is_clustered());
-  ut_ad(ctx->m_space_id == ref.space_id());
+  ut_ad(ctx->m_space_id == dict_index_get_space(ctx->m_index));
 
   const page_no_t first_page_no = ref.page_no();
   const space_id_t space_id = ctx->m_space_id;

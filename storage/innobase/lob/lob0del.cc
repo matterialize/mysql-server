@@ -65,7 +65,7 @@ dberr_t Deleter::free_first_page() {
         m_ctx.m_mtr->get_log_mode() == MTR_LOG_NO_REDO);
 
   page_no_t page_no = m_ctx.m_blobref.page_no();
-  space_id_t space_id = m_ctx.m_blobref.space_id();
+  space_id_t space_id = dict_index_get_space(m_ctx.m_index);
 
   x_latch_rec_page();
 

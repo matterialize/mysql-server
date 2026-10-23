@@ -874,7 +874,7 @@ dberr_t setup_dfield(const row_prebuilt_t *prebuilt, Field *field,
     dfield_set_data(dst_dfield, field_data, data_len);
     if (sql_col.is_ext()) {
       lob::ref_t ref(field_data + data_len - BTR_EXTERN_FIELD_REF_SIZE);
-      ut_ad(ref.space_id() == space_id);
+      ut_ad(ref.stored_space_id() == space_id);
     }
   } else if (dtype->mtype == DATA_SYS) {
     ut_ad(0);
@@ -1017,7 +1017,7 @@ dberr_t fill_tuple_up_to_n_cols(dtuple_t *tuple, const row_prebuilt_t *prebuilt,
       if (sql_col.is_ext()) {
         byte *tmp = field_data + data_len - BTR_EXTERN_FIELD_REF_SIZE;
         lob::ref_t ref(tmp);
-        ut_ad(ref.space_id() == space_id);
+        ut_ad(ref.stored_space_id() == space_id);
       }
     } else if (dtype->mtype == DATA_SYS) {
       ut_ad(!prebuilt->index->is_clustered());

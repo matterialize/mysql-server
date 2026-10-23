@@ -253,7 +253,7 @@ struct ref_t {
   ref_mem_t object.
   @param[out]   obj     LOB reference memory object. */
   void parse(ref_mem_t &obj) const {
-    obj.m_space_id = space_id();
+    obj.m_space_id = stored_space_id();
     obj.m_page_no = page_no();
     obj.m_offset = offset();
     obj.m_length = length();
@@ -421,9 +421,11 @@ struct ref_t {
   }
 #endif /* UNIV_DEBUG */
 
-  /** Read the space id from the blob reference.
-  @return the space id */
-  space_id_t space_id() const { return (mach_read_from_4(m_ref)); }
+  /** Read the space id stored in the blob reference. Never use it to locate
+  LOB pages: in a worktree it can name an ancestor tablespace. LOB pages always
+  live in the clustered index's tablespace, so use dict_index_get_space().
+  @return the space id stored in the reference */
+  space_id_t stored_space_id() const { return (mach_read_from_4(m_ref)); }
 
   /** Read the page number from the blob reference.
   @return the page number */
@@ -1287,7 +1289,6 @@ struct ReadContext {
   /** Read the space_id, page_no and offset information from the BLOB
   reference object and update the member variables. */
   void read_blobref() {
-    m_space_id = m_blobref.space_id();
     m_page_no = m_blobref.page_no();
     m_offset = m_blobref.offset();
   }
@@ -1462,7 +1463,7 @@ struct DeleteContext : public BtrContext {
   /** Check if tablespace supports atomic blobs.
   @return true if tablespace has atomic blobs. */
   bool has_atomic_blobs() const {
-    space_id_t space_id = m_blobref.space_id();
+    space_id_t space_id = dict_index_get_space(m_index);
     uint32_t flags = fil_space_get_flags(space_id);
     return (DICT_TF_HAS_ATOMIC_BLOBS(flags));
   }
@@ -1557,7 +1558,7 @@ inline void DeleteContext::set_blob(byte *field_ref, ulint field_no) {
 
 inline page_size_t DeleteContext::get_page_size() const {
   bool found;
-  space_id_t space_id = m_blobref.space_id();
+  space_id_t space_id = dict_index_get_space(m_index);
   const page_size_t &tmp = fil_space_get_page_size(space_id, &found);
   ut_ad(found);
   return tmp;

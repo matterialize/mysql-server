@@ -3983,6 +3983,10 @@ int mysql_execute_command(THD *thd, bool first_level) {
       if (check_access(thd, CREATE_ACL, lex->name.str, nullptr, nullptr, true,
                        false))
         break;
+      if (lex->m_sql_cmd != nullptr) {  // CREATE WORKTREE
+        res = lex->m_sql_cmd->execute(thd);
+        break;
+      }
       /*
         As mysql_create_db() may modify HA_CREATE_INFO structure passed to
         it, we need to use a copy of LEX::create_info to make execution

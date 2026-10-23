@@ -820,6 +820,7 @@ static const SYMBOL symbols[] = {
     {SYM("WITH", WITH)},
     {SYM("WITHOUT", WITHOUT_SYM)},
     {SYM("WORK", WORK_SYM)},
+    {SYM("WORKTREE", WORKTREE_SYM)},
     {SYM("WRAPPER", WRAPPER_SYM)},
     {SYM("WRITE", WRITE_SYM)},
     {SYM("X509", X509_SYM)},

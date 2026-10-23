@@ -42,6 +42,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "btr0btr.h"
 #include "buf0buf.h"
+#include "fil0wt.h"
 #include "fil0fil.h"
 #include "fsp0sysspace.h"
 #include "ha_prototypes.h"
@@ -5827,6 +5828,8 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
     page_no_t read_page_no;
     space_id_t read_space_id;
     bool is_wrong_page_id [[maybe_unused]] = false;
+    /* Set if the page is stamped with a worktree ancestor's space id. */
+    const wt_map_t *wt_map = nullptr;
 
     if (bpage->size.is_compressed()) {
       frame = bpage->zip.data;
@@ -5848,6 +5851,18 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
     should be the same as in block. */
     read_page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);
     read_space_id = mach_read_from_4(frame + FIL_PAGE_SPACE_ID);
+
+    if (read_space_id != space_id && read_page_no == page_no &&
+        !bpage->size.is_compressed()) {
+      /* Recognise an untouched worktree page before the mismatch retries;
+      it is translated only after its on-disk checksum is validated. */
+      wt_map = fil_wt_map(bpage->get_space());
+      if (wt_map != nullptr && wt_map->is_ancestor(read_space_id)) {
+        read_space_id = space_id;
+      } else {
+        wt_map = nullptr;
+      }
+    }
 
     if (bpage->id.space() == TRX_SYS_SPACE && dblwr::v1::is_inside(page_no)) {
       ib::error(ER_IB_MSG_78) << "Reading page " << bpage->id
@@ -5962,6 +5977,12 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
 
     DBUG_EXECUTE_IF("buf_page_import_corrupt_failure", page_not_corrupt
                     : bpage = bpage;);
+
+    /* In RAM only: the page is not dirtied, so it keeps sharing its disk
+    block with the ancestor until it is really modified. */
+    if (wt_map != nullptr) {
+      wt_translate_page(*wt_map, space_id, frame);
+    }
 
     if (recv_recovery_is_on()) {
       /* Pages must be uncompressed for crash recovery. */

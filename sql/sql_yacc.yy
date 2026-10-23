@@ -139,6 +139,7 @@ Note: YYTHD is passed as an argument to yyparse(), and subsequently to yylex().
 #include "sql/sql_backup_lock.h"                   // Sql_cmd_lock_instance
 #include "sql/sql_class.h"      /* Key_part_spec, enum_filetype */
 #include "sql/sql_cmd_srs.h"
+#include "sql/sql_worktree.h"                      // Sql_cmd_create_worktree
 #include "sql/sql_component.h"
 #include "sql/sql_connect.h"
 #include "sql/sql_error.h"
@@ -1492,6 +1493,8 @@ CHARSET_INFO *warn_on_deprecated_user_defined_collation(
 %token<lexer.keyword> POLICY_SYM        1241     /* MYSQL */
 %token GRAMMAR_SELECTOR_MASKING_EXPR 1242  /* synthetic token: starts data
                                               masking expression */
+
+%token<lexer.keyword> WORKTREE_SYM    1243     /* MYSQL */
 
 /*
   NOTE! When adding new non-standard keywords, make sure they are added to the
@@ -3385,6 +3388,18 @@ create:
           }
         | CREATE view_or_trigger_or_sp_or_event
           {}
+        | CREATE WORKTREE_SYM ident FROM ident
+          {
+            LEX *lex= Lex;
+            lex->create_info= YYTHD->alloc_typed<HA_CREATE_INFO>();
+            if (lex->create_info == nullptr)
+              MYSQL_YYABORT; // OOM
+            lex->sql_command= SQLCOM_CREATE_DB;
+            lex->name= $3;
+            lex->m_sql_cmd= NEW_PTN Sql_cmd_create_worktree(to_lex_cstring($5));
+            if (lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT; // OOM
+          }
         | CREATE USER opt_if_not_exists create_user_list default_role_clause
                       require_clause connect_options
                       opt_account_lock_password_expire_options
@@ -16402,6 +16417,7 @@ ident_keywords_unambiguous:
         | WEIGHT_STRING_SYM
         | WITHOUT_SYM
         | WORK_SYM
+        | WORKTREE_SYM
         | WRAPPER_SYM
         | X509_SYM
         | XID_SYM

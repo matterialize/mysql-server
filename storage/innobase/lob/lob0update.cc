@@ -101,7 +101,7 @@ dberr_t update(InsertContext &ctx, trx_t *trx, dict_index_t *index,
 #endif /* UNIV_DEBUG */
 
   page_no_t first_page_no = blobref.page_no();
-  space_id_t space_id = blobref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
 
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
@@ -273,7 +273,7 @@ dberr_t replace(InsertContext &ctx, trx_t *trx, dict_index_t *index, ref_t ref,
   DBUG_LOG("lob", "adjusted offset=" << offset << ", len=" << len);
 
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
 
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
@@ -509,7 +509,7 @@ static dberr_t replace_inline(InsertContext &ctx, trx_t *trx,
   first_page.set_last_trx_undo_no(undo_no);
 
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
 
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
@@ -589,7 +589,7 @@ dberr_t apply_undolog(mtr_t *mtr, dict_index_t *index, ref_t ref,
   const Lob_diff_vector &lob_diffs = *uf->lob_diffs;
 
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
 
 #ifdef UNIV_DEBUG
   const ulint lob_size = ref.length();

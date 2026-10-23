@@ -176,6 +176,7 @@ enum class Fil_state {
 };
 
 struct fil_space_t;
+struct wt_map_t;
 
 /** File node of a tablespace or the log data space */
 struct fil_node_t {
@@ -479,6 +480,13 @@ struct fil_space_t {
   want to temporarily prevent other threads from opening the file that is being
   renamed.  */
   bool prevent_file_open{};
+
+  /** Worktree ancestor map, or nullptr (see fil0wt.h). Set once, under the
+  shard mutex, before the first file of the space is marked open. */
+  wt_map_t *wt_map{};
+
+  /** True once page 0 has been checked for an ancestor map. */
+  bool wt_map_loaded{};
 
   /** Throttles writing to log a message about long waiting for file to perform
   rename. */

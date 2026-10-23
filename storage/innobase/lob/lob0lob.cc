@@ -32,6 +32,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "lob0first.h"
 #include "lob0inf.h"
 #include "lob0lob.h"
+#include "fil0wt.h"
 #include "lob0zip.h"
 #include "log0chkp.h"
 #include "row0upd.h"
@@ -668,8 +669,7 @@ byte *btr_rec_copy_externally_stored_field_func(
   ut_a(local_len >= BTR_EXTERN_FIELD_REF_SIZE);
 
   /* Verify if the LOB reference is sane. */
-  ut_d(space_id_t space_id = ref.space_id());
-  ut_ad(space_id == 0 || space_id == index->space);
+  ut_ad(ref.check_space_id(const_cast<dict_index_t *>(index)));
 
   if (ref.is_null()) {
     /* The externally stored field was not written yet.
@@ -823,6 +823,7 @@ ulint btr_copy_externally_stored_field_prefix_func(
     ReadContext rctx(page_size, data, local_len, buf, len IF_DEBUG(, is_sdi));
 
     rctx.m_index = const_cast<dict_index_t *>(index);
+    rctx.m_space_id = dict_index_get_space(index);
     rctx.m_trx = trx;
 
     /* Obtain length of LOB available in clustered index.*/
@@ -869,6 +870,7 @@ ulint btr_copy_externally_stored_field_prefix_func(
                    buf + local_len, len IF_DEBUG(, false));
 
   rctx.m_index = (dict_index_t *)index;
+  rctx.m_space_id = dict_index_get_space(index);
   rctx.m_trx = trx;
 
   ulint fetch_len = lob::read(&rctx, rctx.m_blobref, 0, len, buf + local_len);
@@ -901,6 +903,7 @@ byte *btr_copy_externally_stored_field_func(
                    buf + local_len, extern_len IF_DEBUG(, is_sdi));
 
   rctx.m_index = (dict_index_t *)index;
+  rctx.m_space_id = dict_index_get_space(index);
 
   if (ref_t::is_being_modified(field_ref)) {
 #ifdef UNIV_DEBUG
@@ -1139,7 +1142,7 @@ ulint ref_t::get_lob_page_info(const dict_index_t *index,
 
   mtr_start(&mtr);
 
-  block = buf_page_get(page_id_t(ref_mem.m_space_id, ref_mem.m_page_no),
+  block = buf_page_get(page_id_t(dict_index_get_space(index), ref_mem.m_page_no),
                        page_size, RW_S_LATCH, UT_LOCATION_HERE, &mtr);
 
   page_type_t page_type = block->get_page_type();
@@ -1183,7 +1186,7 @@ void ref_t::mark_not_partially_updatable(trx_t *trx, mtr_t *mtr,
     return;
   }
 
-  block = buf_page_get(page_id_t(ref_mem.m_space_id, ref_mem.m_page_no),
+  block = buf_page_get(page_id_t(dict_index_get_space(index), ref_mem.m_page_no),
                        page_size, RW_X_LATCH, UT_LOCATION_HERE, mtr);
 
   page_type_t page_type = block->get_page_type();
@@ -1230,7 +1233,7 @@ bool ref_t::is_lob_partially_updatable(const dict_index_t *index) const {
 }
 
 std::ostream &ref_t::print(std::ostream &out) const {
-  out << "[ref_t: m_ref=" << (void *)m_ref << ", space_id=" << space_id()
+  out << "[ref_t: m_ref=" << (void *)m_ref << ", space_id=" << stored_space_id()
       << ", page_no=" << page_no() << ", offset=" << offset()
       << ", length=" << length()
       << ", is_being_modified=" << is_being_modified() << "]";
@@ -1240,9 +1243,10 @@ std::ostream &ref_t::print(std::ostream &out) const {
 #ifdef UNIV_DEBUG
 bool ref_t::check_space_id(dict_index_t *index) const {
   space_id_t idx_space_id = index->space;
-  space_id_t ref_space_id = space_id();
+  space_id_t ref_space_id = stored_space_id();
 
-  bool lob_ref_valid = (ref_space_id == 0 || idx_space_id == ref_space_id);
+  bool lob_ref_valid = (ref_space_id == 0 ||
+                        fil_wt_is_same_or_ancestor(idx_space_id, ref_space_id));
   return (lob_ref_valid);
 }
 #endif /* UNIV_DEBUG */
@@ -1339,7 +1343,7 @@ dberr_t mark_not_partially_updatable(trx_t *trx, dict_index_t *index,
 
       if (!ref.is_null_relaxed()) {
         mtr_t local_mtr;
-        ut_ad(ref.space_id() == index->space_id());
+        ut_ad(ref.check_space_id(index));
 
         mtr_start(&local_mtr);
         local_mtr.set_log_mode(btr_mtr->get_log_mode());

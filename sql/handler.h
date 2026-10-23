@@ -1815,6 +1815,22 @@ typedef bool (*sdi_set_t)(handlerton *hton, const dd::Tablespace &tablespace,
                           const void *sdi, uint64 sdi_len);
 
 /**
+  Make a copy-on-write clone of a table's tablespace for CREATE WORKTREE.
+  The SE quiesces the source, clones its data file without rewriting data
+  pages, registers the new tablespace and fills in the SE private data of the
+  destination definition (new ids, same roots).
+  @param[in]      hton      handlerton of the table's engine
+  @param[in]      thd       thread handle
+  @param[in]      src       source table definition (locked against writes)
+  @param[in,out]  dst       destination definition, deserialized from src
+  @param[in]      dst_db    destination schema name
+  @retval     false       success
+  @retval     true        failure, my_error() was called
+*/
+typedef bool (*clone_table_t)(handlerton *hton, THD *thd, const dd::Table &src,
+                              dd::Table *dst, const char *dst_db);
+
+/**
   Delete SDI for a given SDI key.
   @param[in]  tablespace  tablespace object
   @param[in]  table       table object
@@ -3001,6 +3017,9 @@ struct handlerton {
 
   post_ddl_t post_ddl;
   post_recover_t post_recover;
+
+  /** Copy-on-write table clone for CREATE WORKTREE, or nullptr. */
+  clone_table_t clone_table;
 
   /** Clone data transfer interfaces */
   Clone_interface_t clone_interface;

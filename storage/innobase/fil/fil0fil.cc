@@ -42,6 +42,7 @@ The tablespace memory cache */
 #include "btr0btr.h"
 #include "buf0buf.h"
 #include "buf0flu.h"
+#include "fil0wt.h"
 #include "clone0api.h"
 #include "dict0boot.h"
 #include "dict0dd.h"
@@ -2935,6 +2936,24 @@ bool Fil_shard::open_file(fil_node_t *file) {
                        OS_DATA_FILE, read_only_mode, &success);
   }
 
+  if (success && !space->wt_map_loaded) {
+    if (space->purpose == FIL_TYPE_TABLESPACE && file == &space->files.front() &&
+        fsp_is_file_per_table(space->id, space->flags)) {
+      /* Worktree map: must be known before any page of the space is read. */
+      auto page0 = static_cast<byte *>(
+          ut::aligned_alloc(UNIV_PAGE_SIZE_MAX, UNIV_PAGE_SIZE_MAX));
+      const page_size_t page_size(space->flags);
+      IORequest request(IORequest::READ);
+      if (os_file_read(request, file->name, file->handle, page0, 0,
+                       page_size.physical()) == DB_SUCCESS) {
+        fil_wt_load(space, page0);
+      }
+      ut::aligned_free(page0);
+    } else {
+      space->wt_map_loaded = true;
+    }
+  }
+
   if (success) {
     add_to_lru_if_needed(file);
     /* The file is ready for IO. */
@@ -3100,6 +3119,9 @@ void Fil_shard::space_free_low(fil_space_t *&space) {
          space->has_no_references());
   }
 #endif /* !UNIV_HOTBACKUP */
+
+  ut::delete_(space->wt_map);
+  space->wt_map = nullptr;
 
   for (auto &file : space->files) {
     ut_d(space->size -= file.size);

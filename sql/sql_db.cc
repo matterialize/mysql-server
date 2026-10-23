@@ -399,6 +399,11 @@ class Create_db_cleanup_handler {
 */
 
 bool mysql_create_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
+  return mysql_create_db(thd, db, create_info, nullptr);
+}
+
+bool mysql_create_db(THD *thd, const char *db, HA_CREATE_INFO *create_info,
+                     const std::function<bool()> &populate) {
   DBUG_TRACE;
   /*
     Use Auto_releaser to keep uncommitted object for database until
@@ -584,6 +589,8 @@ bool mysql_create_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
       return true;
     }
   }
+
+  if (populate && populate()) return true;
 
   // Log the query in the handler's binlog
   ha_binlog_log_query(thd, nullptr, LOGCOM_CREATE_DB, thd->query().str,

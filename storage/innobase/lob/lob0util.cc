@@ -91,7 +91,7 @@ dberr_t get_affected_index_entries(const ref_t &ref, dict_index_t *index,
                                    const Binary_diff &bdiff,
                                    List_iem_t &entries, mtr_t *mtr) {
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
   size_t offset = bdiff.offset();
@@ -184,7 +184,7 @@ dberr_t get_info(ref_t &ref, dict_index_t *index, ulint &lob_version,
                  trx_id_t &last_trx_id, undo_no_t &last_undo_no,
                  page_type_t &page_type, mtr_t *mtr) {
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
 

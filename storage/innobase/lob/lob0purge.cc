@@ -100,7 +100,7 @@ static void rollback(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
   ref.set_length(0, &local_mtr);
 
   page_no_t first_page_no = ref.page_no();
-  page_id_t page_id(ref.space_id(), first_page_no);
+  page_id_t page_id(dict_index_get_space(index), first_page_no);
   page_size_t page_size(dict_table_page_size(index->table));
 
   first_page_t first(&local_mtr, index);
@@ -209,7 +209,7 @@ static void z_rollback(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
   ctx->zblob_write_blobref(ctx->m_field_no, &local_mtr);
 
   page_no_t first_page_no = ref.page_no();
-  page_id_t page_id(ref.space_id(), first_page_no);
+  page_id_t page_id(dict_index_get_space(index), first_page_no);
   page_size_t page_size(dict_table_page_size(index->table));
 
   z_first_page_t first(&local_mtr, index);
@@ -301,7 +301,7 @@ static void z_purge(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
 
   mtr_t *mtr = ctx->get_mtr();
   page_no_t first_page_no = ref.page_no();
-  page_id_t page_id(ref.space_id(), first_page_no);
+  page_id_t page_id(dict_index_get_space(index), first_page_no);
 
   /* Hold exclusive access to LOB */
   z_first_page_t btr_first(mtr, index);
@@ -472,8 +472,8 @@ void purge(DeleteContext *ctx, dict_index_t *index, trx_id_t trxid,
     return;
   }
 
-  space_id_t space_id = ref.space_id();
-  ut_ad(space_id == index->space_id());
+  space_id_t space_id = dict_index_get_space(index);
+  ut_ad(ref.check_space_id(index));
   page_no_t first_page_no = ref.page_no();
   page_id_t page_id(space_id, first_page_no);
   page_size_t page_size(dict_table_page_size(index->table));

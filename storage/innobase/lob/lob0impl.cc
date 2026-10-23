@@ -1339,7 +1339,7 @@ void print(trx_t *trx, dict_index_t *index, std::ostream &out, ref_t ref,
   mtr_t mtr;
 
   /* Print the lob reference object. */
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
   page_no_t page_no = ref.page_no();
   ulint avail_lob = ref.length();
 

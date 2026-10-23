@@ -5459,6 +5459,7 @@ static int innodb_init(void *p) {
   innobase_hton->redo_log_set_state = innobase_redo_set_state;
 
   innobase_hton->post_ddl = innobase_post_ddl;
+  innobase_hton->clone_table = innobase_clone_table;
 
   /* Initialize handler clone interfaces for. */
 

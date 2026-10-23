@@ -76,7 +76,7 @@ dberr_t z_update(InsertContext &ctx, trx_t *trx, dict_index_t *index,
                   z_print_partial_update_hit(uf, index););
 #endif /* UNIV_DEBUG */
   page_no_t first_page_no = blobref.page_no();
-  space_id_t space_id = blobref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
   const page_size_t page_size = dict_table_page_size(index->table);
   const page_id_t first_page_id(space_id, first_page_no);
 
@@ -179,7 +179,7 @@ static dberr_t z_replace(InsertContext &ctx, trx_t *trx, dict_index_t *index,
   mtr_t *mtr = ctx.get_mtr();
 
   page_no_t first_page_no = ref.page_no();
-  space_id_t space_id = ref.space_id();
+  space_id_t space_id = dict_index_get_space(index);
   const page_id_t first_page_id(space_id, first_page_no);
 
   first_page.set_last_trx_id(trxid);

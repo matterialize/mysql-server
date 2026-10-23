@@ -24,6 +24,8 @@
 #ifndef SQL_DB_INCLUDED
 #define SQL_DB_INCLUDED
 
+#include <functional>
+
 #include "lex_string.h"
 
 struct TABLE_SHARE;
@@ -36,6 +38,12 @@ struct CHARSET_INFO;
 struct HA_CREATE_INFO;
 
 bool mysql_create_db(THD *thd, const char *db, HA_CREATE_INFO *create);
+/**
+  Create a schema, calling populate() after the schema is stored in the DD
+  and before the binlog write and commit, so that both are one atomic DDL.
+*/
+bool mysql_create_db(THD *thd, const char *db, HA_CREATE_INFO *create,
+                     const std::function<bool()> &populate);
 bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create);
 bool mysql_rm_db(THD *thd, const LEX_CSTRING &db, bool if_exists);
 bool mysql_change_db(THD *thd, const LEX_CSTRING &new_db_name,
