@@ -1,0 +1,28 @@
+# CREATE WORKTREE needs CREATE on the new schema and full SELECT on
+# every table of the source (a clone exposes every column).
+CREATE DATABASE src;
+CREATE TABLE src.a (id INT PRIMARY KEY, secret INT);
+CREATE TABLE src.b (id INT PRIMARY KEY);
+CREATE USER u_db, u_tbl, u_col, u_nocreate;
+GRANT SELECT ON src.* TO u_db;
+GRANT CREATE ON `wt%`.* TO u_db, u_tbl, u_col;
+GRANT SELECT ON src.a TO u_tbl;
+GRANT SELECT ON src.b TO u_col;
+GRANT SELECT (id) ON src.a TO u_col;
+GRANT SELECT ON src.* TO u_nocreate;
+CREATE WORKTREE wt1 FROM src;
+ERROR 42000: Access denied for user 'u_nocreate'@'%' to database 'wt1'
+CREATE WORKTREE wt2 FROM src;
+Got one of the listed errors
+CREATE WORKTREE wt3 FROM src;
+Got one of the listed errors
+SHOW DATABASES LIKE 'wt%';
+Database (wt%)
+CREATE WORKTREE wt4 FROM src;
+SHOW TABLES FROM wt4;
+Tables_in_wt4
+a
+b
+DROP DATABASE wt4;
+DROP USER u_db, u_tbl, u_col, u_nocreate;
+DROP DATABASE src;

@@ -1,0 +1,43 @@
+--echo # CREATE WORKTREE needs CREATE on the new schema and full SELECT on
+--echo # every table of the source (a clone exposes every column).
+--source include/count_sessions.inc
+
+CREATE DATABASE src;
+CREATE TABLE src.a (id INT PRIMARY KEY, secret INT);
+CREATE TABLE src.b (id INT PRIMARY KEY);
+CREATE USER u_db, u_tbl, u_col, u_nocreate;
+GRANT SELECT ON src.* TO u_db;
+GRANT CREATE ON `wt%`.* TO u_db, u_tbl, u_col;
+GRANT SELECT ON src.a TO u_tbl;
+GRANT SELECT ON src.b TO u_col;
+GRANT SELECT (id) ON src.a TO u_col;
+GRANT SELECT ON src.* TO u_nocreate;
+
+--connect (c_nocreate, localhost, u_nocreate)
+--error ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt1 FROM src;
+--disconnect c_nocreate
+
+--connect (c_tbl, localhost, u_tbl)
+--error ER_TABLEACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt2 FROM src;
+--disconnect c_tbl
+
+--connect (c_col, localhost, u_col)
+--error ER_TABLEACCESS_DENIED_ERROR, ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt3 FROM src;
+--disconnect c_col
+
+--connection default
+SHOW DATABASES LIKE 'wt%';
+
+--connect (c_db, localhost, u_db)
+CREATE WORKTREE wt4 FROM src;
+--disconnect c_db
+
+--connection default
+SHOW TABLES FROM wt4;
+DROP DATABASE wt4;
+DROP USER u_db, u_tbl, u_col, u_nocreate;
+DROP DATABASE src;
+--source include/wait_until_count_sessions.inc

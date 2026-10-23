@@ -23,6 +23,8 @@ Free Software Foundation.
 
 #include <string>
 
+#include "api0api.h"
+#include "api0misc.h"
 #include "dict0boot.h"
 #include "dict0dd.h"
 #include "fil0wt.h"
@@ -243,11 +245,11 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
   by MDL; stop purge, merge the change buffer, then flush every dirty page so
   the file on disk is a complete image. Purge is instance-wide: keep short. */
-  const bool purge_was_running = trx_purge_state() != PURGE_STATE_DISABLED &&
-                                 trx_purge_state() != PURGE_STATE_STOP;
-  if (purge_was_running) trx_purge_stop();
+  /* trx_purge_stop() is reference counted: concurrent clones each hold it. */
+  const bool purge_stopped = trx_purge_state() != PURGE_STATE_DISABLED;
+  if (purge_stopped) trx_purge_stop();
   auto purge_guard = create_scope_guard([&]() {
-    if (purge_was_running) trx_purge_run();
+    if (purge_stopped) trx_purge_run();
   });
 
   while (ibuf_merge_space(src->space) != 0) {
@@ -290,6 +292,25 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
       DB_SUCCESS) {
     my_error(ER_TABLESPACE_MISSING, MYF(0), path.c_str());
     return true;
+  }
+
+  /* The clone still carries the source's SDI records (they name the source
+  schema); drop them. The clone's own are written when its DD objects are
+  stored. */
+  dd::Object_id src_dd_space_id = dd::INVALID_OBJECT_ID;
+  for (const dd::Index *dd_index : src_dd.indexes()) {
+    src_dd_space_id = dd_index->tablespace_id();
+    break;
+  }
+  for (const sdi_key_t &key : {sdi_key_t{SDI_TYPE_TABLE, src_dd.id()},
+                               sdi_key_t{SDI_TYPE_TABLESPACE, src_dd_space_id}}) {
+    ib_sdi_key_t ib_key;
+    ib_key.sdi_key = &key;
+    const dberr_t err = ib_sdi_delete(space_id, &ib_key, trx);
+    if (err != DB_SUCCESS && err != DB_RECORD_NOT_FOUND) {
+      my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
+      return true;
+    }
   }
 
   dd::cache::Dictionary_client *client = dd::get_dd_client(thd);

@@ -154,6 +154,23 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     }
   }
 
+  /* Every source table must be fully readable: table-level SELECT, not just
+  some columns (a clone exposes all of them). */
+  for (const auto &name : names) {
+    auto *tl = new (thd->mem_root)
+        Table_ref(src, strlen(src), thd->mem_strdup(name.c_str()), name.length(),
+                  thd->mem_strdup(name.c_str()), TL_IGNORE);
+    if (tl == nullptr ||
+        check_table_access(thd, SELECT_ACL, tl, false, 1, false))
+      return true;
+    if (!(tl->grant.privilege & SELECT_ACL)) {
+      my_error(ER_TABLEACCESS_DENIED_ERROR, MYF(0), "SELECT",
+               thd->security_context()->priv_user().str,
+               thd->security_context()->host_or_ip().str, tl->table_name);
+      return true;
+    }
+  }
+
   /* Block writers to the source tables for the whole statement. Waiting for
   SNW also waits for open transactions that wrote them to finish. */
   if (lock_tables(thd, in_schema(src, names), MDL_SHARED_NO_WRITE)) return true;
