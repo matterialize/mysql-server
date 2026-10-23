@@ -79,16 +79,12 @@ int reflink(const char *src, const char *dst) {
 #endif
 }
 
-/** fsync a file or directory; F_FULLFSYNC on macOS. */
+/** fsync a file or directory. Plain fsync, not F_FULLFSYNC: the same
+durability InnoDB itself uses for data and redo files on macOS. */
 int sync_path(const char *path, int flags) {
   int fd = open(path, flags);
   if (fd < 0) return -1;
-#ifdef __APPLE__
-  int ret = fcntl(fd, F_FULLFSYNC);
-  if (ret != 0) ret = fsync(fd);
-#else
   int ret = fsync(fd);
-#endif
   close(fd);
   return ret;
 }
@@ -137,12 +133,7 @@ bool rewrite_page0(const std::string &path, space_id_t space_id,
 
   if (pwrite(fd, page, len, 0) != static_cast<ssize_t>(len))
     return wt_os_error("write page 0 of", path);
-#ifdef __APPLE__
-  if (fcntl(fd, F_FULLFSYNC) != 0 && fsync(fd) != 0)
-    return wt_os_error("fsync", path);
-#else
   if (fsync(fd) != 0) return wt_os_error("fsync", path);
-#endif
   return false;
 }
 
