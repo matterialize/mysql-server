@@ -1,0 +1,140 @@
+--echo # Views, routines, triggers and events are cloned. `src.` references are
+--echo # spliced to the worktree at clone time; references to other schemas are
+--echo # left alone; dynamic SQL PREPAREd inside a cloned object is remapped at
+--echo # run time; what cannot be remapped safely is reported (§10.6).
+
+CREATE DATABASE other;
+CREATE TABLE other.o (id INT PRIMARY KEY);
+INSERT INTO other.o VALUES (100), (200);
+
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(20));
+INSERT INTO src.t VALUES (1, 'a'), (2, 'b');
+CREATE TABLE src.audit (id INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(80));
+CREATE TABLE src.counter (n INT);
+INSERT INTO src.counter VALUES (0);
+
+CREATE VIEW src.v1 AS SELECT id, v FROM src.t;
+CREATE VIEW src.v2 AS SELECT v1.id, o.id AS oid FROM src.v1 JOIN other.o ON v1.id < o.id;
+CREATE VIEW src.v3 AS SELECT `src`.`t`.`id` * 10 AS x FROM `src`.`t`;
+CREATE FUNCTION src.f_count() RETURNS INT READS SQL DATA RETURN (SELECT COUNT(*) FROM src.t);
+CREATE VIEW src.v4 AS SELECT src.f_count() AS c;
+CREATE VIEW src.v5 AS SELECT COUNT(*) AS c FROM src.v1 WHERE v1.id IN (SELECT id FROM src.t);
+
+DELIMITER |;
+CREATE PROCEDURE src.p_dyn(OUT c INT)
+BEGIN
+  SET @q = 'SELECT COUNT(*) INTO @c FROM src.t';
+  PREPARE s FROM @q;
+  EXECUTE s;
+  DEALLOCATE PREPARE s;
+  SET c = @c;
+END|
+CREATE PROCEDURE src.p_dyn_other(OUT c INT)
+BEGIN
+  SET @q = 'SELECT COUNT(*) INTO @c FROM other.o';
+  PREPARE s FROM @q;
+  EXECUTE s;
+  DEALLOCATE PREPARE s;
+  SET c = @c;
+END|
+CREATE PROCEDURE src.p_other(OUT c INT)
+BEGIN
+  SELECT COUNT(*) INTO c FROM other.o;
+END|
+CREATE PROCEDURE src.p_literal()
+BEGIN
+  SELECT 'src.t is where it came from' AS note;
+END|
+CREATE PROCEDURE src.p_schema_data(OUT c INT)
+BEGIN
+  SELECT COUNT(*) INTO c FROM information_schema.tables WHERE table_schema = 'src';
+END|
+CREATE TRIGGER src.t_bi BEFORE INSERT ON src.t FOR EACH ROW SET NEW.v = UPPER(NEW.v)|
+CREATE TRIGGER src.t_ai AFTER INSERT ON src.t FOR EACH ROW
+BEGIN
+  INSERT INTO src.audit (msg) VALUES (CONCAT('ins ', NEW.id));
+  UPDATE src.counter SET n = n + 1;
+END|
+CREATE TRIGGER src.t_ai2 AFTER INSERT ON src.t FOR EACH ROW FOLLOWS t_ai
+  INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))|
+DELIMITER ;|
+CREATE EVENT src.e1 ON SCHEDULE EVERY 1 HOUR STARTS '2030-01-01 00:00:00' DO DELETE FROM src.audit;
+
+CREATE WORKTREE wt FROM src;
+SHOW WARNINGS;
+
+SHOW FULL TABLES FROM wt;
+SHOW CREATE VIEW wt.v1;
+SHOW CREATE VIEW wt.v2;
+SHOW CREATE VIEW wt.v3;
+SHOW CREATE VIEW wt.v4;
+SHOW CREATE VIEW wt.v5;
+SELECT VIEW_NAME, TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE
+  WHERE VIEW_SCHEMA = 'wt' ORDER BY VIEW_NAME, TABLE_SCHEMA, TABLE_NAME;
+SELECT TABLE_SCHEMA, TABLE_NAME, SPECIFIC_SCHEMA, SPECIFIC_NAME FROM INFORMATION_SCHEMA.VIEW_ROUTINE_USAGE
+  WHERE TABLE_SCHEMA IN ('src', 'wt') ORDER BY TABLE_SCHEMA, TABLE_NAME;
+SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION FROM INFORMATION_SCHEMA.ROUTINES
+  WHERE ROUTINE_SCHEMA = 'wt' ORDER BY ROUTINE_NAME;
+SELECT TRIGGER_NAME, ACTION_TIMING, ACTION_ORDER, ACTION_STATEMENT FROM INFORMATION_SCHEMA.TRIGGERS
+  WHERE TRIGGER_SCHEMA = 'wt' ORDER BY ACTION_TIMING, ACTION_ORDER;
+SELECT EVENT_NAME, STATUS, EVENT_DEFINITION FROM INFORMATION_SCHEMA.EVENTS
+  WHERE EVENT_SCHEMA IN ('src', 'wt') ORDER BY EVENT_SCHEMA;
+
+--echo # The two sides diverge; triggers and routines act on their own side.
+INSERT INTO src.t VALUES (3, 'c');
+INSERT INTO wt.t VALUES (10, 'x'), (11, 'y'), (12, 'z');
+SELECT * FROM src.t ORDER BY id;
+SELECT * FROM wt.t ORDER BY id;
+SELECT * FROM src.audit ORDER BY id;
+SELECT * FROM wt.audit ORDER BY id;
+SELECT n FROM src.counter;
+SELECT n FROM wt.counter;
+SELECT * FROM wt.v1 ORDER BY id;
+SELECT COUNT(*) FROM wt.v2;
+SELECT SUM(x) FROM wt.v3;
+SELECT * FROM src.v4;
+SELECT * FROM wt.v4;
+SELECT * FROM wt.v5;
+SELECT src.f_count(), wt.f_count();
+CALL src.p_dyn(@s);
+CALL wt.p_dyn(@w);
+SELECT @s AS src_count, @w AS wt_count;
+CALL wt.p_dyn_other(@o);
+CALL wt.p_other(@o2);
+SELECT @o, @o2;
+CALL wt.p_literal();
+
+--echo # Top-level dynamic SQL is never remapped.
+USE wt;
+SET @q = 'SELECT COUNT(*) FROM src.t';
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+USE test;
+
+--echo # A worktree of a worktree remaps wt. to wt2.
+CREATE WORKTREE wt2 FROM wt;
+SHOW CREATE VIEW wt2.v1;
+INSERT INTO wt2.t VALUES (20, 'q');
+CALL wt2.p_dyn(@w2);
+CALL wt.p_dyn(@w);
+CALL src.p_dyn(@s);
+SELECT @w2 AS wt2_count, @w AS wt_count, @s AS src_count;
+SELECT * FROM wt2.audit ORDER BY id;
+SELECT ACTION_STATEMENT FROM INFORMATION_SCHEMA.TRIGGERS
+  WHERE TRIGGER_SCHEMA = 'wt2' AND TRIGGER_NAME = 't_ai';
+
+--echo # Everything survives a restart.
+--source include/restart_mysqld.inc
+SELECT * FROM wt.v1 ORDER BY id;
+CALL wt.p_dyn(@w);
+SELECT @w;
+INSERT INTO wt.t VALUES (13, 'w');
+SELECT * FROM wt.audit ORDER BY id;
+SELECT EVENT_NAME, STATUS FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt';
+
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+DROP DATABASE other;

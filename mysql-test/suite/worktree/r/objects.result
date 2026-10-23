@@ -1,0 +1,287 @@
+# Views, routines, triggers and events are cloned. `src.` references are
+# spliced to the worktree at clone time; references to other schemas are
+# left alone; dynamic SQL PREPAREd inside a cloned object is remapped at
+# run time; what cannot be remapped safely is reported (§10.6).
+CREATE DATABASE other;
+CREATE TABLE other.o (id INT PRIMARY KEY);
+INSERT INTO other.o VALUES (100), (200);
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(20));
+INSERT INTO src.t VALUES (1, 'a'), (2, 'b');
+CREATE TABLE src.audit (id INT AUTO_INCREMENT PRIMARY KEY, msg VARCHAR(80));
+CREATE TABLE src.counter (n INT);
+INSERT INTO src.counter VALUES (0);
+CREATE VIEW src.v1 AS SELECT id, v FROM src.t;
+CREATE VIEW src.v2 AS SELECT v1.id, o.id AS oid FROM src.v1 JOIN other.o ON v1.id < o.id;
+CREATE VIEW src.v3 AS SELECT `src`.`t`.`id` * 10 AS x FROM `src`.`t`;
+CREATE FUNCTION src.f_count() RETURNS INT READS SQL DATA RETURN (SELECT COUNT(*) FROM src.t);
+CREATE VIEW src.v4 AS SELECT src.f_count() AS c;
+CREATE VIEW src.v5 AS SELECT COUNT(*) AS c FROM src.v1 WHERE v1.id IN (SELECT id FROM src.t);
+CREATE PROCEDURE src.p_dyn(OUT c INT)
+BEGIN
+SET @q = 'SELECT COUNT(*) INTO @c FROM src.t';
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END|
+CREATE PROCEDURE src.p_dyn_other(OUT c INT)
+BEGIN
+SET @q = 'SELECT COUNT(*) INTO @c FROM other.o';
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END|
+CREATE PROCEDURE src.p_other(OUT c INT)
+BEGIN
+SELECT COUNT(*) INTO c FROM other.o;
+END|
+CREATE PROCEDURE src.p_literal()
+BEGIN
+SELECT 'src.t is where it came from' AS note;
+END|
+CREATE PROCEDURE src.p_schema_data(OUT c INT)
+BEGIN
+SELECT COUNT(*) INTO c FROM information_schema.tables WHERE table_schema = 'src';
+END|
+CREATE TRIGGER src.t_bi BEFORE INSERT ON src.t FOR EACH ROW SET NEW.v = UPPER(NEW.v)|
+CREATE TRIGGER src.t_ai AFTER INSERT ON src.t FOR EACH ROW
+BEGIN
+INSERT INTO src.audit (msg) VALUES (CONCAT('ins ', NEW.id));
+UPDATE src.counter SET n = n + 1;
+END|
+CREATE TRIGGER src.t_ai2 AFTER INSERT ON src.t FOR EACH ROW FOLLOWS t_ai
+INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))|
+CREATE EVENT src.e1 ON SCHEDULE EVERY 1 HOUR STARTS '2030-01-01 00:00:00' DO DELETE FROM src.audit;
+CREATE WORKTREE wt FROM src;
+Warnings:
+Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
+Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
+Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
+SHOW FULL TABLES FROM wt;
+Tables_in_wt	Table_type
+audit	BASE TABLE
+counter	BASE TABLE
+t	BASE TABLE
+v1	VIEW
+v2	VIEW
+v3	VIEW
+v4	VIEW
+v5	VIEW
+SHOW CREATE VIEW wt.v1;
+View	Create View	character_set_client	collation_connection
+v1	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v1` AS select `wt`.`t`.`id` AS `id`,`wt`.`t`.`v` AS `v` from `wt`.`t`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW wt.v2;
+View	Create View	character_set_client	collation_connection
+v2	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v2` AS select `wt`.`v1`.`id` AS `id`,`other`.`o`.`id` AS `oid` from (`wt`.`v1` join `other`.`o` on((`wt`.`v1`.`id` < `other`.`o`.`id`)))	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW wt.v3;
+View	Create View	character_set_client	collation_connection
+v3	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v3` AS select (`wt`.`t`.`id` * 10) AS `x` from `wt`.`t`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW wt.v4;
+View	Create View	character_set_client	collation_connection
+v4	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v4` AS select `wt`.`f_count`() AS `c`	utf8mb4	utf8mb4_0900_ai_ci
+SHOW CREATE VIEW wt.v5;
+View	Create View	character_set_client	collation_connection
+v5	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt`.`v5` AS select count(0) AS `c` from `wt`.`v1` where `wt`.`v1`.`id` in (select `wt`.`t`.`id` from `wt`.`t`)	utf8mb4	utf8mb4_0900_ai_ci
+SELECT VIEW_NAME, TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE
+WHERE VIEW_SCHEMA = 'wt' ORDER BY VIEW_NAME, TABLE_SCHEMA, TABLE_NAME;
+VIEW_NAME	TABLE_SCHEMA	TABLE_NAME
+v1	wt	t
+v2	other	o
+v2	wt	v1
+v3	wt	t
+v4	wt	t
+v5	wt	t
+v5	wt	v1
+SELECT TABLE_SCHEMA, TABLE_NAME, SPECIFIC_SCHEMA, SPECIFIC_NAME FROM INFORMATION_SCHEMA.VIEW_ROUTINE_USAGE
+WHERE TABLE_SCHEMA IN ('src', 'wt') ORDER BY TABLE_SCHEMA, TABLE_NAME;
+TABLE_SCHEMA	TABLE_NAME	SPECIFIC_SCHEMA	SPECIFIC_NAME
+src	v4	src	f_count
+src	v4	src	f_count
+wt	v4	wt	f_count
+wt	v4	wt	f_count
+SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION FROM INFORMATION_SCHEMA.ROUTINES
+WHERE ROUTINE_SCHEMA = 'wt' ORDER BY ROUTINE_NAME;
+ROUTINE_NAME	ROUTINE_TYPE	ROUTINE_DEFINITION
+f_count	FUNCTION	RETURN (SELECT COUNT(*) FROM wt.t)
+p_dyn	PROCEDURE	BEGIN
+SET @q = 'SELECT COUNT(*) INTO @c FROM src.t';
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END
+p_dyn_other	PROCEDURE	BEGIN
+SET @q = 'SELECT COUNT(*) INTO @c FROM other.o';
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END
+p_literal	PROCEDURE	BEGIN
+SELECT 'src.t is where it came from' AS note;
+END
+p_other	PROCEDURE	BEGIN
+SELECT COUNT(*) INTO c FROM other.o;
+END
+p_schema_data	PROCEDURE	BEGIN
+SELECT COUNT(*) INTO c FROM information_schema.tables WHERE table_schema = 'src';
+END
+SELECT TRIGGER_NAME, ACTION_TIMING, ACTION_ORDER, ACTION_STATEMENT FROM INFORMATION_SCHEMA.TRIGGERS
+WHERE TRIGGER_SCHEMA = 'wt' ORDER BY ACTION_TIMING, ACTION_ORDER;
+TRIGGER_NAME	ACTION_TIMING	ACTION_ORDER	ACTION_STATEMENT
+t_bi	BEFORE	1	SET NEW.v = UPPER(NEW.v)
+t_ai	AFTER	1	BEGIN
+INSERT INTO wt.audit (msg) VALUES (CONCAT('ins ', NEW.id));
+UPDATE wt.counter SET n = n + 1;
+END
+t_ai2	AFTER	2	INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))
+SELECT EVENT_NAME, STATUS, EVENT_DEFINITION FROM INFORMATION_SCHEMA.EVENTS
+WHERE EVENT_SCHEMA IN ('src', 'wt') ORDER BY EVENT_SCHEMA;
+EVENT_NAME	STATUS	EVENT_DEFINITION
+e1	ENABLED	DELETE FROM src.audit
+e1	DISABLED	DELETE FROM wt.audit
+# The two sides diverge; triggers and routines act on their own side.
+INSERT INTO src.t VALUES (3, 'c');
+INSERT INTO wt.t VALUES (10, 'x'), (11, 'y'), (12, 'z');
+SELECT * FROM src.t ORDER BY id;
+id	v
+1	a
+2	b
+3	C
+SELECT * FROM wt.t ORDER BY id;
+id	v
+1	a
+2	b
+10	X
+11	Y
+12	Z
+SELECT * FROM src.audit ORDER BY id;
+id	msg
+1	ins 3
+2	second 3
+SELECT * FROM wt.audit ORDER BY id;
+id	msg
+1	ins 10
+2	second 10
+3	ins 11
+4	second 11
+5	ins 12
+6	second 12
+SELECT n FROM src.counter;
+n
+1
+SELECT n FROM wt.counter;
+n
+3
+SELECT * FROM wt.v1 ORDER BY id;
+id	v
+1	a
+2	b
+10	X
+11	Y
+12	Z
+SELECT COUNT(*) FROM wt.v2;
+COUNT(*)
+10
+SELECT SUM(x) FROM wt.v3;
+SUM(x)
+360
+SELECT * FROM src.v4;
+c
+3
+SELECT * FROM wt.v4;
+c
+5
+SELECT * FROM wt.v5;
+c
+5
+SELECT src.f_count(), wt.f_count();
+src.f_count()	wt.f_count()
+3	5
+CALL src.p_dyn(@s);
+CALL wt.p_dyn(@w);
+SELECT @s AS src_count, @w AS wt_count;
+src_count	wt_count
+3	5
+CALL wt.p_dyn_other(@o);
+CALL wt.p_other(@o2);
+SELECT @o, @o2;
+@o	@o2
+2	2
+CALL wt.p_literal();
+note
+src.t is where it came from
+# Top-level dynamic SQL is never remapped.
+USE wt;
+SET @q = 'SELECT COUNT(*) FROM src.t';
+PREPARE s FROM @q;
+EXECUTE s;
+COUNT(*)
+3
+DEALLOCATE PREPARE s;
+USE test;
+# A worktree of a worktree remaps wt. to wt2.
+CREATE WORKTREE wt2 FROM wt;
+SHOW CREATE VIEW wt2.v1;
+View	Create View	character_set_client	collation_connection
+v1	CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `wt2`.`v1` AS select `wt2`.`t`.`id` AS `id`,`wt2`.`t`.`v` AS `v` from `wt2`.`t`	utf8mb4	utf8mb4_0900_ai_ci
+INSERT INTO wt2.t VALUES (20, 'q');
+CALL wt2.p_dyn(@w2);
+CALL wt.p_dyn(@w);
+CALL src.p_dyn(@s);
+SELECT @w2 AS wt2_count, @w AS wt_count, @s AS src_count;
+wt2_count	wt_count	src_count
+6	5	3
+SELECT * FROM wt2.audit ORDER BY id;
+id	msg
+1	ins 10
+2	second 10
+3	ins 11
+4	second 11
+5	ins 12
+6	second 12
+7	ins 20
+8	second 20
+SELECT ACTION_STATEMENT FROM INFORMATION_SCHEMA.TRIGGERS
+WHERE TRIGGER_SCHEMA = 'wt2' AND TRIGGER_NAME = 't_ai';
+ACTION_STATEMENT
+BEGIN
+INSERT INTO wt2.audit (msg) VALUES (CONCAT('ins ', NEW.id));
+UPDATE wt2.counter SET n = n + 1;
+END
+# Everything survives a restart.
+# restart
+SELECT * FROM wt.v1 ORDER BY id;
+id	v
+1	a
+2	b
+10	X
+11	Y
+12	Z
+CALL wt.p_dyn(@w);
+SELECT @w;
+@w
+5
+INSERT INTO wt.t VALUES (13, 'w');
+SELECT * FROM wt.audit ORDER BY id;
+id	msg
+1	ins 10
+2	second 10
+3	ins 11
+4	second 11
+5	ins 12
+6	second 12
+7	ins 13
+8	second 13
+SELECT EVENT_NAME, STATUS FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt';
+EVENT_NAME	STATUS
+e1	DISABLED
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+DROP DATABASE other;

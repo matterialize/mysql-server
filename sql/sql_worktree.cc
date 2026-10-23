@@ -581,11 +581,18 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
       if (dc.store(e.get())) return true;
     }
 
-    /* Lineage: the runtime remap of dynamic SQL inside cloned objects. */
+    /* Lineage, nearest ancestor first ("src,src's source,..."): the runtime
+    remap of dynamic SQL inside cloned objects, whose string literals may
+    still name any ancestor. */
+    dd::String_type lineage(src);
+    if (src_schema->options().exists("worktree_of")) {
+      dd::String_type older;
+      if (!src_schema->options().get("worktree_of", &older)) lineage += "," + older;
+    }
     dd::Schema *wt_mod = nullptr;
     if (dc.acquire_for_modification(wt, &wt_mod) || wt_mod == nullptr)
       return true;
-    wt_mod->options().set("worktree_of", src);
+    wt_mod->options().set("worktree_of", lineage);
     if (dc.update(wt_mod)) return true;
 
     /* The deserialized parents do not know about their (also new) children
@@ -668,10 +675,20 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
     }
     return false;
   };
-  const Remap_result r = remap_schema(std::string(query, *query_len),
-                                      src.c_str(), db.str,
-                                      thd->variables.sql_mode, exists);
-  if (r.remapped == 0) return query;
+  std::string text(query, *query_len);
+  int remapped = 0;
+  for (size_t b = 0; b <= src.size();) {
+    size_t e = src.find(',', b);
+    if (e == dd::String_type::npos) e = src.size();
+    const std::string ancestor(src.c_str() + b, e - b);
+    const Remap_result r = remap_schema(text, ancestor.c_str(), db.str,
+                                        thd->variables.sql_mode, exists);
+    remapped += r.remapped;
+    text = r.text;
+    b = e + 1;
+  }
+  if (remapped == 0) return query;
+  const Remap_result r{text, remapped};
   char *out = thd->strmake(r.text.c_str(), r.text.size());
   if (out == nullptr) return query;
   *query_len = r.text.size();

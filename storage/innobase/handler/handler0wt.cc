@@ -297,12 +297,22 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
   /* The clone still carries the source's SDI records (they name the source
   schema); drop them. The clone's own are written when its DD objects are
   stored. FTS auxiliary tables have no SDI. */
-  for (const sdi_key_t &key : {sdi_key_t{SDI_TYPE_TABLE, src_dd_table_id},
-                               sdi_key_t{SDI_TYPE_TABLESPACE, src_dd_space_id}}) {
+  /* Not every file holds every record (a partitioned table's SDI is in only
+  some partitions), so delete only the keys that are there. */
+  sdi_vector_t keys;
+  ib_sdi_vector_t ib_keys;
+  ib_keys.sdi_vector = &keys;
+  if (ib_sdi_get_keys(c->space_id, &ib_keys, trx) != DB_SUCCESS) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
+    return true;
+  }
+  for (const sdi_key_t &key : keys.m_vec) {
+    if (!(key.type == SDI_TYPE_TABLE && key.id == src_dd_table_id) &&
+        !(key.type == SDI_TYPE_TABLESPACE && key.id == src_dd_space_id))
+      continue;
     ib_sdi_key_t ib_key;
     ib_key.sdi_key = &key;
-    const dberr_t err = ib_sdi_delete(c->space_id, &ib_key, trx);
-    if (err != DB_SUCCESS && err != DB_RECORD_NOT_FOUND) {
+    if (ib_sdi_delete(c->space_id, &ib_key, trx) != DB_SUCCESS) {
       my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
       return true;
     }
@@ -462,6 +472,7 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   the names derived from the clone's new ids. */
   dict_table_t *fts_src = partitioned ? nullptr : clones[0].src;
   std::vector<Fts_aux> aux;
+  char src_db[FN_REFLEN];
   const bool has_fts =
       fts_src != nullptr && fts_src->fts != nullptr &&
       (dict_table_has_fts_index(fts_src) ||
@@ -480,8 +491,23 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
         fts_aux_names(fts_src, fts_src->name.m_name, fts_src->id, src_fts_ids);
     const auto dst_names = fts_aux_names(fts_src, clones[0].name.c_str(),
                                          clones[0].table_id, dst_fts_ids);
+    /* Opening an auxiliary table may load it from the DD: lock it first
+    (statement-long, as its DD object stays cached until the end). */
+    char src_db_enc[FN_REFLEN];
+    const char *slash = strchr(fts_src->name.m_name, '/');
+    snprintf(src_db_enc, sizeof(src_db_enc), "%.*s",
+             static_cast<int>(slash - fts_src->name.m_name),
+             fts_src->name.m_name);
+    filename_to_tablename(src_db_enc, src_db, sizeof(src_db));
     aux.resize(src_names.size());
     for (size_t i = 0; i < src_names.size(); ++i) {
+      MDL_request src_req;
+      MDL_REQUEST_INIT(&src_req, MDL_key::TABLE, src_db,
+                       strchr(src_names[i].c_str(), '/') + 1, MDL_SHARED,
+                       MDL_TRANSACTION);
+      if (thd->mdl_context.acquire_lock(&src_req,
+                                        thd->variables.lock_wait_timeout))
+        return true;
       aux[i].src = dd_table_open_on_name(thd, nullptr, src_names[i].c_str(),
                                          false, DICT_ERR_IGNORE_NONE);
       if (aux[i].src == nullptr && src_fts_ids.empty()) {
@@ -576,12 +602,6 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   /* FTS auxiliary DD tables: deep copies (SDI round trip) under the new names,
   stored in the same DD transaction as the parent. */
   if (!aux.empty()) {
-    char src_db[FN_REFLEN], src_db_enc[FN_REFLEN];
-    const char *slash = strchr(fts_src->name.m_name, '/');
-    snprintf(src_db_enc, sizeof(src_db_enc), "%.*s",
-             static_cast<int>(slash - fts_src->name.m_name),
-             fts_src->name.m_name);
-    filename_to_tablename(src_db_enc, src_db, sizeof(src_db));
     const dd::Schema *dst_schema = nullptr;
     if (client->acquire(dst_db, &dst_schema) || dst_schema == nullptr)
       return true;
@@ -591,13 +611,8 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
       /* Statement-long locks: the DD objects acquired below stay cached
       until the statement ends. */
       MDL_ticket *dst_mdl = nullptr;
-      MDL_request src_req;
-      MDL_REQUEST_INIT(&src_req, MDL_key::TABLE, src_db, a.src_dd_name.c_str(),
-                       MDL_SHARED, MDL_TRANSACTION);
       if (dd::acquire_exclusive_table_mdl(thd, dst_db, dst_tname, false,
-                                          &dst_mdl) ||
-          thd->mdl_context.acquire_lock(&src_req,
-                                        thd->variables.lock_wait_timeout))
+                                          &dst_mdl))
         return true;
       const dd::Table *src_aux_dd = nullptr;
       if (client->acquire(src_db, a.src_dd_name.c_str(), &src_aux_dd) ||

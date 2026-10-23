@@ -1,0 +1,85 @@
+# Page 0 is no longer a single point of failure (fork-design.md §12.1 H5,
+# §10.1 item 4): the ancestor map has a copy in page 1 that names the
+# file's own space id, and startup never identifies a worktree file as
+# its ancestor.
+call mtr.add_suppression("Worktree map in page 0 of tablespace wt/big is damaged");
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/big.ibd");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.big (id INT PRIMARY KEY, pad CHAR(200));
+INSERT INTO src.big WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 900) SELECT n, 'x' FROM s;
+#
+# A. The map in page 0 is garbled (page checksum re-stamped, so only the
+#    map's own CRC catches it): the copy in page 1 is used.
+CREATE WORKTREE wt FROM src;
+UPDATE wt.big SET pad = 'wt' WHERE id = 1;
+SET GLOBAL innodb_fast_shutdown = 0;
+# restart
+SELECT COUNT(*), SUM(id), MAX(pad) FROM wt.big;
+COUNT(*)	SUM(id)	MAX(pad)
+900	405450	x
+SELECT COUNT(*), MAX(pad) FROM src.big;
+COUNT(*)	MAX(pad)
+900	x
+CHECK TABLE wt.big;
+Table	Op	Msg_type	Msg_text
+wt.big	check	status	OK
+Pattern "Worktree map in page 0 of tablespace wt/big is damaged; using the copy in page 1" found
+DROP DATABASE wt;
+#
+# B. Page 0 is lost (zeroed) after a crash: startup identifies the file by
+#    the copy in page 1 and restores the worktree's own page 0 from the
+#    doublewrite buffer.
+CREATE WORKTREE wt FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO wt.big WITH RECURSIVE s(n) AS (SELECT 1000 UNION ALL SELECT n + 1 FROM s WHERE n < 9000) SELECT n, 'y' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.big SET pad = 'after-checkpoint' WHERE id = 5;
+# Kill the server
+# restart: --log-error-verbosity=3
+SELECT COUNT(*), MAX(id) FROM wt.big;
+COUNT(*)	MAX(id)
+8901	9000
+SELECT pad FROM wt.big WHERE id = 5;
+pad
+after-checkpoint
+SELECT COUNT(*) FROM src.big;
+COUNT(*)
+900
+CHECK TABLE wt.big, src.big;
+Table	Op	Msg_type	Msg_text
+wt.big	check	status	OK
+src.big	check	status	OK
+Pattern "Datafile './wt/big.ibd' is a worktree; its own space id [0-9]+ is taken from page 1" found
+Pattern "Restoring page \[page id: space=[0-9]+, page number=0\] of datafile './wt/big.ibd' from the doublewrite buffer" found
+page 0 of the worktree is its own: yes
+DROP DATABASE wt;
+#
+# C. Pages 0 and 1 are both lost and nearly every page still carries the
+#    ancestor's id, with the ancestor's page 0 in the doublewrite buffer.
+#    A plain majority vote would pick the ancestor and restore its page 0
+#    into the worktree's file; instead the vote refuses the ancestor and
+#    startup stops with the file unidentified.
+CREATE WORKTREE wt FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.big WITH RECURSIVE s(n) AS (SELECT 1000 UNION ALL SELECT n + 1 FROM s WHERE n < 9000) SELECT n, 'y' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.big SET pad = 'after-checkpoint' WHERE id = 5;
+# Kill the server
+Pattern "Datafile './wt/big.ibd': space id [0-9]+ belongs to another file; not chosen" found
+Pattern "Could not find any file associated with the tablespace ID" found
+source page 0 written into the worktree: no
+# Put the file back; recovery then completes normally.
+# restart
+SELECT pad FROM wt.big WHERE id = 5;
+pad
+after-checkpoint
+CHECK TABLE wt.big;
+Table	Op	Msg_type	Msg_text
+wt.big	check	status	OK
+DROP DATABASE wt;
+DROP DATABASE src;

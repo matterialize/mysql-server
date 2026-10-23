@@ -1,0 +1,151 @@
+# FULLTEXT tables clone with their auxiliary index tables, renamed for the
+# clone's new table and index ids (§10.3). The FTS cache is synced first,
+# so documents that are only in the cache are not lost.
+CREATE DATABASE src;
+CREATE TABLE src.a (id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(200), body TEXT,
+FULLTEXT ft_all (title, body), FULLTEXT ft_body (body));
+CREATE TABLE src.b (FTS_DOC_ID BIGINT UNSIGNED AUTO_INCREMENT NOT NULL PRIMARY KEY,
+txt TEXT, FULLTEXT (txt));
+INSERT INTO src.a (title, body) VALUES
+('MySQL tutorial', 'DBMS stands for DataBase management system'),
+('How to use MySQL well', 'After you went through a tutorial'),
+('Optimizing MySQL', 'In this tutorial we will show how to optimize'),
+('1001 MySQL tricks', '1. Never run mysqld as root. 2. Avoid surprises'),
+('MySQL vs. YourSQL', 'In the following database comparison we compare'),
+('MySQL security', 'When configured properly, MySQL is secure'),
+('Copy on write', 'A worktree shares pages with its golden source');
+INSERT INTO src.b (txt) VALUES ('apple banana'), ('banana cherry'), ('cherry date'),
+('date elderberry'), ('fig grape');
+DELETE FROM src.b WHERE txt = 'fig grape';
+INSERT INTO src.a (title, body) VALUES ('Cache only', 'unsynced zeppelin document');
+INSERT INTO src.b (txt) VALUES ('zeppelin cache');
+CREATE WORKTREE wt FROM src;
+SHOW CREATE TABLE wt.a;
+Table	Create Table
+a	CREATE TABLE `a` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `title` varchar(200) DEFAULT NULL,
+  `body` text,
+  PRIMARY KEY (`id`),
+  FULLTEXT KEY `ft_all` (`title`,`body`),
+  FULLTEXT KEY `ft_body` (`body`)
+) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+# Auxiliary tables: 5 common per table + 6 per FULLTEXT index.
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'src/fts\_%';
+COUNT(*)
+28
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/fts\_%';
+COUNT(*)
+28
+# Identical results right after the clone.
+SELECT 1 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('database')) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('database')) AS wt;
+q	src	wt
+1	1,5	1,5
+SELECT 2 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('+MySQL -YourSQL' IN BOOLEAN MODE)) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('+MySQL -YourSQL' IN BOOLEAN MODE)) AS wt;
+q	src	wt
+2	1,2,3,4,6	1,2,3,4,6
+SELECT 3 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (body) AGAINST ('tutorial' WITH QUERY EXPANSION)) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (body) AGAINST ('tutorial' WITH QUERY EXPANSION)) AS wt;
+q	src	wt
+3	2,3	2,3
+SELECT 4 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (body) AGAINST ('zeppelin')) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (body) AGAINST ('zeppelin')) AS wt;
+q	src	wt
+4	8	8
+SELECT 5 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('"golden source"' IN BOOLEAN MODE)) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('"golden source"' IN BOOLEAN MODE)) AS wt;
+q	src	wt
+5	7	7
+SELECT 6 AS q, (SELECT GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('secur*' IN BOOLEAN MODE)) AS src,
+(SELECT GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('secur*' IN BOOLEAN MODE)) AS wt;
+q	src	wt
+6	6	6
+SELECT GROUP_CONCAT(FTS_DOC_ID ORDER BY FTS_DOC_ID) FROM src.b WHERE MATCH (txt) AGAINST ('banana cherry zeppelin');
+GROUP_CONCAT(FTS_DOC_ID ORDER BY FTS_DOC_ID)
+1,2,3,6
+SELECT GROUP_CONCAT(FTS_DOC_ID ORDER BY FTS_DOC_ID) FROM wt.b WHERE MATCH (txt) AGAINST ('banana cherry zeppelin');
+GROUP_CONCAT(FTS_DOC_ID ORDER BY FTS_DOC_ID)
+1,2,3,6
+# Each side then diverges on its own.
+INSERT INTO wt.a (title, body) VALUES ('Worktree only', 'a zebra in the worktree');
+DELETE FROM wt.a WHERE title = 'MySQL security';
+INSERT INTO src.a (title, body) VALUES ('Source only', 'a yak in the source');
+DELETE FROM src.a WHERE title = 'Optimizing MySQL';
+INSERT INTO wt.b (txt) VALUES ('banana split');
+SELECT 'src' AS side, GROUP_CONCAT(title ORDER BY id) FROM src.a WHERE MATCH (body) AGAINST ('zebra yak')
+UNION ALL
+SELECT 'wt', GROUP_CONCAT(title ORDER BY id) FROM wt.a WHERE MATCH (body) AGAINST ('zebra yak');
+side	GROUP_CONCAT(title ORDER BY id)
+src	Source only
+wt	Worktree only
+SELECT 'src' AS side, GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('secure optimize' IN BOOLEAN MODE)
+UNION ALL
+SELECT 'wt', GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('secure optimize' IN BOOLEAN MODE);
+side	GROUP_CONCAT(id ORDER BY id)
+src	6
+wt	3
+SELECT 'src' AS side, COUNT(*) FROM src.b WHERE MATCH (txt) AGAINST ('banana')
+UNION ALL
+SELECT 'wt', COUNT(*) FROM wt.b WHERE MATCH (txt) AGAINST ('banana');
+side	COUNT(*)
+src	2
+wt	3
+# OPTIMIZE (FTS-only) on one side does not affect the other.
+SET GLOBAL innodb_optimize_fulltext_only = ON;
+OPTIMIZE TABLE wt.a;
+Table	Op	Msg_type	Msg_text
+wt.a	optimize	status	OK
+OPTIMIZE TABLE wt.b;
+Table	Op	Msg_type	Msg_text
+wt.b	optimize	status	OK
+SET GLOBAL innodb_optimize_fulltext_only = OFF;
+SELECT 'src' AS side, GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (title, body) AGAINST ('MySQL')
+UNION ALL
+SELECT 'wt', GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (title, body) AGAINST ('MySQL');
+side	GROUP_CONCAT(id ORDER BY id)
+src	1,2,4,5,6
+wt	1,2,3,4,5
+CHECK TABLE src.a, src.b, wt.a, wt.b;
+Table	Op	Msg_type	Msg_text
+src.a	check	status	OK
+src.b	check	status	OK
+wt.a	check	status	OK
+wt.b	check	status	OK
+# New rows get new doc ids on each side independently.
+INSERT INTO wt.a (title, body) VALUES ('After optimize', 'quokka');
+SELECT id FROM wt.a WHERE MATCH (body) AGAINST ('quokka');
+id
+10
+SELECT COUNT(*) FROM src.a WHERE MATCH (body) AGAINST ('quokka');
+COUNT(*)
+0
+# A worktree of the worktree, and a restart.
+CREATE WORKTREE wt2 FROM wt;
+SELECT GROUP_CONCAT(id ORDER BY id) FROM wt2.a WHERE MATCH (body) AGAINST ('zebra quokka');
+GROUP_CONCAT(id ORDER BY id)
+9,10
+# restart
+SELECT 'src' AS side, GROUP_CONCAT(id ORDER BY id) FROM src.a WHERE MATCH (body) AGAINST ('zebra yak quokka zeppelin')
+UNION ALL
+SELECT 'wt', GROUP_CONCAT(id ORDER BY id) FROM wt.a WHERE MATCH (body) AGAINST ('zebra yak quokka zeppelin')
+UNION ALL
+SELECT 'wt2', GROUP_CONCAT(id ORDER BY id) FROM wt2.a WHERE MATCH (body) AGAINST ('zebra yak quokka zeppelin');
+side	GROUP_CONCAT(id ORDER BY id)
+src	8,9
+wt	8,9,10
+wt2	8,9,10
+INSERT INTO wt2.a (title, body) VALUES ('wt2', 'narwhal');
+SELECT COUNT(*) FROM wt.a WHERE MATCH (body) AGAINST ('narwhal');
+COUNT(*)
+0
+SELECT COUNT(*) FROM wt2.a WHERE MATCH (body) AGAINST ('narwhal');
+COUNT(*)
+1
+DROP DATABASE wt2;
+DROP DATABASE wt;
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt%/fts\_%';
+COUNT(*)
+0
+DROP DATABASE src;

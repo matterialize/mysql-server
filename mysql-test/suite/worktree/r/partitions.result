@@ -1,0 +1,224 @@
+# Partitioned tables clone per partition (each partition is its own
+# tablespace), and partition maintenance on the worktree never touches
+# the source.
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.r (id INT, d DATE, v INT, PRIMARY KEY (id, d))
+PARTITION BY RANGE (YEAR(d)) (
+PARTITION p2020 VALUES LESS THAN (2021),
+PARTITION p2021 VALUES LESS THAN (2022),
+PARTITION pmax VALUES LESS THAN MAXVALUE);
+CREATE TABLE src.l (id INT, region INT, PRIMARY KEY (id, region))
+PARTITION BY LIST (region) (
+PARTITION pa VALUES IN (1, 2),
+PARTITION pb VALUES IN (3, 4));
+CREATE TABLE src.h (id INT PRIMARY KEY, b LONGBLOB) PARTITION BY HASH (id) PARTITIONS 4;
+CREATE TABLE src.k (id INT PRIMARY KEY, v INT, KEY (v)) PARTITION BY KEY (id) PARTITIONS 3;
+CREATE TABLE src.s (id INT AUTO_INCREMENT, d DATE, PRIMARY KEY (id, d))
+PARTITION BY RANGE (YEAR(d)) SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (
+PARTITION p0 VALUES LESS THAN (2021),
+PARTITION p1 VALUES LESS THAN MAXVALUE);
+CREATE TABLE src.ex (id INT, d DATE, v INT, PRIMARY KEY (id, d));
+INSERT INTO src.r WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+SELECT i, DATE('2020-01-01') + INTERVAL (i % 1000) DAY, i FROM n;
+INSERT INTO src.l WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+SELECT i, 1 + i % 4 FROM n;
+INSERT INTO src.h WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400)
+SELECT i, IF(i % 50 = 0, REPEAT('h', 30000), NULL) FROM n;
+INSERT INTO src.k WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+SELECT i, i % 37 FROM n;
+INSERT INTO src.s (d) WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1000)
+SELECT DATE('2020-06-01') + INTERVAL (i % 400) DAY FROM n;
+INSERT INTO src.ex VALUES (90001, '2021-03-03', 1), (90002, '2021-04-04', 2);
+CREATE WORKTREE wt FROM src;
+# One file per (sub)partition.
+ex.ibd
+h#p#p0.ibd
+h#p#p1.ibd
+h#p#p2.ibd
+h#p#p3.ibd
+k#p#p0.ibd
+k#p#p1.ibd
+k#p#p2.ibd
+l#p#pa.ibd
+l#p#pb.ibd
+r#p#p2020.ibd
+r#p#p2021.ibd
+r#p#pmax.ibd
+s#p#p0#sp#p0sp0.ibd
+s#p#p0#sp#p0sp1.ibd
+s#p#p1#sp#p1sp0.ibd
+s#p#p1#sp#p1sp1.ibd
+SELECT 'r' AS t, (SELECT COUNT(*) FROM src.r) = (SELECT COUNT(*) FROM wt.r) AS same_rows,
+(SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM src.r) = (SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM wt.r) AS same_ids;
+t	same_rows	same_ids
+r	1	1
+SELECT 'l' AS t, (SELECT COUNT(*) FROM src.l) = (SELECT COUNT(*) FROM wt.l) AS same_rows,
+(SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM src.l) = (SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM wt.l) AS same_ids;
+t	same_rows	same_ids
+l	1	1
+SELECT 'h' AS t, (SELECT COUNT(*) FROM src.h) = (SELECT COUNT(*) FROM wt.h) AS same_rows,
+(SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM src.h) = (SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM wt.h) AS same_ids;
+t	same_rows	same_ids
+h	1	1
+SELECT 'k' AS t, (SELECT COUNT(*) FROM src.k) = (SELECT COUNT(*) FROM wt.k) AS same_rows,
+(SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM src.k) = (SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM wt.k) AS same_ids;
+t	same_rows	same_ids
+k	1	1
+SELECT 's' AS t, (SELECT COUNT(*) FROM src.s) = (SELECT COUNT(*) FROM wt.s) AS same_rows,
+(SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM src.s) = (SELECT SUM(CRC32(CONCAT_WS(',', id))) FROM wt.s) AS same_ids;
+t	same_rows	same_ids
+s	1	1
+SELECT PARTITION_NAME, SUBPARTITION_NAME FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = 'wt' AND TABLE_NAME = 's' ORDER BY 1, 2;
+PARTITION_NAME	SUBPARTITION_NAME
+p0	p0sp0
+p0	p0sp1
+p1	p1sp0
+p1	p1sp1
+SELECT COUNT(*) FROM wt.r PARTITION (p2021);
+COUNT(*)
+1095
+SELECT COUNT(*) FROM wt.s PARTITION (p0sp1);
+COUNT(*)
+314
+SELECT id, LENGTH(b) FROM wt.h WHERE b IS NOT NULL ORDER BY id LIMIT 3;
+id	LENGTH(b)
+50	30000
+100	30000
+150	30000
+SELECT COUNT(*) FROM wt.k FORCE INDEX (v) WHERE v = 5;
+COUNT(*)
+81
+# Partition maintenance on the worktree.
+ALTER TABLE wt.r REORGANIZE PARTITION pmax INTO (
+PARTITION p2022 VALUES LESS THAN (2023),
+PARTITION pmax VALUES LESS THAN MAXVALUE);
+ALTER TABLE wt.l ADD PARTITION (PARTITION pc VALUES IN (5, 6));
+INSERT INTO wt.l VALUES (5000, 5), (5001, 6);
+ALTER TABLE wt.r DROP PARTITION p2020;
+ALTER TABLE wt.r EXCHANGE PARTITION p2021 WITH TABLE wt.ex;
+ALTER TABLE wt.h COALESCE PARTITION 2;
+ALTER TABLE wt.k ADD PARTITION PARTITIONS 2;
+ALTER TABLE wt.s TRUNCATE PARTITION p0;
+INSERT INTO wt.s (d) VALUES ('2020-02-02');
+UPDATE wt.k SET v = -1 WHERE id <= 10;
+SELECT PARTITION_NAME FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = 'wt' AND TABLE_NAME = 'r' ORDER BY PARTITION_ORDINAL_POSITION;
+PARTITION_NAME
+p2021
+p2022
+pmax
+SELECT COUNT(*), MIN(YEAR(d)) FROM wt.r;
+COUNT(*)	MIN(YEAR(d))
+809	2021
+SELECT * FROM wt.r PARTITION (p2021) ORDER BY id;
+id	d	v
+90001	2021-03-03	1
+90002	2021-04-04	2
+SELECT COUNT(*) FROM wt.ex;
+COUNT(*)
+1095
+SELECT COUNT(*) FROM wt.l PARTITION (pc);
+COUNT(*)
+2
+SELECT COUNT(*) FROM wt.h;
+COUNT(*)
+400
+SELECT COUNT(*) FROM wt.s;
+COUNT(*)
+373
+SELECT MAX(id) > 1000 FROM wt.s;
+MAX(id) > 1000
+1
+SELECT COUNT(*) FROM wt.k WHERE v = -1;
+COUNT(*)
+10
+# The source is untouched.
+SELECT PARTITION_NAME FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = 'src' AND TABLE_NAME = 'r' ORDER BY PARTITION_ORDINAL_POSITION;
+PARTITION_NAME
+p2020
+p2021
+pmax
+SELECT COUNT(*), MIN(YEAR(d)) FROM src.r;
+COUNT(*)	MIN(YEAR(d))
+3000	2020
+SELECT COUNT(*) FROM src.r PARTITION (p2021);
+COUNT(*)
+1095
+SELECT COUNT(*) FROM src.ex;
+COUNT(*)
+2
+SELECT COUNT(*) FROM src.l;
+COUNT(*)
+2000
+SELECT COUNT(*) FROM src.s;
+COUNT(*)
+1000
+SELECT COUNT(*) FROM src.k WHERE v = -1;
+COUNT(*)
+0
+SELECT PARTITION_NAME FROM INFORMATION_SCHEMA.PARTITIONS
+WHERE TABLE_SCHEMA = 'src' AND TABLE_NAME = 'h' ORDER BY PARTITION_ORDINAL_POSITION;
+PARTITION_NAME
+p0
+p1
+p2
+p3
+ex.ibd
+h#p#p0.ibd
+h#p#p1.ibd
+h#p#p2.ibd
+h#p#p3.ibd
+k#p#p0.ibd
+k#p#p1.ibd
+k#p#p2.ibd
+l#p#pa.ibd
+l#p#pb.ibd
+r#p#p2020.ibd
+r#p#p2021.ibd
+r#p#pmax.ibd
+s#p#p0#sp#p0sp0.ibd
+s#p#p0#sp#p0sp1.ibd
+s#p#p1#sp#p1sp0.ibd
+s#p#p1#sp#p1sp1.ibd
+CHECK TABLE src.r, src.l, src.h, src.k, src.s, wt.r, wt.l, wt.h, wt.k, wt.s, wt.ex;
+Table	Op	Msg_type	Msg_text
+src.r	check	status	OK
+src.l	check	status	OK
+src.h	check	status	OK
+src.k	check	status	OK
+src.s	check	status	OK
+wt.r	check	status	OK
+wt.l	check	status	OK
+wt.h	check	status	OK
+wt.k	check	status	OK
+wt.s	check	status	OK
+wt.ex	check	status	OK
+# A worktree of the modified worktree, and a restart.
+CREATE WORKTREE wt2 FROM wt;
+SELECT COUNT(*) FROM wt2.r;
+COUNT(*)
+809
+SELECT COUNT(*) FROM wt2.l PARTITION (pc);
+COUNT(*)
+2
+# restart
+SELECT COUNT(*) FROM wt.r;
+COUNT(*)
+809
+SELECT COUNT(*) FROM wt2.k WHERE v = -1;
+COUNT(*)
+10
+SELECT COUNT(*) FROM src.r;
+COUNT(*)
+3000
+CHECK TABLE wt.s, wt2.s, src.s;
+Table	Op	Msg_type	Msg_text
+wt.s	check	status	OK
+wt2.s	check	status	OK
+src.s	check	status	OK
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
