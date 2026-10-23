@@ -1,0 +1,91 @@
+--echo # A realistic application schema (34 tables with FKs, 6 views, 6 routines,
+--echo # 6 triggers, 2 events, 4 partitioned and 2 FULLTEXT tables, plus a table
+--echo # in another schema) is cloned, then an application workload (through
+--echo # routines, triggers and views) runs on both sides at the same time.
+--source include/not_valgrind.inc
+
+let $T = $MYSQL_TEST_DIR/suite/worktree/t;
+--exec $MYSQL < $T/realistic_tables.sql
+--exec (echo "SET @scale = 1;"; cat $T/realistic_data.sql) | $MYSQL
+--exec (echo "SET @lo = 1, @hi = 3000;"; cat $T/realistic_facts.sql) | $MYSQL
+--exec $MYSQL < $T/realistic_objects.sql
+
+# The workload, created before the clone so the worktree gets its own
+# (remapped) copy: orders through sp_place_order (triggers write stock and
+# audit rows), transfers through sp_transfer (dynamic SQL), reviews (FTS).
+DELIMITER |;
+CREATE PROCEDURE shop.sp_workload(IN p_tag VARCHAR(8), IN p_n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE o BIGINT;
+  WHILE i < p_n DO
+    CALL shop.sp_place_order(1 + i % 2000, 1 + i % 50, 1, CONCAT(p_tag, '-o', i), o);
+    CALL sp_transfer(1 + i % 2000, 1 + (i * 7) % 2000, 1 + i % 9, CONCAT(p_tag, '-t', i));
+    INSERT INTO shop.review (product_id, customer_id, rating, title, body)
+      VALUES (1 + i % 50, 1, 5, CONCAT(' ', p_tag, ' review '), CONCAT('workload ', p_tag, ' wombat'));
+    SET i = i + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+
+# Per-schema reports (in schema test, which is not a worktree, so its
+# dynamic SQL is never remapped).
+DELIMITER |;
+CREATE PROCEDURE test.report(IN which VARCHAR(16), IN db VARCHAR(64))
+BEGIN
+  SET @q = REPLACE(CASE which
+    WHEN 'inventory' THEN 'SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ''#'' AND TABLE_TYPE = ''BASE TABLE'') AS base_tables, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = ''#'') AS views, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = ''#'') AS routines, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = ''#'') AS triggers, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = ''#'') AS events, (SELECT COUNT(DISTINCT TABLE_NAME) FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = ''#'' AND PARTITION_NAME IS NOT NULL) AS partitioned, (SELECT COUNT(DISTINCT TABLE_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ''#'' AND INDEX_TYPE = ''FULLTEXT'') AS fulltext_tables, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = ''#'') AS fks'
+    WHEN 'checks' THEN 'SELECT (SELECT COUNT(*) FROM #.orders) AS orders, (SELECT SUM(qty) FROM #.inventory) AS stock, (SELECT SUM(balance) FROM #.account) AS money, (SELECT COUNT(*) FROM #.v_customer_spend) AS spenders, (SELECT ROUND(SUM(spend)) FROM #.v_customer_spend) AS spend, (SELECT COUNT(*) FROM #.review WHERE MATCH (title, body) AGAINST (''amazing'')) AS fts, (SELECT COUNT(*) FROM #.v_low_stock) AS low_stock, (SELECT COUNT(*) FROM #.v_prices_in) AS prices, (SELECT COUNT(*) FROM #.audit_log) AS audit'
+    ELSE 'SELECT (SELECT COUNT(*) FROM #.orders WHERE token LIKE ''SRC-%'') AS src_orders, (SELECT COUNT(*) FROM #.orders WHERE token LIKE ''WT-%'') AS wt_orders, (SELECT COUNT(*) FROM #.ledger WHERE token LIKE ''SRC-%'') AS src_ledger, (SELECT COUNT(*) FROM #.ledger WHERE token LIKE ''WT-%'') AS wt_ledger, (SELECT COUNT(*) FROM #.audit_log WHERE token LIKE ''SRC-%'' OR token LIKE ''WT-%'') AS audit_rows, (SELECT COUNT(*) FROM #.review WHERE MATCH (title, body) AGAINST (''wombat'')) AS fts_wombat, (SELECT SUM(balance) FROM #.account) AS money, (SELECT COUNT(*) FROM #.stock_movement WHERE reason = ''order'') - 6000 AS new_movements, (SELECT 5000 * 10 * 100000 - SUM(qty) FROM #.inventory) AS units_sold' END, '#', db);
+  PREPARE s FROM @q;
+  EXECUTE s;
+  DEALLOCATE PREPARE s;
+END|
+DELIMITER ;|
+
+CALL test.report('inventory', 'shop');
+CREATE WORKTREE wt FROM shop;
+SHOW WARNINGS;
+CALL test.report('inventory', 'wt');
+
+--echo # No cloned object still names `shop` (the cross-schema ones keep `ref`).
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt' AND VIEW_DEFINITION LIKE '%`shop`%';
+SELECT TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt' AND VIEW_DEFINITION LIKE '%`ref`.%';
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt' AND ACTION_STATEMENT LIKE '%shop.%';
+SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt' AND ROUTINE_DEFINITION LIKE '%shop.%' ORDER BY 1;
+SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS
+  WHERE CONSTRAINT_SCHEMA = 'wt' AND UNIQUE_CONSTRAINT_SCHEMA <> 'wt';
+
+--echo # Identical answers right after the clone.
+CALL test.report('checks', 'shop');
+CALL test.report('checks', 'wt');
+
+--echo # The workload on both sides at the same time.
+--connect (c_src, localhost, root)
+--send CALL shop.sp_workload('SRC', 200)
+--connect (c_wt, localhost, root)
+--send CALL wt.sp_workload('WT', 300)
+--connection c_src
+--reap
+--connection c_wt
+--reap
+--connection default
+--disconnect c_src
+--disconnect c_wt
+
+--echo # Each side has exactly its own effects.
+CALL test.report('side', 'shop');
+CALL test.report('side', 'wt');
+SELECT COUNT(*) FROM wt.v_order_totals WHERE order_id > 3000;
+SELECT COUNT(*) FROM shop.v_order_totals WHERE order_id > 3000;
+CALL wt.sp_count('ledger', @w);
+CALL shop.sp_count('ledger', @s);
+SELECT @w, @s;
+
+CHECK TABLE wt.orders, wt.order_item, wt.payment, wt.stock_movement, wt.review, wt.account, wt.ledger, wt.inventory;
+CHECK TABLE shop.orders, shop.order_item, shop.review, shop.account, shop.ledger, shop.inventory;
+
+DROP DATABASE wt;
+DROP DATABASE shop;
+DROP DATABASE ref;
+DROP PROCEDURE test.report;

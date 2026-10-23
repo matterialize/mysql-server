@@ -1,0 +1,106 @@
+# A realistic application schema (34 tables with FKs, 6 views, 6 routines,
+# 6 triggers, 2 events, 4 partitioned and 2 FULLTEXT tables, plus a table
+# in another schema) is cloned, then an application workload (through
+# routines, triggers and views) runs on both sides at the same time.
+CREATE PROCEDURE shop.sp_workload(IN p_tag VARCHAR(8), IN p_n INT)
+BEGIN
+DECLARE i INT DEFAULT 0;
+DECLARE o BIGINT;
+WHILE i < p_n DO
+CALL shop.sp_place_order(1 + i % 2000, 1 + i % 50, 1, CONCAT(p_tag, '-o', i), o);
+CALL sp_transfer(1 + i % 2000, 1 + (i * 7) % 2000, 1 + i % 9, CONCAT(p_tag, '-t', i));
+INSERT INTO shop.review (product_id, customer_id, rating, title, body)
+VALUES (1 + i % 50, 1, 5, CONCAT(' ', p_tag, ' review '), CONCAT('workload ', p_tag, ' wombat'));
+SET i = i + 1;
+END WHILE;
+END|
+CREATE PROCEDURE test.report(IN which VARCHAR(16), IN db VARCHAR(64))
+BEGIN
+SET @q = REPLACE(CASE which
+WHEN 'inventory' THEN 'SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ''#'' AND TABLE_TYPE = ''BASE TABLE'') AS base_tables, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = ''#'') AS views, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = ''#'') AS routines, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = ''#'') AS triggers, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = ''#'') AS events, (SELECT COUNT(DISTINCT TABLE_NAME) FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = ''#'' AND PARTITION_NAME IS NOT NULL) AS partitioned, (SELECT COUNT(DISTINCT TABLE_NAME) FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ''#'' AND INDEX_TYPE = ''FULLTEXT'') AS fulltext_tables, (SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = ''#'') AS fks'
+    WHEN 'checks' THEN 'SELECT (SELECT COUNT(*) FROM #.orders) AS orders, (SELECT SUM(qty) FROM #.inventory) AS stock, (SELECT SUM(balance) FROM #.account) AS money, (SELECT COUNT(*) FROM #.v_customer_spend) AS spenders, (SELECT ROUND(SUM(spend)) FROM #.v_customer_spend) AS spend, (SELECT COUNT(*) FROM #.review WHERE MATCH (title, body) AGAINST (''amazing'')) AS fts, (SELECT COUNT(*) FROM #.v_low_stock) AS low_stock, (SELECT COUNT(*) FROM #.v_prices_in) AS prices, (SELECT COUNT(*) FROM #.audit_log) AS audit'
+    ELSE 'SELECT (SELECT COUNT(*) FROM #.orders WHERE token LIKE ''SRC-%'') AS src_orders, (SELECT COUNT(*) FROM #.orders WHERE token LIKE ''WT-%'') AS wt_orders, (SELECT COUNT(*) FROM #.ledger WHERE token LIKE ''SRC-%'') AS src_ledger, (SELECT COUNT(*) FROM #.ledger WHERE token LIKE ''WT-%'') AS wt_ledger, (SELECT COUNT(*) FROM #.audit_log WHERE token LIKE ''SRC-%'' OR token LIKE ''WT-%'') AS audit_rows, (SELECT COUNT(*) FROM #.review WHERE MATCH (title, body) AGAINST (''wombat'')) AS fts_wombat, (SELECT SUM(balance) FROM #.account) AS money, (SELECT COUNT(*) FROM #.stock_movement WHERE reason = ''order'') - 6000 AS new_movements, (SELECT 5000 * 10 * 100000 - SUM(qty) FROM #.inventory) AS units_sold' END, '#', db);
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+END|
+CALL test.report('inventory', 'shop');
+base_tables	views	routines	triggers	events	partitioned	fulltext_tables	fks
+34	6	7	6	2	4	2	32
+CREATE WORKTREE wt FROM shop;
+Warnings:
+Warning	1105	CREATE WORKTREE: routine wt.sp_transfer uses the schema name 'shop' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1105	CREATE WORKTREE: routine wt.sp_transfer uses the schema name 'shop' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
+CALL test.report('inventory', 'wt');
+base_tables	views	routines	triggers	events	partitioned	fulltext_tables	fks
+34	6	7	6	2	4	2	32
+# No cloned object still names `shop` (the cross-schema ones keep `ref`).
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt' AND VIEW_DEFINITION LIKE '%`shop`%';
+COUNT(*)
+0
+SELECT TABLE_NAME FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt' AND VIEW_DEFINITION LIKE '%`ref`.%';
+TABLE_NAME
+v_prices_in
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt' AND ACTION_STATEMENT LIKE '%shop.%';
+COUNT(*)
+0
+SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt' AND ROUTINE_DEFINITION LIKE '%shop.%' ORDER BY 1;
+ROUTINE_NAME
+sp_count
+sp_transfer
+SELECT CONSTRAINT_NAME, UNIQUE_CONSTRAINT_SCHEMA FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS
+WHERE CONSTRAINT_SCHEMA = 'wt' AND UNIQUE_CONSTRAINT_SCHEMA <> 'wt';
+CONSTRAINT_NAME	UNIQUE_CONSTRAINT_SCHEMA
+country_ibfk_1	ref
+# Identical answers right after the clone.
+CALL test.report('checks', 'shop');
+orders	stock	money	spenders	spend	fts	low_stock	prices	audit
+3000	5000000000	2000000	2000	4509000	1250	0	20000	3000
+CALL test.report('checks', 'wt');
+orders	stock	money	spenders	spend	fts	low_stock	prices	audit
+3000	5000000000	2000000	2000	4509000	1250	0	20000	3000
+# The workload on both sides at the same time.
+CALL shop.sp_workload('SRC', 200);
+CALL wt.sp_workload('WT', 300);
+# Each side has exactly its own effects.
+CALL test.report('side', 'shop');
+src_orders	wt_orders	src_ledger	wt_ledger	audit_rows	fts_wombat	money	new_movements	units_sold
+200	0	200	0	400	200	2000000	200	200
+CALL test.report('side', 'wt');
+src_orders	wt_orders	src_ledger	wt_ledger	audit_rows	fts_wombat	money	new_movements	units_sold
+0	300	0	300	600	300	2000000	300	300
+SELECT COUNT(*) FROM wt.v_order_totals WHERE order_id > 3000;
+COUNT(*)
+300
+SELECT COUNT(*) FROM shop.v_order_totals WHERE order_id > 3000;
+COUNT(*)
+200
+CALL wt.sp_count('ledger', @w);
+CALL shop.sp_count('ledger', @s);
+SELECT @w, @s;
+@w	@s
+300	200
+CHECK TABLE wt.orders, wt.order_item, wt.payment, wt.stock_movement, wt.review, wt.account, wt.ledger, wt.inventory;
+Table	Op	Msg_type	Msg_text
+wt.orders	check	status	OK
+wt.order_item	check	status	OK
+wt.payment	check	status	OK
+wt.stock_movement	check	status	OK
+wt.review	check	status	OK
+wt.account	check	status	OK
+wt.ledger	check	status	OK
+wt.inventory	check	status	OK
+CHECK TABLE shop.orders, shop.order_item, shop.review, shop.account, shop.ledger, shop.inventory;
+Table	Op	Msg_type	Msg_text
+shop.orders	check	status	OK
+shop.order_item	check	status	OK
+shop.review	check	status	OK
+shop.account	check	status	OK
+shop.ledger	check	status	OK
+shop.inventory	check	status	OK
+DROP DATABASE wt;
+DROP DATABASE shop;
+DROP DATABASE ref;
+DROP PROCEDURE test.report;

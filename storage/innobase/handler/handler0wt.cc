@@ -284,6 +284,11 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
   const std::string dir = c->path.substr(0, c->path.rfind('/'));
   if (sync_path(dir.c_str(), O_RDONLY) != 0) return wt_os_error("fsync", dir);
   DBUG_EXECUTE_IF("wt_crash_after_rename", DBUG_SUICIDE(););
+  /* Kill with some files of a multi-file clone published and some not. */
+  DBUG_EXECUTE_IF("wt_crash_after_third_rename", {
+    static int renames = 0;
+    if (++renames == 3) DBUG_SUICIDE();
+  });
 
   std::string space_name(c->name);
   dict_name::convert_to_space(space_name);

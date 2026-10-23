@@ -272,8 +272,14 @@ dd::String_type remap_body(THD *thd, const char *kind, const char *wt,
     } else if (r.literal_is_src) {
       push_warning_printf(
           thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
-          "CREATE WORKTREE: %s %s.%s uses the schema name '%s' as data (e.g. "
-          "compared with DATABASE() or *_SCHEMA); it is not remapped",
+          prepares
+              ? "CREATE WORKTREE: %s %s.%s uses the schema name '%s' as data; "
+                "it is remapped at run time only where it ends up in a "
+                "PREPAREd statement (not in comparisons with DATABASE() or "
+                "*_SCHEMA)"
+              : "CREATE WORKTREE: %s %s.%s uses the schema name '%s' as data "
+                "(e.g. compared with DATABASE() or *_SCHEMA); it is not "
+                "remapped",
           kind, wt, name.c_str(), src);
       *warned = true;
     } else if (r.src_as_name) {
@@ -370,7 +376,11 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   const auto need = [&](Access_bitmask acl) {
     return check_access(thd, acl, wt, nullptr, nullptr, true, false);
   };
-  if ((!views.empty() && (need(CREATE_VIEW_ACL) ||
+  const auto need_src = [&](Access_bitmask acl) {
+    return check_access(thd, acl, src, nullptr, nullptr, true, false);
+  };
+  if ((!events.empty() && need_src(EVENT_ACL)) ||
+      (!views.empty() && (need(CREATE_VIEW_ACL) ||
                           check_access(thd, SHOW_VIEW_ACL, src, nullptr,
                                        nullptr, true, false))) ||
       (!routines.empty() && need(CREATE_PROC_ACL)) ||
@@ -427,7 +437,7 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     if (my_strcasecmp(system_charset_info, t->engine().c_str(), "InnoDB") != 0)
       return unsupported("CREATE WORKTREE of a schema with non-InnoDB tables");
     if (t->has_trigger()) {
-      if (need(TRIGGER_ACL)) return true;
+      if (need(TRIGGER_ACL) || need_src(TRIGGER_ACL)) return true;
       for (const dd::Trigger *tr : t->triggers()) {
         if (check_definer(thd, tr->definer_user(), tr->definer_host()))
           return true;

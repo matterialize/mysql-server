@@ -9,9 +9,19 @@ CREATE TABLE src.a (id INT PRIMARY KEY, v VARCHAR(20), b LONGBLOB);
 CREATE TABLE src.b (id INT PRIMARY KEY, aid INT, FOREIGN KEY (aid) REFERENCES src.a(id));
 INSERT INTO src.a VALUES (1, 'one', REPEAT('1', 40000)), (2, 'two', NULL);
 INSERT INTO src.b VALUES (1, 1);
+# Multi-file tables and every object type (milestone 2).
+CREATE TABLE src.p (id INT, d DATE, PRIMARY KEY (id, d)) PARTITION BY RANGE (YEAR(d))
+  SUBPARTITION BY HASH (id) SUBPARTITIONS 2 (PARTITION p0 VALUES LESS THAN (2021), PARTITION p1 VALUES LESS THAN MAXVALUE);
+INSERT INTO src.p VALUES (1, '2020-01-01'), (2, '2022-02-02');
+CREATE TABLE src.f (id INT PRIMARY KEY, body TEXT, FULLTEXT (body));
+INSERT INTO src.f VALUES (1, 'crash test document'), (2, 'another document');
+CREATE VIEW src.v AS SELECT a.id, b.aid FROM src.a JOIN src.b ON b.aid = a.id;
+CREATE FUNCTION src.fn() RETURNS INT READS SQL DATA RETURN (SELECT COUNT(*) FROM src.a);
+CREATE TRIGGER src.trg AFTER INSERT ON src.b FOR EACH ROW UPDATE src.a SET v = CONCAT(v, '+') WHERE id = NEW.aid;
+CREATE EVENT src.ev ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src.b;
 let $datadir= `SELECT @@datadir`;
 
-let $points = wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_before_commit;
+let $points = wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
 while ($points)
 {
   let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
@@ -27,6 +37,10 @@ while ($points)
   --error 1
   --file_exists $datadir/wt
   SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+  SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt') +
+         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt') +
+         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt') +
+         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt') AS wt_objects;
 }
 
 --echo # Crash right after the commit: the worktree is complete.
@@ -35,10 +49,19 @@ SET SESSION debug = '+d,wt_crash_after_commit';
 --error CR_SERVER_LOST
 CREATE WORKTREE wt FROM src;
 --source include/start_mysqld.inc
-SHOW TABLES FROM wt;
+SHOW FULL TABLES FROM wt;
 SELECT id, v, LENGTH(b) FROM wt.a ORDER BY id;
 SELECT * FROM wt.b;
-CHECK TABLE wt.a, wt.b;
+SELECT * FROM wt.p ORDER BY id;
+SELECT id FROM wt.f WHERE MATCH (body) AGAINST ('crash');
+SELECT COUNT(*) AS fts_aux FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/fts\_%';
+SELECT wt.fn();
+SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt';
+SELECT TRIGGER_NAME, ACTION_STATEMENT FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt';
+SELECT EVENT_NAME, STATUS FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt';
+INSERT INTO wt.b VALUES (2, 2);
+SELECT * FROM wt.v ORDER BY id, aid;
+CHECK TABLE wt.a, wt.b, wt.p, wt.f;
 DROP DATABASE wt;
 
 --echo # After all that, a normal clone works.

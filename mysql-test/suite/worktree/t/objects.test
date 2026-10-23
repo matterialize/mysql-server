@@ -30,6 +30,21 @@ BEGIN
   DEALLOCATE PREPARE s;
   SET c = @c;
 END|
+CREATE PROCEDURE src.p_literal_prepare(OUT c INT)
+BEGIN
+  PREPARE s FROM 'SELECT COUNT(*) INTO @c FROM src.t';
+  EXECUTE s;
+  DEALLOCATE PREPARE s;
+  SET c = @c;
+END|
+CREATE PROCEDURE src.p_concat(OUT c INT)
+BEGIN
+  SET @q = CONCAT('SELECT COUNT(*) INTO @c FROM ', 'src', '.', 't');
+  PREPARE s FROM @q;
+  EXECUTE s;
+  DEALLOCATE PREPARE s;
+  SET c = @c;
+END|
 CREATE PROCEDURE src.p_dyn_other(OUT c INT)
 BEGIN
   SET @q = 'SELECT COUNT(*) INTO @c FROM other.o';
@@ -100,6 +115,10 @@ SELECT src.f_count(), wt.f_count();
 CALL src.p_dyn(@s);
 CALL wt.p_dyn(@w);
 SELECT @s AS src_count, @w AS wt_count;
+CALL wt.p_literal_prepare(@w1);
+CALL wt.p_concat(@w2);
+CALL src.p_concat(@s2);
+SELECT @w1 AS literal_prepare, @w2 AS concat_built, @s2 AS src_concat;
 CALL wt.p_dyn_other(@o);
 CALL wt.p_other(@o2);
 SELECT @o, @o2;

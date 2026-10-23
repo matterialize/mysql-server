@@ -25,6 +25,21 @@ EXECUTE s;
 DEALLOCATE PREPARE s;
 SET c = @c;
 END|
+CREATE PROCEDURE src.p_literal_prepare(OUT c INT)
+BEGIN
+PREPARE s FROM 'SELECT COUNT(*) INTO @c FROM src.t';
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END|
+CREATE PROCEDURE src.p_concat(OUT c INT)
+BEGIN
+SET @q = CONCAT('SELECT COUNT(*) INTO @c FROM ', 'src', '.', 't');
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END|
 CREATE PROCEDURE src.p_dyn_other(OUT c INT)
 BEGIN
 SET @q = 'SELECT COUNT(*) INTO @c FROM other.o';
@@ -56,10 +71,12 @@ INSERT INTO audit (msg) VALUES (CONCAT('second ', NEW.id))|
 CREATE EVENT src.e1 ON SCHEDULE EVERY 1 HOUR STARTS '2030-01-01 00:00:00' DO DELETE FROM src.audit;
 CREATE WORKTREE wt FROM src;
 Warnings:
+Warning	1105	CREATE WORKTREE: routine wt.p_concat uses the schema name 'src' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
 Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
 SHOW WARNINGS;
 Level	Code	Message
+Warning	1105	CREATE WORKTREE: routine wt.p_concat uses the schema name 'src' as data; it is remapped at run time only where it ends up in a PREPAREd statement (not in comparisons with DATABASE() or *_SCHEMA)
 Warning	1105	CREATE WORKTREE: routine wt.p_literal has `src.` inside a string literal that is not PREPAREd; it still refers to src
 Warning	1105	CREATE WORKTREE: routine wt.p_schema_data uses the schema name 'src' as data (e.g. compared with DATABASE() or *_SCHEMA); it is not remapped
 SHOW FULL TABLES FROM wt;
@@ -108,6 +125,13 @@ SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION FROM INFORMATION_SCHEMA.RO
 WHERE ROUTINE_SCHEMA = 'wt' ORDER BY ROUTINE_NAME;
 ROUTINE_NAME	ROUTINE_TYPE	ROUTINE_DEFINITION
 f_count	FUNCTION	RETURN (SELECT COUNT(*) FROM wt.t)
+p_concat	PROCEDURE	BEGIN
+SET @q = CONCAT('SELECT COUNT(*) INTO @c FROM ', 'src', '.', 't');
+PREPARE s FROM @q;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
+END
 p_dyn	PROCEDURE	BEGIN
 SET @q = 'SELECT COUNT(*) INTO @c FROM src.t';
 PREPARE s FROM @q;
@@ -124,6 +148,12 @@ SET c = @c;
 END
 p_literal	PROCEDURE	BEGIN
 SELECT 'src.t is where it came from' AS note;
+END
+p_literal_prepare	PROCEDURE	BEGIN
+PREPARE s FROM 'SELECT COUNT(*) INTO @c FROM src.t';
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SET c = @c;
 END
 p_other	PROCEDURE	BEGIN
 SELECT COUNT(*) INTO c FROM other.o;
@@ -208,6 +238,12 @@ CALL wt.p_dyn(@w);
 SELECT @s AS src_count, @w AS wt_count;
 src_count	wt_count
 3	5
+CALL wt.p_literal_prepare(@w1);
+CALL wt.p_concat(@w2);
+CALL src.p_concat(@s2);
+SELECT @w1 AS literal_prepare, @w2 AS concat_built, @s2 AS src_concat;
+literal_prepare	concat_built	src_concat
+5	5	3
 CALL wt.p_dyn_other(@o);
 CALL wt.p_other(@o2);
 SELECT @o, @o2;
