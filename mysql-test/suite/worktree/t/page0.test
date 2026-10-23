@@ -120,4 +120,38 @@ SELECT pad FROM wt.big WHERE id = 5;
 CHECK TABLE wt.big;
 
 DROP DATABASE wt;
+
+--echo #
+--echo # D. Page 0 lost after a clean shutdown (nothing in the doublewrite
+--echo #    buffer): unrecoverable, exactly as for a stock table. Stock InnoDB
+--echo #    either reports such a tablespace missing or stops with "Tablespace id
+--echo #    is N in the data dictionary but in file ... it is 0" on first access
+--echo #    (also when the buffer pool dump is loaded), so the table is not
+--echo #    touched here. What a worktree must add: the server starts, the source
+--echo #    is unaffected, and the worktree's page 0 is never replaced.
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/shutdown_mysqld.inc
+--copy_file $WT_IBD $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved
+perl;
+  my $f = $ENV{WT_IBD}; open(my $fh, '+<:raw', $f) or die "$f: $!";
+  sysseek($fh, 0, 0); syswrite($fh, "\0" x 16384); close($fh);
+EOF
+--let $restart_parameters = restart: --innodb-buffer-pool-load-at-startup=OFF
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM src.big;
+CHECK TABLE src.big;
+perl;
+  my $f = $ENV{WT_IBD}; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384);
+  print "page 0 of the worktree is still all zero: ", ($p eq ("\0" x 16384) ? "yes" : "NO"), "\n";
+EOF
+--source include/shutdown_mysqld.inc
+--remove_file $WT_IBD
+--copy_file $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved $WT_IBD
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_big.ibd.saved
+--let $restart_parameters = restart
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM wt.big;
+
+DROP DATABASE wt;
 DROP DATABASE src;

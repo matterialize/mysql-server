@@ -82,4 +82,27 @@ CHECK TABLE wt.big;
 Table	Op	Msg_type	Msg_text
 wt.big	check	status	OK
 DROP DATABASE wt;
+#
+# D. Page 0 lost after a clean shutdown (nothing in the doublewrite
+#    buffer): unrecoverable, exactly as for a stock table. Stock InnoDB
+#    either reports such a tablespace missing or stops with "Tablespace id
+#    is N in the data dictionary but in file ... it is 0" on first access
+#    (also when the buffer pool dump is loaded), so the table is not
+#    touched here. What a worktree must add: the server starts, the source
+#    is unaffected, and the worktree's page 0 is never replaced.
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_fast_shutdown = 0;
+# restart: --innodb-buffer-pool-load-at-startup=OFF
+SELECT COUNT(*) FROM src.big;
+COUNT(*)
+8901
+CHECK TABLE src.big;
+Table	Op	Msg_type	Msg_text
+src.big	check	status	OK
+page 0 of the worktree is still all zero: yes
+# restart
+SELECT COUNT(*) FROM wt.big;
+COUNT(*)
+8901
+DROP DATABASE wt;
 DROP DATABASE src;

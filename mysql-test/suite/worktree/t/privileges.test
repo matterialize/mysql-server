@@ -38,6 +38,47 @@ CREATE WORKTREE wt4 FROM src;
 --connection default
 SHOW TABLES FROM wt4;
 DROP DATABASE wt4;
+
+--echo # Objects need the matching privilege on the source and the worktree,
+--echo # and cloning an object defined by someone else needs SET_ANY_DEFINER.
+CREATE DATABASE src2;
+CREATE TABLE src2.t (id INT PRIMARY KEY);
+CREATE VIEW src2.v AS SELECT id FROM src2.t;
+CREATE EVENT src2.e ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src2.t;
+CREATE TRIGGER src2.tr BEFORE INSERT ON src2.t FOR EACH ROW SET NEW.id = NEW.id;
+GRANT SELECT ON src2.* TO u_db;
+--connect (c_db, localhost, u_db)
+--error ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt5 FROM src2;
+--connection default
+GRANT EVENT ON src2.* TO u_db;
+GRANT EVENT ON `wt%`.* TO u_db;
+--connection c_db
+--error ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt5 FROM src2;
+--connection default
+GRANT CREATE VIEW ON `wt%`.* TO u_db;
+GRANT SHOW VIEW ON src2.* TO u_db;
+--connection c_db
+--error ER_SPECIFIC_ACCESS_DENIED_ERROR
+CREATE WORKTREE wt5 FROM src2;
+--connection default
+GRANT SET_ANY_DEFINER ON *.* TO u_db;
+--connection c_db
+--error ER_DBACCESS_DENIED_ERROR
+CREATE WORKTREE wt5 FROM src2;
+--connection default
+GRANT TRIGGER ON src2.* TO u_db;
+GRANT TRIGGER ON `wt%`.* TO u_db;
+--connection c_db
+CREATE WORKTREE wt5 FROM src2;
+--disconnect c_db
+--connection default
+SHOW FULL TABLES FROM wt5;
+SELECT EVENT_NAME, STATUS FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt5';
+SELECT TRIGGER_NAME FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt5';
+DROP DATABASE wt5;
+DROP DATABASE src2;
 DROP USER u_db, u_tbl, u_col, u_nocreate;
 DROP DATABASE src;
 --source include/wait_until_count_sessions.inc
