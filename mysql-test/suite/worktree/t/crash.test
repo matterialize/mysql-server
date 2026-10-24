@@ -21,7 +21,7 @@ CREATE TRIGGER src.trg AFTER INSERT ON src.b FOR EACH ROW UPDATE src.a SET v = C
 CREATE EVENT src.ev ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src.b;
 let $datadir= `SELECT @@datadir`;
 
-let $points = wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
+let $points = wt_crash_in_probe wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
 while ($points)
 {
   let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;

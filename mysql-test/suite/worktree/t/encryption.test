@@ -118,6 +118,55 @@ CHECKSUM TABLE wt.e, wt.ez;
 CHECKSUM TABLE wt2.e, wt2.ez;
 CHECK TABLE wt2.e, wt2.ez, wt2.p;
 
+--echo # Page 0 of an encrypted worktree lost after a crash. Page 1 is encrypted
+--echo # with the key that page 0 holds, so its map copy cannot name the file,
+--echo # and identification falls back to InnoDB's page vote. Whatever the vote
+--echo # makes of it (it may restore the worktree's own page 0 from the
+--echo # doublewrite buffer, or stop with the file unidentified), it never
+--echo # restores the source's page 0 into the worktree.
+let WT_IBD = $datadir/wt/e.ibd;
+let SRC_IBD = $datadir/src/e.ibd;
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/e.ibd");
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 200000 UNION ALL SELECT n + 1 FROM s WHERE n < 220000)
+  SELECT n, CONCAT('more-', n), n % 7 FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.e SET v = 'enc-after-checkpoint' WHERE id = 5;
+--source include/kill_mysqld.inc
+--copy_file $WT_IBD $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved
+perl;
+  my $f = $ENV{WT_IBD}; open(my $fh, '+<:raw', $f) or die "$f: $!";
+  sysseek($fh, 0, 0); syswrite($fh, "\0" x 16384); close($fh);
+EOF
+let E_LOG = $MYSQLTEST_VARDIR/log/encryption_page0.err;
+--exec_in_background $MYSQLD_CMD --log-error=$E_LOG --log-error-verbosity=3
+let MYSQLD_SOCK = $MASTER_MYSOCK;
+perl;
+  # Wait for startup to finish either way; stop the server if it came up.
+  my ($log, $up) = ($ENV{E_LOG}, 0);
+  for (1 .. 600) {
+    my $t = -e $log ? do { local (@ARGV, $/) = $log; <> } : '';
+    if ($t =~ /ready for connections/) { $up = 1; last; }
+    last if $t =~ /Aborting|Shutdown complete/;
+    select(undef, undef, undef, 0.2);
+  }
+  system("$ENV{MYSQLADMIN} -uroot -S $ENV{MYSQLD_SOCK} shutdown >/dev/null 2>&1") if $up;
+  for (1 .. 300) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /Shutdown complete|Aborting/;
+    select(undef, undef, undef, 0.2); }
+  sub space_id { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384); return unpack('N', substr($p, 34, 4)); }
+  print "source page 0 written into the worktree: ", (space_id($ENV{WT_IBD}) == space_id($ENV{SRC_IBD}) ? "YES" : "no"), "\n";
+EOF
+--remove_file $WT_IBD
+--copy_file $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved $WT_IBD
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved
+--remove_file $E_LOG
+--source include/start_mysqld.inc
+SELECT v FROM wt.e WHERE id = 5;
+SELECT COUNT(*) FROM src.e;
+CHECK TABLE wt.e, src.e;
+
 --echo # Control: stock FOR EXPORT does write them, and the listing shows them.
 FLUSH TABLES src.e FOR EXPORT;
 --list_files $datadir/src *.cf?

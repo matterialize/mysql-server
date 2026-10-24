@@ -15,6 +15,23 @@ CREATE VIEW src.v AS SELECT a.id, b.aid FROM src.a JOIN src.b ON b.aid = a.id;
 CREATE FUNCTION src.fn() RETURNS INT READS SQL DATA RETURN (SELECT COUNT(*) FROM src.a);
 CREATE TRIGGER src.trg AFTER INSERT ON src.b FOR EACH ROW UPDATE src.a SET v = CONCAT(v, '+') WHERE id = NEW.aid;
 CREATE EVENT src.ev ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src.b;
+# Crash at wt_crash_in_probe
+SET SESSION debug = '+d,wt_crash_in_probe';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt') +
+(SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt') +
+(SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt') +
+(SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt') AS wt_objects;
+wt_objects
+0
 # Crash at wt_crash_after_ddl_log
 SET SESSION debug = '+d,wt_crash_after_ddl_log';
 CREATE WORKTREE wt FROM src;

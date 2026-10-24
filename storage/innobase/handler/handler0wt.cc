@@ -112,7 +112,8 @@ bool wt_reflink_error(const std::string &path) {
     const std::string what =
         "CREATE WORKTREE on a filesystem without copy-on-write file clones "
         "(reflink) at '" +
-        path.substr(0, path.rfind('/')) +
+        (path.find('/') == std::string::npos ? std::string(".")
+                                              : path.substr(0, path.rfind('/'))) +
         "'; it needs APFS, XFS with reflink=1, or btrfs";
     my_error(ER_NOT_SUPPORTED_YET, MYF(0), what.c_str());
     return true;
@@ -120,16 +121,20 @@ bool wt_reflink_error(const std::string &path) {
   return wt_os_error("reflink (APFS clonefile / FICLONE) to", path);
 }
 
-/** Check that dir's filesystem can clone files before anything is quiesced
-or written, so an unsupported filesystem fails cleanly. */
-bool probe_reflink(const std::string &dir) {
-  const std::string a = dir + "/#wt_probe", b = a + ".clone";
+/** Check that the datadir's filesystem can clone files before anything is
+quiesced or written, so an unsupported filesystem fails cleanly. The probe is
+not in the new schema's directory: a crash before the unlink would leave a file
+there that the DDL log does not know, and rolling back the schema would fail. */
+bool probe_reflink(THD *thd) {
+  const std::string a = "#wt_probe_" + std::to_string(thd_get_thread_id(thd));
+  const std::string b = a + ".clone";
   unlink(a.c_str());
   unlink(b.c_str());
   const int fd = open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
   if (fd < 0) return wt_os_error("create", a);
   const bool written = write(fd, "x", 1) == 1;
   close(fd);
+  DBUG_EXECUTE_IF("wt_crash_in_probe", DBUG_SUICIDE(););
   const int ret = written ? reflink(a.c_str(), b.c_str()) : -1;
   const int err = errno;
   unlink(a.c_str());
@@ -386,6 +391,8 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
   }
   mtr.commit();
   ut_d(fil_space_dec_redo_skipped_count(c->space_id));
+  /* Overflow pages written in the buffer pool only, not flushed. */
+  DBUG_EXECUTE_IF("wt_crash_in_overflow", DBUG_SUICIDE(););
   fil_space_release(space);
   if (!ok) return wt_error("CREATE WORKTREE: index count too large for the page size");
 
@@ -662,8 +669,7 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
       return true;
   }
 
-  if (probe_reflink(clones[0].path.substr(0, clones[0].path.rfind('/'))))
-    return true;
+  if (probe_reflink(thd)) return true;
 
   /* FULLTEXT (§10.3): the auxiliary tables are hidden InnoDB tables with their
   own files, named after the parent and FTS index ids; they are cloned under

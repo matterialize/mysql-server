@@ -37,6 +37,21 @@ src.z4	574550257
 src.z8	574550257
 src.z16	574550257
 src.z1_small	3657261927
+# kill -9 while the overflow pages are written (on the temporary file,
+# without redo): nothing survives, and the statement can be re-run.
+SET SESSION debug = '+d,wt_crash_in_overflow';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SET SESSION cte_max_recursion_depth = 100000;
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+CHECK TABLE src.z1;
+Table	Op	Msg_type	Msg_text
+src.z1	check	status	OK
 CREATE WORKTREE wt FROM src;
 CHECKSUM TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
 Table	Checksum

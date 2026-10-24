@@ -28,6 +28,20 @@ INSERT INTO src.z1_small WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1
 
 CHECKSUM TABLE src.z1, src.z2, src.z4, src.z8, src.z16, src.z1_small;
 
+--echo # kill -9 while the overflow pages are written (on the temporary file,
+--echo # without redo): nothing survives, and the statement can be re-run.
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_in_overflow';
+--error CR_SERVER_LOST
+CREATE WORKTREE wt FROM src;
+--source include/start_mysqld.inc
+SET SESSION cte_max_recursion_depth = 100000;
+SHOW DATABASES LIKE 'wt';
+--error 1
+--file_exists $datadir/wt
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+CHECK TABLE src.z1;
+
 CREATE WORKTREE wt FROM src;
 CHECKSUM TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
 CHECK TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;

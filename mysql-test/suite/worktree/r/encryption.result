@@ -136,6 +136,33 @@ Table	Op	Msg_type	Msg_text
 wt2.e	check	status	OK
 wt2.ez	check	status	OK
 wt2.p	check	status	OK
+# Page 0 of an encrypted worktree lost after a crash. Page 1 is encrypted
+# with the key that page 0 holds, so its map copy cannot name the file,
+# and identification falls back to InnoDB's page vote. Whatever the vote
+# makes of it (it may restore the worktree's own page 0 from the
+# doublewrite buffer, or stop with the file unidentified), it never
+# restores the source's page 0 into the worktree.
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/e.ibd");
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 200000 UNION ALL SELECT n + 1 FROM s WHERE n < 220000)
+SELECT n, CONCAT('more-', n), n % 7 FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wt.e SET v = 'enc-after-checkpoint' WHERE id = 5;
+# Kill the server
+source page 0 written into the worktree: no
+# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+SELECT v FROM wt.e WHERE id = 5;
+v
+enc-after-checkpoint
+SELECT COUNT(*) FROM src.e;
+COUNT(*)
+25002
+CHECK TABLE wt.e, src.e;
+Table	Op	Msg_type	Msg_text
+wt.e	check	status	OK
+src.e	check	status	OK
 # Control: stock FOR EXPORT does write them, and the listing shows them.
 FLUSH TABLES src.e FOR EXPORT;
 e.cfg
