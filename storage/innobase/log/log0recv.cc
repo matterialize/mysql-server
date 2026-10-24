@@ -2648,7 +2648,12 @@ void recv_recover_page_func(
       int shown = 0;
       for (auto recv : recv_addr->rec_list) {
         if (recv->start_lsn <= freeze_lsn || shown++ == 8) continue;
-        records << " " << get_mlog_string(recv->type) << "@" << recv->start_lsn
+#ifdef UNIV_DEBUG
+        records << " " << get_mlog_string(recv->type);
+#else
+        records << " " << int(recv->type);
+#endif /* UNIV_DEBUG */
+        records << "@" << recv->start_lsn
                 << "/" << recv->len;
       }
       ib::error() << "Overlay page " << block->page.id << ": page LSN "
