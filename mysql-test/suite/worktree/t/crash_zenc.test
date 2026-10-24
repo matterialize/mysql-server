@@ -1,0 +1,69 @@
+--echo # kill -9 at every phase of CREATE WORKTREE, with compressed and encrypted
+--echo # tables in the source: a 1 KB compressed table (overflow map), an
+--echo # encrypted one, and one both encrypted and compressed at 1 KB. Before the
+--echo # commit nothing survives; after it the worktree is complete and readable.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+--source include/have_component_keyring_file.inc
+--source suite/component_keyring_file/inc/setup_component.inc
+# Restarts keep the keyring's --plugin-dir; do not echo the host path.
+let $do_not_echo_parameters = 1;
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.z1 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY (a), KEY (b), KEY (c))
+  ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1;
+CREATE TABLE src.enc (id INT PRIMARY KEY, v VARCHAR(40), KEY (v)) ENCRYPTION = 'Y';
+CREATE TABLE src.encz (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY (a), KEY (b), KEY (c))
+  ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1 ENCRYPTION = 'Y';
+INSERT INTO src.z1 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+  SELECT n, n % 7, CONCAT('b', n), n FROM s;
+INSERT INTO src.enc WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+  SELECT n, CONCAT('v', n) FROM s;
+INSERT INTO src.encz SELECT * FROM src.z1;
+let $datadir= `SELECT @@datadir`;
+CHECKSUM TABLE src.z1, src.enc, src.encz;
+
+let $points = wt_crash_in_probe wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_in_overflow wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
+while ($points)
+{
+  let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
+  let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
+  --echo # Crash at $point
+  --source include/expect_crash.inc
+  eval SET SESSION debug = '+d,$point';
+  --error CR_SERVER_LOST
+  CREATE WORKTREE wt FROM src;
+  --source include/start_mysqld.inc
+  SHOW DATABASES LIKE 'wt';
+  --echo # no schema directory, no clone files
+  --error 1
+  --file_exists $datadir/wt
+  SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+}
+CHECK TABLE src.z1, src.enc, src.encz;
+CHECKSUM TABLE src.z1, src.enc, src.encz;
+
+--echo # Crash right after the commit: the worktree is complete.
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_after_commit';
+--error CR_SERVER_LOST
+CREATE WORKTREE wt FROM src;
+--source include/start_mysqld.inc
+SELECT NAME, ENCRYPTION, ROW_FORMAT FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME LIKE 'wt/%' ORDER BY NAME;
+CHECKSUM TABLE wt.z1, wt.enc, wt.encz;
+CHECK TABLE wt.z1, wt.enc, wt.encz;
+SELECT COUNT(*) FROM wt.encz FORCE INDEX (b) WHERE b LIKE 'b1%';
+INSERT INTO wt.encz VALUES (5000, 1, 'wt', 1);
+UPDATE wt.z1 SET b = 'wt' WHERE id = 1;
+--source include/restart_mysqld.inc
+CHECK TABLE wt.z1, wt.enc, wt.encz, src.z1, src.encz;
+SELECT COUNT(*) FROM src.encz WHERE b = 'wt';
+SELECT COUNT(*) FROM wt.encz WHERE b = 'wt';
+SELECT b FROM src.z1 WHERE id = 1;
+SELECT b FROM wt.z1 WHERE id = 1;
+DROP DATABASE wt;
+DROP DATABASE src;
+let $do_not_echo_parameters = 0;
+--source suite/component_keyring_file/inc/teardown_component.inc

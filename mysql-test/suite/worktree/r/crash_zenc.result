@@ -1,0 +1,179 @@
+# kill -9 at every phase of CREATE WORKTREE, with compressed and encrypted
+# tables in the source: a 1 KB compressed table (overflow map), an
+# encrypted one, and one both encrypted and compressed at 1 KB. Before the
+# commit nothing survives; after it the worktree is complete and readable.
+# ----------------------------------------------------------------------
+# Setup
+# Creating local configuration file for keyring component: component_keyring_file
+# Creating manifest file for current MySQL server instance
+# Re-starting mysql server with manifest file
+# ----------------------------------------------------------------------
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.z1 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY (a), KEY (b), KEY (c))
+ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1;
+CREATE TABLE src.enc (id INT PRIMARY KEY, v VARCHAR(40), KEY (v)) ENCRYPTION = 'Y';
+CREATE TABLE src.encz (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY (a), KEY (b), KEY (c))
+ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1 ENCRYPTION = 'Y';
+INSERT INTO src.z1 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+SELECT n, n % 7, CONCAT('b', n), n FROM s;
+INSERT INTO src.enc WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+SELECT n, CONCAT('v', n) FROM s;
+INSERT INTO src.encz SELECT * FROM src.z1;
+CHECKSUM TABLE src.z1, src.enc, src.encz;
+Table	Checksum
+src.z1	2262705519
+src.enc	3657261927
+src.encz	2262705519
+# Crash at wt_crash_in_probe
+SET SESSION debug = '+d,wt_crash_in_probe';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_ddl_log
+SET SESSION debug = '+d,wt_crash_after_ddl_log';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_reflink
+SET SESSION debug = '+d,wt_crash_after_reflink';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_page0
+SET SESSION debug = '+d,wt_crash_after_page0';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_in_overflow
+SET SESSION debug = '+d,wt_crash_in_overflow';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_rename
+SET SESSION debug = '+d,wt_crash_after_rename';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_after_third_rename
+SET SESSION debug = '+d,wt_crash_after_third_rename';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+# Crash at wt_crash_before_commit
+SET SESSION debug = '+d,wt_crash_before_commit';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# no schema directory, no clone files
+SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
+COUNT(*)
+0
+CHECK TABLE src.z1, src.enc, src.encz;
+Table	Op	Msg_type	Msg_text
+src.z1	check	status	OK
+src.enc	check	status	OK
+src.encz	check	status	OK
+CHECKSUM TABLE src.z1, src.enc, src.encz;
+Table	Checksum
+src.z1	2262705519
+src.enc	3657261927
+src.encz	2262705519
+# Crash right after the commit: the worktree is complete.
+SET SESSION debug = '+d,wt_crash_after_commit';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT NAME, ENCRYPTION, ROW_FORMAT FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME LIKE 'wt/%' ORDER BY NAME;
+NAME	ENCRYPTION	ROW_FORMAT
+wt/enc	Y	Dynamic
+wt/encz	Y	Compressed
+wt/z1	N	Compressed
+CHECKSUM TABLE wt.z1, wt.enc, wt.encz;
+Table	Checksum
+wt.z1	2262705519
+wt.enc	3657261927
+wt.encz	2262705519
+CHECK TABLE wt.z1, wt.enc, wt.encz;
+Table	Op	Msg_type	Msg_text
+wt.z1	check	status	OK
+wt.enc	check	status	OK
+wt.encz	check	status	OK
+SELECT COUNT(*) FROM wt.encz FORCE INDEX (b) WHERE b LIKE 'b1%';
+COUNT(*)
+1111
+INSERT INTO wt.encz VALUES (5000, 1, 'wt', 1);
+UPDATE wt.z1 SET b = 'wt' WHERE id = 1;
+# restart
+CHECK TABLE wt.z1, wt.enc, wt.encz, src.z1, src.encz;
+Table	Op	Msg_type	Msg_text
+wt.z1	check	status	OK
+wt.enc	check	status	OK
+wt.encz	check	status	OK
+src.z1	check	status	OK
+src.encz	check	status	OK
+SELECT COUNT(*) FROM src.encz WHERE b = 'wt';
+COUNT(*)
+0
+SELECT COUNT(*) FROM wt.encz WHERE b = 'wt';
+COUNT(*)
+1
+SELECT b FROM src.z1 WHERE id = 1;
+b
+b1
+SELECT b FROM wt.z1 WHERE id = 1;
+b
+wt
+DROP DATABASE wt;
+DROP DATABASE src;
+# ----------------------------------------------------------------------
+# Teardown
+# Removing manifest file for current MySQL server instance
+# Removing local keyring file for keyring component: component_keyring_file
+# Removing local configuration file for keyring component: component_keyring_file
+# Restarting server without the manifest file
+# ----------------------------------------------------------------------
