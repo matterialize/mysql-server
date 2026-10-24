@@ -70,7 +70,7 @@ SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wt.big SET pad = 'after-checkpoint' WHERE id = 5;
 # Kill the server
-Pattern "Datafile './wt/big.ibd': space id [0-9]+ belongs to another file; not chosen" found
+Pattern "Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen" found
 Pattern "Could not find any file associated with the tablespace ID" found
 source page 0 written into the worktree: no
 # Put the file back; recovery then completes normally.

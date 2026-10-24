@@ -101,7 +101,10 @@ let $c_log = $MYSQLTEST_VARDIR/log/page0_case_c.err;
 --error 1
 --exec $MYSQLD_CMD --log-error=$c_log --log-error-verbosity=3 > /dev/null 2>&1
 let SEARCH_FILE = $c_log;
---let SEARCH_PATTERN = Datafile './wt/big.ibd': space id [0-9]+ belongs to another file; not chosen
+# Either guard may refuse the ancestor first: "belongs to another file" needs
+# the source's file scanned already, and the startup scan runs in parallel;
+# the ancestor registry does not depend on the order.
+--let SEARCH_PATTERN = Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen
 --source include/search_pattern.inc
 --let SEARCH_PATTERN = Could not find any file associated with the tablespace ID
 --source include/search_pattern.inc
