@@ -273,13 +273,13 @@ inline bool log_free_check_is_required() {
 void log_free_check_validate();
 #endif /* UNIV_DEBUG */
 
-/** Reserves free_check_margin in the redo space for the current thread.
-For further details please look at description of @see log_free_check_margin().
-@param[in]  log   redo log */
 /** Overlay mode: first-dirty images since this thread's last free check
 (fil0overlay.h, limits/overlay-v3.md §5.2 O5). */
 extern thread_local ulint wt_img_since_check;
 
+/** Reserves free_check_margin in the redo space for the current thread.
+For further details please look at description of @see log_free_check_margin().
+@param[in]  log   redo log */
 inline void log_free_check(log_t &log) {
   ut_d(log_free_check_validate());
   wt_img_since_check = 0;

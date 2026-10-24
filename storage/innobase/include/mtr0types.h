@@ -278,8 +278,12 @@ enum mlog_id_t {
   /** Delete record list start on index page */
   MLOG_LIST_START_DELETE = 76,
 
+  /** Worktree overlay: full image of a compressed page, zip.data from byte 4
+  to its end (fil0overlay.h, limits/overlay-v3-addendum.md A1) */
+  MLOG_WT_ZIP_IMAGE = 77,
+
   /** biggest value (used in assertions) */
-  MLOG_BIGGEST_TYPE = MLOG_LIST_START_DELETE
+  MLOG_BIGGEST_TYPE = MLOG_WT_ZIP_IMAGE
 };
 
 /** @} */

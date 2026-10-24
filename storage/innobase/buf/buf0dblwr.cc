@@ -32,6 +32,7 @@ Atomic writes handling. */
 
 #include "buf0buf.h"
 #include "buf0checksum.h"
+#include "fil0overlay.h"
 #include "log0chkp.h"
 #include "os0enc.h"
 #include "os0thread-create.h"
@@ -279,6 +280,17 @@ class Pages {
   @return       page frame
   @retval nullptr if no page was found */
   const byte *find(const page_id_t &page_id) const noexcept;
+
+  /** Doublewrite candidate selection (limits/overlay-v3.md §6.2): among the
+  copies of page_id, keep the valid ones (right page number, checksum clean)
+  with LSN > lsn_floor and return the one with the highest LSN.
+  @param[in]  page_id  page
+  @param[in]  lsn_floor  copies with LSN <= this are ignored
+  @param[in]  page_size  page size, or nullptr: from the candidate's own FSP
+                         flags for page 0, else from the space if known
+  @return the copy, or nullptr */
+  const byte *select(const page_id_t &page_id, lsn_t lsn_floor,
+                     const page_size_t *page_size) const noexcept;
 
   /** @return true if page is recovered from the regular doublewrite buffer
   @param[in]   page_id                 Page number to lookup */
@@ -3195,6 +3207,24 @@ void recv::Pages::recover(fil_space_t *space) noexcept {
 
     fil_space_open_if_needed(space);
 
+    if (space->wt_ov != nullptr) {
+      /* Overlay (v3 §6.2): once per page id, from the best valid copy newer
+      than the freeze; older copies belong to the layer. */
+      const page_size_t size(space->flags);
+      const byte *best = select(page_id_t(space_id, page_no),
+                                space->wt_ov->link.freeze_lsn, &size);
+      const bool done =
+          best != nullptr &&
+          dblwr_recover_page(page->m_no, space, page_no, const_cast<byte *>(best));
+      for (const auto &other : m_pages) {
+        if (page_get_space_id(other->m_buffer.begin()) == space_id &&
+            page_get_page_no(other->m_buffer.begin()) == page_no) {
+          other->m_recovered = done;
+        }
+      }
+      continue;
+    }
+
     page->m_recovered =
         dblwr_recover_page(page->m_no, space, page_no, page->m_buffer.begin());
   }
@@ -3227,6 +3257,13 @@ void recv::Pages::reduced_recover(fil_space_t *space) noexcept {
 
     fil_space_open_if_needed(space);
 
+    /* Overlay: reduced entries from before the freeze are stale, and a local
+    hole is the normal "read from the layer" state (v3 §6.2). */
+    if (space->wt_ov != nullptr &&
+        entry.m_lsn <= space->wt_ov->link.freeze_lsn) {
+      continue;
+    }
+
     bool is_corrupted = false;
     bool is_all_zero = false;
     std::tie(is_corrupted, is_all_zero) =
@@ -3257,41 +3294,43 @@ void recv::Pages::reduced_recover(fil_space_t *space) noexcept {
 #endif /* !UNIV_HOTBACKUP */
 }
 
-const byte *recv::Pages::find(const page_id_t &page_id) const noexcept {
+const byte *recv::Pages::select(const page_id_t &page_id, lsn_t lsn_floor,
+                                const page_size_t *page_size) const noexcept {
   if (!dblwr::is_enabled()) {
     return nullptr;
   }
-  using Matches = std::vector<const byte *, ut::allocator<const byte *>>;
-
-  Matches matches;
-  const byte *page = nullptr;
-
+  const byte *best = nullptr;
+  lsn_t best_lsn = 0;
   for (const auto &page : m_pages) {
-    auto &buffer = page->m_buffer;
-
-    if (page_get_space_id(buffer.begin()) == page_id.space() &&
-        page_get_page_no(buffer.begin()) == page_id.page_no()) {
-      matches.push_back(buffer.begin());
+    const byte *copy = page->m_buffer.begin();
+    if (page_get_space_id(copy) != page_id.space() ||
+        page_get_page_no(copy) != page_id.page_no()) {
+      continue;
+    }
+    /* Validate first, then filter, then rank: a damaged copy with a higher
+    LSN must not hide a valid one. */
+    const fil_space_t *space = fil_space_get(page_id.space());
+    const page_size_t size =
+        page_size != nullptr ? *page_size
+        : page_id.page_no() == 0
+            ? page_size_t(fsp_header_get_field(copy, FSP_SPACE_FLAGS))
+        : space != nullptr ? page_size_t(space->flags)
+                           : page_size_t(univ_page_size);
+    /* No LSN check: before redo is scanned every newer copy would fail it. */
+    BlockReporter reporter(false, copy, size, false);
+    if (reporter.is_corrupted()) continue;
+    const lsn_t lsn = mach_read_from_8(copy + FIL_PAGE_LSN);
+    if (lsn <= lsn_floor) continue;
+    if (best == nullptr || lsn > best_lsn) {
+      best = copy;
+      best_lsn = lsn;
     }
   }
+  return best;
+}
 
-  if (matches.size() == 1) {
-    page = matches[0];
-
-  } else if (matches.size() > 1) {
-    lsn_t max_lsn = 0;
-
-    for (const auto &match : matches) {
-      lsn_t page_lsn = mach_read_from_8(match + FIL_PAGE_LSN);
-
-      if (page_lsn > max_lsn) {
-        max_lsn = page_lsn;
-        page = match;
-      }
-    }
-  }
-
-  return page;
+const byte *recv::Pages::find(const page_id_t &page_id) const noexcept {
+  return select(page_id, 0, nullptr);
 }
 
 bool recv::Pages::is_recovered(const page_id_t &page_id) const noexcept {

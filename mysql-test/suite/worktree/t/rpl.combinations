@@ -1,5 +1,21 @@
 [row]
 binlog-format=row
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M
 
 [stmt]
 binlog-format=statement
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M
+
+[row-overlay]
+binlog-format=row
+innodb-worktree-mode=OVERLAY
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M
+
+[stmt-overlay]
+binlog-format=statement
+innodb-worktree-mode=OVERLAY
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M

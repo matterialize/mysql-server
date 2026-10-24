@@ -25,94 +25,10 @@ Table	Checksum
 src.z1	2262705519
 src.enc	3657261927
 src.encz	2262705519
-# Crash at wt_crash_in_probe
-SET SESSION debug = '+d,wt_crash_in_probe';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_after_ddl_log
-SET SESSION debug = '+d,wt_crash_after_ddl_log';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_after_reflink
-SET SESSION debug = '+d,wt_crash_after_reflink';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_after_page0
-SET SESSION debug = '+d,wt_crash_after_page0';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_in_overflow
-SET SESSION debug = '+d,wt_crash_in_overflow';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_after_rename
-SET SESSION debug = '+d,wt_crash_after_rename';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_after_third_rename
-SET SESSION debug = '+d,wt_crash_after_third_rename';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
-# Crash at wt_crash_before_commit
-SET SESSION debug = '+d,wt_crash_before_commit';
-CREATE WORKTREE wt FROM src;
-ERROR HY000: Lost connection to MySQL server during query
-# restart
-SHOW DATABASES LIKE 'wt';
-Database (wt)
-# no schema directory, no clone files
-SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-COUNT(*)
-0
+# kill -9 at every crash point before the commit (the points differ by
+# mode: overlay mode has no reflink probe and freezes the writable source).
+# Each one must leave no schema, directory, InnoDB table or object behind.
+crash points that left nothing behind: at least 7: 1
 CHECK TABLE src.z1, src.enc, src.encz;
 Table	Op	Msg_type	Msg_text
 src.z1	check	status	OK

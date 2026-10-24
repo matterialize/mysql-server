@@ -4198,6 +4198,9 @@ static void innobase_post_recover() {
 
   ut_a(innodb_inited);
 
+  /* Worktree layers no link reaches, and live links (fil0overlay.h). */
+  if (!opt_initialize) innobase_wt_gc(true);
+
   if (!opt_initialize) {
     if (!log_pfs_create_tables()) {
       ib::warn(ER_IB_MSG_LOG_PFS_CREATE_TABLES_FAILED);
@@ -5010,6 +5013,8 @@ static void innobase_post_ddl(THD *thd) {
       ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_DDL_LOG_FAIL_POST_DDL);
     }
   }
+  /* An overlay or a live-linked source was dropped: collect its layers. */
+  if (wt_gc_wanted.exchange(false)) innobase_wt_gc(false);
 }
 
 // simple (no measurement attributes supported) metric callback
@@ -5469,6 +5474,8 @@ static int innodb_init(void *p) {
 
   innobase_hton->post_ddl = innobase_post_ddl;
   innobase_hton->clone_table = innobase_clone_table;
+  innobase_hton->worktree_refresh = innobase_worktree_refresh;
+  innobase_hton->worktree_materialize = innobase_worktree_materialize;
 
   /* Initialize handler clone interfaces for. */
 

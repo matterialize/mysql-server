@@ -45,6 +45,9 @@ extern std::atomic<uint64_t> wt_image_overdrafts;
 /** Images since this thread's last log_free_check(). */
 extern thread_local ulint wt_img_since_check;
 
+/** An overlay or live-linked space was freed: run layer GC after the DDL. */
+extern std::atomic<bool> wt_gc_wanted;
+
 /** Overlay mode was enabled at startup (innodb_worktree_mode). */
 extern bool srv_wt_overlay;
 
@@ -152,6 +155,17 @@ std::string wt_new_uuid();
 
 /** @return path of a layer file */
 std::string wt_layer_path(const std::string &uuid);
+
+struct buf_block_t;
+struct mtr_t;
+
+/** Log a full image of an X-latched page in mtr (the first-dirty hook's
+record; flatten adopts chain pages with it). */
+void wt_mtr_log_image(mtr_t *mtr, const buf_block_t *block);
+
+/** Flatten's last step (v3 §8 step 5): the space is no longer an overlay.
+Detach its chain and drop its map. */
+void fil_wt_detach(space_id_t space_id);
 
 /* Freeze support in fil0fil.cc (limits/overlay-v3.md §7.1). */
 

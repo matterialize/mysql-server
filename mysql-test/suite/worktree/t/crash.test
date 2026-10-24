@@ -21,27 +21,54 @@ CREATE TRIGGER src.trg AFTER INSERT ON src.b FOR EACH ROW UPDATE src.a SET v = C
 CREATE EVENT src.ev ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM src.b;
 let $datadir= `SELECT @@datadir`;
 
-let $points = wt_crash_in_probe wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  let $points = wt_crash_in_probe wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
+}
+if ($overlay)
+{
+  # Overlay mode: no reflink probe; the writable source is frozen first.
+  let $points = wt_crash_freeze_after_link wt_crash_freeze_after_tmp wt_crash_freeze_after_rename wt_crash_freeze_after_open wt_crash_after_ddl_log wt_crash_after_reflink wt_crash_after_page0 wt_crash_after_rename wt_crash_after_third_rename wt_crash_before_commit;
+}
+--echo # kill -9 at every crash point before the commit (the points differ by
+--echo # mode: overlay mode has no reflink probe and freezes the writable source).
+--echo # Each one must leave no schema, directory, InnoDB table or object behind.
+--disable_query_log
+--disable_result_log
+let $n_points = 0;
 while ($points)
 {
+  --disable_query_log
+  --disable_result_log
   let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
   let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
-  --echo # Crash at $point
   --source include/expect_crash.inc
   eval SET SESSION debug = '+d,$point';
   --error CR_SERVER_LOST
   CREATE WORKTREE wt FROM src;
   --source include/start_mysqld.inc
-  SHOW DATABASES LIKE 'wt';
-  --echo # no schema directory, no clone files
+  # (it turns the logs back on)
+  --disable_query_log
+  --disable_result_log
+  let $left = `SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'wt') +
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%') +
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt') +
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt') +
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt') +
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt')`;
+  if ($left)
+  {
+    --die Crash at $point left $left objects of wt behind
+  }
   --error 1
   --file_exists $datadir/wt
-  SELECT COUNT(*) FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME LIKE 'wt/%';
-  SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_SCHEMA = 'wt') +
-         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = 'wt') +
-         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt') +
-         (SELECT COUNT(*) FROM INFORMATION_SCHEMA.EVENTS WHERE EVENT_SCHEMA = 'wt') AS wt_objects;
+  inc $n_points;
 }
+--enable_result_log
+--enable_query_log
+let $enough = `SELECT $n_points >= 7`;
+--echo crash points that left nothing behind: at least 7: $enough
 
 --echo # Crash right after the commit: the worktree is complete.
 --source include/expect_crash.inc

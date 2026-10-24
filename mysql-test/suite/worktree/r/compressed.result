@@ -81,7 +81,7 @@ z2: 1024 pages, data pages rewritten: 0, map in page 0: inline
 z4: 768 pages, data pages rewritten: 0, map in page 0: inline
 z8: 640 pages, data pages rewritten: 0, map in page 0: inline
 z16: 576 pages, data pages rewritten: 0, map in page 0: inline
-z1_small: 5120 pages, data pages rewritten: 0, map in page 0: inline
+z1_small: 5120 pages, data pages rewritten: 0, map in page 0: inline, or overflow in overlay mode
 # restart
 # After a restart the map (inline or from overflow pages) is read before
 # any page: untouched pages of every index still read correctly.
@@ -161,7 +161,7 @@ wt2.z1	662530299
 wt2.z1_small	3657261927
 wt2.z4	574550257
 wt2.z1: map in page 0: overflow
-wt2.z1_small: map in page 0: inline
+wt2.z1_small: map in page 0: inline, or overflow in overlay mode
 # restart
 CHECK TABLE wt2.z1, wt2.z2, wt2.z4, wt2.z8, wt2.z16, wt2.z1_small;
 Table	Op	Msg_type	Msg_text

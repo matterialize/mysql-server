@@ -68,4 +68,24 @@ class Sql_cmd_create_worktree final : public Sql_cmd_ddl {
   LEX_CSTRING m_src;
 };
 
+/**
+  ALTER WORKTREE <db> MATERIALIZE: make every overlay file of the schema a
+  standalone stock-format file (limits/overlay-v3.md §8).
+*/
+class Sql_cmd_materialize_worktree final : public Sql_cmd_ddl {
+ public:
+  enum_sql_command sql_command_code() const override {
+    return SQLCOM_ALTER_DB;
+  }
+
+  bool execute(THD *thd) override;
+};
+
+/**
+  For every table of schema db: the engine's worktree refresh (before a
+  read-only schema becomes writable) or materialize operation.
+  @retval true failure, my_error() was called
+*/
+bool worktree_tables_op(THD *thd, const char *db, bool refresh);
+
 #endif /* SQL_WORKTREE_INCLUDED */

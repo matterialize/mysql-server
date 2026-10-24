@@ -98,15 +98,18 @@ perl;
   sysseek($fh, 0, 0); syswrite($fh, "\0" x 32768); close($fh);
 EOF
 let $c_log = $MYSQLTEST_VARDIR/log/page0_case_c.err;
---error 1
+# Reflink mode: the vote refuses the ancestor and no file is identified
+# (exit 1). Overlay mode: the worktree's holes don't vote, its own written
+# pages identify it, and its page 0 has no doublewrite copy (fatal, exit 2).
+--error 1,2
 --exec $MYSQLD_CMD --log-error=$c_log --log-error-verbosity=3 > /dev/null 2>&1
 let SEARCH_FILE = $c_log;
 # Either guard may refuse the ancestor first: "belongs to another file" needs
 # the source's file scanned already, and the startup scan runs in parallel;
 # the ancestor registry does not depend on the order.
---let SEARCH_PATTERN = Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen
+--let SEARCH_PATTERN = (Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen|Header page consists of zero bytes in datafile: ./wt/big.ibd)
 --source include/search_pattern.inc
---let SEARCH_PATTERN = Could not find any file associated with the tablespace ID
+--let SEARCH_PATTERN = (Could not find any file associated with the tablespace ID|could not be found in the doublewrite buffer)
 --source include/search_pattern.inc
 perl;
   sub space_id { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384); return unpack('N', substr($p, 34, 4)); }
@@ -200,10 +203,12 @@ perl;
   sysseek($fh, 0, 0); syswrite($fh, "\0" x 32768); close($fh);
 EOF
 let $f_log = $MYSQLTEST_VARDIR/log/page0_case_f.err;
---error 1
+# As in C: reflink mode exits 1, overlay mode (own id found, no page-0 copy)
+# exits 2; neither writes the ancestor's page 0 into the worktree.
+--error 1,2
 --exec $MYSQLD_CMD --log-error=$f_log --log-error-verbosity=3 > /dev/null 2>&1
 let SEARCH_FILE = $f_log;
---let SEARCH_PATTERN = Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen
+--let SEARCH_PATTERN = (Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen|could not be found in the doublewrite buffer)
 --source include/search_pattern.inc
 perl;
   my $f = $ENV{WT_IBD}; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 32768);

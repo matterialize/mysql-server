@@ -1830,6 +1830,11 @@ typedef bool (*sdi_set_t)(handlerton *hton, const dd::Tablespace &tablespace,
 typedef bool (*clone_table_t)(handlerton *hton, THD *thd, const dd::Table &src,
                               dd::Table *dst, const char *dst_db);
 
+/** A worktree operation on one table's files (refresh, materialize).
+@retval true failure, my_error() was called */
+typedef bool (*worktree_table_op_t)(handlerton *hton, THD *thd,
+                                    const dd::Table &table);
+
 /**
   Delete SDI for a given SDI key.
   @param[in]  tablespace  tablespace object
@@ -3020,6 +3025,14 @@ struct handlerton {
 
   /** Copy-on-write table clone for CREATE WORKTREE, or nullptr. */
   clone_table_t clone_table;
+
+  /** Overlay worktrees: before a read-only schema becomes writable, stop its
+  tables' files being layers (refresh); or nullptr. */
+  worktree_table_op_t worktree_refresh;
+
+  /** ALTER WORKTREE ... MATERIALIZE: make a table's files standalone; or
+  nullptr. */
+  worktree_table_op_t worktree_materialize;
 
   /** Clone data transfer interfaces */
   Clone_interface_t clone_interface;

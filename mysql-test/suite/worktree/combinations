@@ -1,0 +1,8 @@
+[auto]
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M
+
+[overlay]
+innodb-worktree-mode=OVERLAY
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M

@@ -59,6 +59,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "log0log.h"
 #include "log0pre_8_0_30.h"
 #include "log0recv.h"
+#include "fil0overlay.h"
 #include "log0test.h"
 #include "mem0mem.h"
 #include "mtr0log.h"
@@ -2167,6 +2168,27 @@ static const byte *recv_parse_or_apply_log_rec_body(
       break;
     }
 
+    case MLOG_WT_ZIP_IMAGE: {
+      /* Worktree overlay image of a compressed page (addendum A1). */
+      if (end_ptr < ptr + 2) {
+        return nullptr;
+      }
+      const ulint len = mach_read_from_2(ptr);
+      ptr += 2;
+      if (end_ptr < ptr + len) {
+        return nullptr;
+      }
+      if (page_zip != nullptr) {
+        ut_a(4 + len == page_zip_get_size(page_zip));
+        memcpy(page_zip->data + 4, ptr, len);
+        if (page != nullptr && fil_page_index_page_check(page_zip->data)) {
+          ut_a(page_zip_decompress(page_zip, page, true));
+        }
+      }
+      ptr += len;
+      break;
+    }
+
     case MLOG_WRITE_STRING: {
       ut_ad(!page || page_type != FIL_PAGE_TYPE_ALLOCATED || page_no == 0);
       bool is_encryption = check_encryption(page_no, space_id, ptr, end_ptr);
@@ -2582,6 +2604,59 @@ void recv_recover_page_func(
   lsn_t end_lsn = 0;
   lsn_t start_lsn = 0;
   bool modification_to_page = false;
+
+#ifndef UNIV_HOTBACKUP
+  /* Overlay case C3 (limits/overlay-v3.md §6.3): a page read from the layer
+  chain (no local copy) is a valid base only if its first post-freeze redo
+  group holds a full image of it or initializes it. Otherwise its local write
+  was lost: fail-stop rather than apply records to the wrong base. */
+  if (just_read_in && block->page.wt_src != 0 &&
+      block->page.get_space() != nullptr &&
+      block->page.get_space()->wt_ov != nullptr) {
+    const fil_space_t *ov_space = block->page.get_space();
+    const lsn_t freeze_lsn = ov_space->wt_ov->link.freeze_lsn;
+    const ulint image_len = block->page.size.physical() - 4 - FIL_PAGE_DATA_END;
+    /* One mtr's records share their end LSN (each has its own start). */
+    lsn_t first = 0;
+    for (auto recv : recv_addr->rec_list) {
+      if (recv->start_lsn > freeze_lsn) {
+        first = recv->end_lsn;
+        break;
+      }
+    }
+    bool based = first == 0;
+    for (auto recv : recv_addr->rec_list) {
+      if (based || recv->end_lsn != first) continue;
+      if (recv->type == MLOG_INIT_FILE_PAGE2 ||
+          recv->type == MLOG_INIT_FILE_PAGE ||
+          recv->type == MLOG_WT_ZIP_IMAGE) {
+        based = true;
+      } else if (recv->type == MLOG_WRITE_STRING && recv->data != nullptr &&
+                 recv->len >= 4) {
+        const byte *body = reinterpret_cast<const byte *>(recv->data) +
+                           sizeof(recv_data_t);
+        based = mach_read_from_2(body) == 4 &&
+                mach_read_from_2(body + 2) == image_len;
+      }
+    }
+    if (!based) {
+      std::ostringstream records;
+      int shown = 0;
+      for (auto recv : recv_addr->rec_list) {
+        if (recv->start_lsn <= freeze_lsn || shown++ == 8) continue;
+        records << " " << get_mlog_string(recv->type) << "@" << recv->start_lsn
+                << "/" << recv->len;
+      }
+      ib::error() << "Overlay page " << block->page.id << ": page LSN "
+                  << page_lsn << ", wt_src " << int(block->page.wt_src)
+                  << ", records after the freeze:" << records.str();
+      ib::fatal(UT_LOCATION_HERE)
+          << "Overlay page " << block->page.id << " of " << ov_space->name
+          << " lost: it is not in its file, and its first redo after the "
+             "freeze (LSN " << first << ") neither images nor initializes it";
+    }
+  }
+#endif /* !UNIV_HOTBACKUP */
 
   for (auto recv : recv_addr->rec_list) {
     end_lsn = recv->end_lsn;
@@ -4088,6 +4163,9 @@ const char *get_mlog_string(mlog_id_t type) {
 
     case MLOG_WRITE_STRING:
       return "MLOG_WRITE_STRING";
+
+    case MLOG_WT_ZIP_IMAGE:
+      return "MLOG_WT_ZIP_IMAGE";
 
     case MLOG_MULTI_REC_END:
       return "MLOG_MULTI_REC_END";

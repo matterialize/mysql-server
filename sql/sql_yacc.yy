@@ -8249,7 +8249,24 @@ alter_table_stmt:
         ;
 
 alter_database_stmt:
-          ALTER DATABASE ident_or_empty
+          ALTER WORKTREE_SYM ident ident
+          {
+            if (my_strcasecmp(system_charset_info, $4.str, "MATERIALIZE") != 0)
+            {
+              YYTHD->syntax_error_at(@4);
+              MYSQL_YYABORT;
+            }
+            LEX *lex= Lex;
+            lex->create_info= YYTHD->alloc_typed<HA_CREATE_INFO>();
+            if (lex->create_info == nullptr)
+              MYSQL_YYABORT; // OOM
+            lex->sql_command= SQLCOM_ALTER_DB;
+            lex->name= $3;
+            lex->m_sql_cmd= NEW_PTN Sql_cmd_materialize_worktree();
+            if (lex->m_sql_cmd == nullptr)
+              MYSQL_YYABORT; // OOM
+          }
+        | ALTER DATABASE ident_or_empty
           {
             Lex->create_info= YYTHD->alloc_typed<HA_CREATE_INFO>();
             if (Lex->create_info == nullptr)

@@ -678,21 +678,27 @@ std::atomic<uint64_t> wt_images{0};
 std::atomic<uint64_t> wt_image_overdrafts{0};
 thread_local ulint wt_img_since_check = 0;
 
-namespace {
-/** Log a full image of one page, [4, physical - 8), from the bytes that are
-written to disk (zip.data for a compressed page that has no frame content of
-its own), as a WRITE_STRING record with an explicit page id. */
-void wt_log_image(mtr_t *mtr, const buf_block_t *block) {
+/** Log a full image of one page from the bytes that are written to disk:
+[4, physical - 8) of the frame as WRITE_STRING, or for a compressed B-tree or
+BLOB page [4, physical) of zip.data as WT_ZIP_IMAGE; explicit page id. */
+void wt_mtr_log_image(mtr_t *mtr, const buf_block_t *block) {
   const page_size_t &size = block->page.size;
-  const bool zip_only =
-      size.is_compressed() && !page_is_uncompressed_type(block->frame);
-  ut_a(!zip_only || fil_page_get_type(block->page.zip.data) == FIL_PAGE_TYPE_ZBLOB ||
-       fil_page_get_type(block->page.zip.data) == FIL_PAGE_TYPE_ZBLOB2 ||
-       fil_page_get_type(block->page.zip.data) == FIL_PAGE_SDI_ZBLOB);
-  const byte *src = zip_only ? block->page.zip.data : block->frame;
-  const ulint len = size.physical() - 4 - FIL_PAGE_DATA_END;
   byte *log_ptr = nullptr;
   if (!mlog_open(mtr, 30, log_ptr)) return;
+  if (size.is_compressed() && !page_is_uncompressed_type(block->page.zip.data)) {
+    /* A compressed B-tree or BLOB page: its content is zip.data, which has
+    no FIL trailer (addendum A1). */
+    const ulint len = size.physical() - 4;
+    log_ptr = mlog_write_initial_log_record_low(
+        MLOG_WT_ZIP_IMAGE, block->page.id.space(), block->page.id.page_no(),
+        log_ptr, mtr);
+    mach_write_to_2(log_ptr, len);
+    log_ptr += 2;
+    mlog_close(mtr, log_ptr);
+    mlog_catenate_string(mtr, block->page.zip.data + 4, len);
+    return;
+  }
+  const ulint len = size.physical() - 4 - FIL_PAGE_DATA_END;
   log_ptr = mlog_write_initial_log_record_low(
       MLOG_WRITE_STRING, block->page.id.space(), block->page.id.page_no(),
       log_ptr, mtr);
@@ -701,9 +707,10 @@ void wt_log_image(mtr_t *mtr, const buf_block_t *block) {
   mach_write_to_2(log_ptr, len);
   log_ptr += 2;
   mlog_close(mtr, log_ptr);
-  mlog_catenate_string(mtr, src + 4, len);
+  mlog_catenate_string(mtr, block->frame + 4, len);
 }
 
+namespace {
 /** The first-dirty hook (limits/overlay-v3.md §5.2): runs on the memo slots
 that commit will dirty, before the redo is written. */
 struct Wt_image_hook {
@@ -750,7 +757,7 @@ struct Wt_image_hook {
       case MTR_LOG_ALL:
       case MTR_LOG_SHORT_INSERTS:
         /* Rule 3. */
-        wt_log_image(m_mtr, block);
+        wt_mtr_log_image(m_mtr, block);
         fil_wt_set_present(space, page_no);
         wt_images.fetch_add(1);
         if (++wt_img_since_check > WT_K_INT) wt_image_overdrafts.fetch_add(1);

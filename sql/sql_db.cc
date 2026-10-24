@@ -702,6 +702,11 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
 
   // Set read_only option.
   if (create_info->used_fields & HA_CREATE_USED_READ_ONLY) {
+    /* Overlay worktrees: a read-only schema's live files may be layers;
+    freeze them before the schema can be written (refresh). */
+    if (schema_read_only && !create_info->schema_read_only &&
+        worktree_tables_op(thd, db, true))
+      return true;
     schema->set_read_only(create_info->schema_read_only);
   }
 

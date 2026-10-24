@@ -1,0 +1,4 @@
+[reflink]
+innodb-worktree-mode=REFLINK
+innodb-thread-concurrency=8
+innodb-redo-log-capacity=64M

@@ -4010,6 +4010,10 @@ int mysql_execute_command(THD *thd, bool first_level) {
     case SQLCOM_ALTER_DB: {
       if (check_and_convert_db_name(&lex->name, false) != Ident_name_check::OK)
         break;
+      if (lex->m_sql_cmd != nullptr) {  // ALTER WORKTREE ... MATERIALIZE
+        res = lex->m_sql_cmd->execute(thd);
+        break;
+      }
       if (check_access(thd, ALTER_ACL, lex->name.str, nullptr, nullptr, true,
                        false))
         break;

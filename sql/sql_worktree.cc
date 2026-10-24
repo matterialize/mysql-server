@@ -765,3 +765,48 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
   *query_len = r.text.size();
   return out;
 }
+
+bool worktree_tables_op(THD *thd, const char *db, bool refresh) {
+  dd::cache::Dictionary_client &dc = *thd->dd_client();
+  const dd::cache::Dictionary_client::Auto_releaser releaser(&dc);
+  if (dd::mdl_lock_schema(thd, db, MDL_TRANSACTION)) return true;  // DD lookups
+  const dd::Schema *schema = nullptr;
+  if (dc.acquire(db, &schema)) return true;
+  if (schema == nullptr) {
+    my_error(ER_BAD_DB_ERROR, MYF(0), db);
+    return true;
+  }
+  /* The caller holds the schema name lock: no table of it can be created,
+  dropped or altered meanwhile, so the fetched objects stay valid. */
+  std::vector<const dd::Table *> tables, visible;
+  if (dc.fetch_schema_components(schema, &tables)) return true;
+  std::vector<std::string> names;
+  for (const dd::Table *t : tables) {
+    if (t->hidden() != dd::Abstract_table::HT_VISIBLE) continue;
+    visible.push_back(t);
+    names.emplace_back(t->name().c_str());
+  }
+  /* Refresh freezes (writes blocked, like a freeze for CREATE WORKTREE);
+  materialize flattens, which allows reads and writes (overlay-v3 §8). */
+  if (lock_tables(thd, in_schema(db, names),
+                  refresh ? MDL_SHARED_NO_WRITE : MDL_SHARED_READ))
+    return true;
+  for (const dd::Table *table : visible) {
+    handlerton *hton = nullptr;
+    if (dd::table_storage_engine(thd, table, &hton)) return true;
+    const worktree_table_op_t op =
+        refresh ? hton->worktree_refresh : hton->worktree_materialize;
+    if (op != nullptr && op(hton, thd, *table)) return true;
+  }
+  return false;
+}
+
+bool Sql_cmd_materialize_worktree::execute(THD *thd) {
+  const char *db = thd->lex->name.str;
+  if (check_access(thd, ALTER_ACL, db, nullptr, nullptr, true, false))
+    return true;
+  if (lock_schema_name(thd, db)) return true;
+  if (worktree_tables_op(thd, db, false)) return true;
+  my_ok(thd);
+  return false;
+}

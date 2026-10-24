@@ -70,8 +70,8 @@ SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wt.big SET pad = 'after-checkpoint' WHERE id = 5;
 # Kill the server
-Pattern "Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen" found
-Pattern "Could not find any file associated with the tablespace ID" found
+Pattern "(Datafile './wt/big.ibd': space id [0-9]+ (belongs to another file|is a worktree ancestor and this is not its file); not chosen|Header page consists of zero bytes in datafile: ./wt/big.ibd)" found
+Pattern "(Could not find any file associated with the tablespace ID|could not be found in the doublewrite buffer)" found
 source page 0 written into the worktree: no
 # Put the file back; recovery then completes normally.
 # restart
@@ -141,7 +141,7 @@ SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wt.big SET pad = 'wt-after-drop' WHERE id = 5;
 # Kill the server
-Pattern "Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen" found
+Pattern "(Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen|could not be found in the doublewrite buffer)" found
 pages 0 and 1 of the worktree are still all zero: yes
 # restart
 SELECT pad FROM wt.big WHERE id = 5;

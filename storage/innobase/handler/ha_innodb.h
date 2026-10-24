@@ -843,6 +843,19 @@ typedef struct new_ft_info {
 void innobase_register_trx(handlerton *hton, THD *thd, trx_t *trx);
 
 /** CREATE WORKTREE: see clone_table_t in handler.h. */
+/** Overlay refresh (ALTER SCHEMA ... READ ONLY = 0): freeze the table's
+live-linked files (limits/overlay-v3-addendum.md A2). */
+bool innobase_worktree_refresh(handlerton *hton, THD *thd,
+                               const dd::Table &table);
+
+/** ALTER WORKTREE ... MATERIALIZE: flatten the table's overlay files into
+standalone stock-format files (limits/overlay-v3.md §8). */
+bool innobase_worktree_materialize(handlerton *hton, THD *thd,
+                                   const dd::Table &table);
+
+/** Overlay layer GC (limits/overlay-v3.md §9) and live-link marking. */
+void innobase_wt_gc(bool startup);
+
 /** Choose the worktree mode at startup (innodb_worktree_mode).
 @return true if startup must abort */
 bool innobase_wt_select_mode();

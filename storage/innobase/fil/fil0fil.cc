@@ -3168,6 +3168,7 @@ void Fil_shard::space_free_low(fil_space_t *&space) {
 
   ut::delete_(space->wt_map);
   space->wt_map = nullptr;
+  if (space->wt_ov != nullptr || space->wt_linked) wt_gc_wanted.store(true);
   fil_wt_overlay_free(space);
 
   for (auto &file : space->files) {
@@ -11996,4 +11997,16 @@ bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link) {
   ++space->wt_gen;
   shard->mutex_release();
   return success;
+}
+
+void fil_wt_detach(space_id_t space_id) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_space_t *space = shard->get_space_by_id(space_id);
+  space->flags &= ~FSP_FLAGS_MASK_WT_OVERLAY;
+  fil_wt_overlay_free(space);
+  ut::delete_(space->wt_map);
+  space->wt_map = nullptr;
+  space->wt_map_loaded = true;
+  shard->mutex_release();
 }
