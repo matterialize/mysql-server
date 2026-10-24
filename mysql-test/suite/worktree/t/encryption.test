@@ -155,8 +155,10 @@ perl;
     select(undef, undef, undef, 0.2);
   }
   system("$ENV{MYSQLADMIN} -uroot -S $ENV{MYSQLD_SOCK} shutdown >/dev/null 2>&1") if $up;
-  for (1 .. 300) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /Shutdown complete|Aborting/;
+  # Until the process has exited: it holds the datadir's file locks until then.
+  for (1 .. 300) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /MySQL Server - end/;
     select(undef, undef, undef, 0.2); }
+  sleep(2);
   sub space_id { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384); return unpack('N', substr($p, 34, 4)); }
   print "source page 0 written into the worktree: ", (space_id($ENV{WT_IBD}) == space_id($ENV{SRC_IBD}) ? "YES" : "no"), "\n";
   # Refused: put the file back so that recovery can run. Recovered: the
