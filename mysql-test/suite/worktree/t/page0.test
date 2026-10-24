@@ -7,6 +7,9 @@
 --source include/have_innodb_16k.inc
 
 let $datadir = `SELECT @@datadir`;
+# Hand-started servers get the running one's settings (the combination's
+# options are on its command line, not in my.cnf).
+let $wt_opts = `SELECT CONCAT('--innodb-worktree-mode=', @@innodb_worktree_mode, ' --innodb-thread-concurrency=', @@innodb_thread_concurrency, ' --innodb-redo-log-capacity=', @@innodb_redo_log_capacity)`;
 let WT_IBD = $datadir/wt/big.ibd;
 let SRC_IBD = $datadir/src/big.ibd;
 let $error_log = $MYSQLTEST_VARDIR/log/mysqld.1.err;
@@ -102,7 +105,7 @@ let $c_log = $MYSQLTEST_VARDIR/log/page0_case_c.err;
 # (exit 1). Overlay mode: the worktree's holes don't vote, its own written
 # pages identify it, and its page 0 has no doublewrite copy (fatal, exit 2).
 --error 1,2
---exec $MYSQLD_CMD --log-error=$c_log --log-error-verbosity=3 > /dev/null 2>&1
+--exec $MYSQLD_CMD $wt_opts --log-error=$c_log --log-error-verbosity=3 > /dev/null 2>&1
 let SEARCH_FILE = $c_log;
 # Either guard may refuse the ancestor first: "belongs to another file" needs
 # the source's file scanned already, and the startup scan runs in parallel;
@@ -206,7 +209,7 @@ let $f_log = $MYSQLTEST_VARDIR/log/page0_case_f.err;
 # As in C: reflink mode exits 1, overlay mode (own id found, no page-0 copy)
 # exits 2; neither writes the ancestor's page 0 into the worktree.
 --error 1,2
---exec $MYSQLD_CMD --log-error=$f_log --log-error-verbosity=3 > /dev/null 2>&1
+--exec $MYSQLD_CMD $wt_opts --log-error=$f_log --log-error-verbosity=3 > /dev/null 2>&1
 let SEARCH_FILE = $f_log;
 --let SEARCH_PATTERN = (Datafile './wt/big.ibd': space id [0-9]+ is a worktree ancestor and this is not its file; not chosen|could not be found in the doublewrite buffer)
 --source include/search_pattern.inc
@@ -252,7 +255,7 @@ perl;
   sysseek($fh, 0, 0); syswrite($fh, "\0" x 1024); close($fh);
 EOF
 let G_LOG = $MYSQLTEST_VARDIR/log/page0_compressed.err;
---exec_in_background $MYSQLD_CMD --log-error=$G_LOG --log-error-verbosity=3
+--exec_in_background $MYSQLD_CMD $wt_opts --log-error=$G_LOG --log-error-verbosity=3
 let MYSQLD_SOCK = $MASTER_MYSOCK;
 perl;
   # Wait for startup to finish either way; stop the server if it came up.

@@ -666,6 +666,7 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
   */
   bool schema_read_only = false;
   schema_read_only = schema->read_only();
+  const dd::Object_id schema_id = schema->id();
   if (!thread_can_ignore_schema_read_only(thd) && schema_read_only) {
     if (!(create_info->used_fields & HA_CREATE_USED_READ_ONLY) ||
         ((create_info->used_fields & ~HA_CREATE_USED_READ_ONLY) &&
@@ -734,6 +735,12 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
     options of current database.
   */
   if (trans_commit_stmt(thd) || trans_commit(thd)) return true;
+
+  /* Overlay worktrees: purge of the schema's old history can be waited for
+  now, once, instead of at each CREATE WORKTREE from it. */
+  if ((create_info->used_fields & HA_CREATE_USED_READ_ONLY) &&
+      !schema_read_only && create_info->schema_read_only)
+    worktree_schema_read_only(thd, schema_id);
 
   /*
     Change collation options if the current database is being

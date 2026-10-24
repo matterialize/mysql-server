@@ -776,6 +776,18 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
   return out;
 }
 
+static bool worktree_read_only_one(THD *thd, plugin_ref plugin, void *arg) {
+  handlerton *hton = plugin_data<handlerton *>(plugin);
+  if (hton->state == SHOW_OPTION_YES && hton->worktree_read_only != nullptr)
+    hton->worktree_read_only(hton, thd, *static_cast<dd::Object_id *>(arg));
+  return false;
+}
+
+void worktree_schema_read_only(THD *thd, dd::Object_id schema_id) {
+  plugin_foreach(thd, worktree_read_only_one, MYSQL_STORAGE_ENGINE_PLUGIN,
+                 &schema_id);
+}
+
 bool worktree_tables_op(THD *thd, const char *db, bool refresh) {
   dd::cache::Dictionary_client &dc = *thd->dd_client();
   const dd::cache::Dictionary_client::Auto_releaser releaser(&dc);

@@ -52,26 +52,29 @@ DELETE FROM wt.ft WHERE id = 1;
 UPDATE wt.z SET v = CONCAT('w', v) WHERE id <= 300;
 CALL src.pay(3, 7);
 SET SESSION group_concat_max_len = 10000000;
-SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
-COUNT(*)	SUM(bal)	SUM(note = 'wt only')
-500	500050	10
+# How many burst updates the clone caught depends on timing; each one is
+# +1 balance and one log row (trigger), so bal - log rows is fixed, and wt
+# caught a prefix of them (src has all 300).
+SELECT COUNT(*), SUM(bal) - (SELECT COUNT(*) FROM wt.log) AS bal_minus_log, SUM(note = 'wt only') FROM wt.acct;
+COUNT(*)	bal_minus_log	SUM(note = 'wt only')
+500	500038	10
 SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
 COUNT(*)	SUM(bal)	SUM(note = 'wt only')
 500	500307	0
-SELECT COUNT(*) FROM wt.log;
-COUNT(*)
-12
+SELECT (SELECT COUNT(*) FROM wt.log) - 12 BETWEEN 0 AND 300 AS wt_caught_a_prefix;
+wt_caught_a_prefix
+1
 SELECT COUNT(*) FROM src.log;
 COUNT(*)
 301
 SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
 COUNT(*)
 2
-SELECT * FROM wt.v ORDER BY id LIMIT 3;
-id	bal	n
-1	1100	2
-2	950	2
-3	1000	1
+SELECT id, bal - n AS bal_minus_n FROM wt.v ORDER BY id LIMIT 3;
+id	bal_minus_n
+1	1098
+2	948
+3	999
 # The binary log has one CREATE WORKTREE and no statements creating wt's
 # tables or objects one by one.
 CREATE WORKTREE events: 1, per-object CREATEs for wt: 0

@@ -12,6 +12,9 @@ if (!$overlay)
 }
 let $datadir = `SELECT @@datadir`;
 let WT_DD = $datadir;
+# Hand-started servers get the running one's settings (the combination's
+# options are on its command line, not in my.cnf).
+let $wt_opts = `SELECT CONCAT('--innodb-worktree-mode=', @@innodb_worktree_mode, ' --innodb-thread-concurrency=', @@innodb_thread_concurrency, ' --innodb-redo-log-capacity=', @@innodb_redo_log_capacity)`;
 let $error_log = $MYSQLTEST_VARDIR/log/mysqld.1.err;
 call mtr.add_suppression("Worktree freeze of .* aborted");
 call mtr.add_suppression("Database page corruption on disk or a failed file read");
@@ -139,7 +142,7 @@ perl;
 EOF
 let $c3_log = $MYSQLTEST_VARDIR/log/overlay_c3.err;
 --error 1,2
---exec $MYSQLD_CMD --log-error=$c3_log > /dev/null 2>&1
+--exec $MYSQLD_CMD $wt_opts --log-error=$c3_log > /dev/null 2>&1
 let SEARCH_FILE = $c3_log;
 --let SEARCH_PATTERN = Overlay page \[page id: space=[0-9]+, page number=[0-9]+\] of wtt/t lost
 --source include/search_pattern.inc

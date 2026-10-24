@@ -1266,20 +1266,42 @@ bool overlay_check_config() {
 /** Wait until purge has processed every transaction numbered below target,
 so that it never writes a source that is about to be linked live (addendum
 A2). @return true on timeout (error reported) */
-bool overlay_wait_purged(THD *thd, trx_id_t target) {
+/** Read-only schemas whose history purge has drained since they became
+read-only (in memory: a restart forgets them). */
+std::mutex wt_purged_mutex;
+std::set<dd::Object_id> wt_purged_schemas;
+
+bool wt_schema_purged(dd::Object_id schema_id) {
+  const std::lock_guard<std::mutex> guard(wt_purged_mutex);
+  return wt_purged_schemas.count(schema_id) != 0;
+}
+
+void wt_schema_purged_set(dd::Object_id schema_id, bool purged) {
+  const std::lock_guard<std::mutex> guard(wt_purged_mutex);
+  if (purged) {
+    wt_purged_schemas.insert(schema_id);
+  } else {
+    wt_purged_schemas.erase(schema_id);
+  }
+}
+
+bool overlay_wait_purged(THD *thd, trx_id_t target, bool report = true) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(thd_lock_wait_timeout(thd));
   for (;;) {
     if (trx_sys->rseg_history_len.load() == 0) return false;
-    trx_id_t done;
+    /* What purge has applied, as purge_sys->done records it in debug builds
+    (limit, or iter while limit is unset), read with no batch in flight:
+    stopping purge waits for the running one. */
+    trx_purge_stop();
     rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
-    /* limit: where the running batch started; every earlier batch has
-    completed (done exists in debug builds only). */
-    done = purge_sys->limit.trx_no;
+    const trx_id_t done = purge_sys->limit.trx_no != 0 ? purge_sys->limit.trx_no
+                                                       : purge_sys->iter.trx_no;
     rw_lock_s_unlock(&purge_sys->latch);
+    trx_purge_run();
     if (done >= target) return false;
     if (std::chrono::steady_clock::now() > deadline || thd_killed(thd)) {
-      my_error(ER_LOCK_WAIT_TIMEOUT, MYF(0));
+      if (report) my_error(ER_LOCK_WAIT_TIMEOUT, MYF(0));
       return true;
     }
     srv_purge_wakeup();
@@ -1530,14 +1552,15 @@ so both files carry the key encrypted under the same master key. */
     a.clone.overlay = overlay;
     a.clone.src_read_only = src_read_only;
   }
-  if (src_read_only) {
-    /* Once per statement: a read-only schema gets no new writes, so the
-    first table's target covers every table (a wait per table cost a purge
-    cycle each). */
+  /* A read-only schema gets no new writes: purge of its history is waited
+  for once, normally when it became read-only (innobase_worktree_read_only),
+  else here, once per statement. */
+  if (src_read_only && !wt_schema_purged(src_dd.schema_id())) {
     static thread_local std::pair<const THD *, query_id_t> waited{nullptr, 0};
     if (waited.first != thd || waited.second != thd->query_id) {
       if (overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no())) return true;
       waited = {thd, thd->query_id};
+      wt_schema_purged_set(src_dd.schema_id(), true);
     }
   }
 
@@ -1636,8 +1659,18 @@ so both files carry the key encrypted under the same master key. */
   return false;
 }
 
+void innobase_worktree_read_only(handlerton *, THD *thd,
+                                 dd::Object_id schema_id) {
+  if (!srv_wt_overlay) return;
+  /* (No error on timeout: the ALTER has committed; CREATE waits instead.) */
+  if (!overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no(), false))
+    wt_schema_purged_set(schema_id, true);
+}
+
 bool innobase_worktree_refresh(handlerton *, THD *thd, const dd::Table &table) {
   if (!srv_wt_overlay) return false;
+  /* Writable from now on: a later read-only period waits for purge again. */
+  wt_schema_purged_set(table.schema_id(), false);
   trx_t *trx = check_trx_exists(thd);
   std::vector<dict_table_t *> opened;
   std::vector<MDL_ticket *> mdls;

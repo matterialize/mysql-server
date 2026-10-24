@@ -13,6 +13,9 @@
 let $do_not_echo_parameters = 1;
 
 let $datadir = `SELECT @@datadir`;
+# Hand-started servers get the running one's settings (the combination's
+# options are on its command line, not in my.cnf).
+let $wt_opts = `SELECT CONCAT('--innodb-worktree-mode=', @@innodb_worktree_mode, ' --innodb-thread-concurrency=', @@innodb_thread_concurrency, ' --innodb-redo-log-capacity=', @@innodb_redo_log_capacity)`;
 let WT_DD = $datadir;
 SET SESSION cte_max_recursion_depth = 100000;
 
@@ -146,7 +149,7 @@ perl;
   sysseek($fh, 0, 0); syswrite($fh, "\0" x 16384); close($fh);
 EOF
 let E_LOG = $MYSQLTEST_VARDIR/log/encryption_page0.err;
---exec_in_background $MYSQLD_CMD --log-error=$E_LOG --log-error-verbosity=3
+--exec_in_background $MYSQLD_CMD $wt_opts --log-error=$E_LOG --log-error-verbosity=3
 let MYSQLD_SOCK = $MASTER_MYSOCK;
 perl;
   # Wait for startup to finish either way; stop the server if it came up.

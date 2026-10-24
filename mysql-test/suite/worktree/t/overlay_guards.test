@@ -13,14 +13,18 @@ if (!$overlay)
 }
 let $datadir = `SELECT @@datadir`;
 let WT_DD = $datadir;
+# Hand-started servers get the running one's settings (the combination's
+# options are on its command line, not in my.cnf).
+let $wt_opts = `SELECT CONCAT('--innodb-worktree-mode=', @@innodb_worktree_mode, ' --innodb-thread-concurrency=', @@innodb_thread_concurrency, ' --innodb-redo-log-capacity=', @@innodb_redo_log_capacity)`;
 let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
-let WT_MYSQLD = $MYSQLD_CMD;
+let WT_MYSQLD = $MYSQLD_CMD $wt_opts;
 let WT_TMP = $MYSQLTEST_VARDIR/tmp;
 call mtr.add_suppression("innodb_force_recovery is on");
 call mtr.add_suppression("in InnoDB read-only mode");
 call mtr.add_suppression("Failed to compress the gtid_executed table");
 call mtr.add_suppression("Skip re-populating collations");
 call mtr.add_suppression("Ignored the innodb-redo-log-capacity option in the Innodb read-only mode");
+call mtr.add_suppression("Skipped updating resource group metadata in InnoDB read only mode");
 
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;

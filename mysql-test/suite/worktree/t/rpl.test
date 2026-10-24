@@ -67,12 +67,15 @@ let $sql_wt = `SELECT REPLACE("$sql_src", 'src.', 'wt.')`;
 SET SESSION group_concat_max_len = 10000000;
 let $source_src = `$sql_src`;
 let $source_wt = `$sql_wt`;
-SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+--echo # How many burst updates the clone caught depends on timing; each one is
+--echo # +1 balance and one log row (trigger), so bal - log rows is fixed, and wt
+--echo # caught a prefix of them (src has all 300).
+SELECT COUNT(*), SUM(bal) - (SELECT COUNT(*) FROM wt.log) AS bal_minus_log, SUM(note = 'wt only') FROM wt.acct;
 SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
-SELECT COUNT(*) FROM wt.log;
+SELECT (SELECT COUNT(*) FROM wt.log) - 12 BETWEEN 0 AND 300 AS wt_caught_a_prefix;
 SELECT COUNT(*) FROM src.log;
 SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
-SELECT * FROM wt.v ORDER BY id LIMIT 3;
+SELECT id, bal - n AS bal_minus_n FROM wt.v ORDER BY id LIMIT 3;
 
 --echo # The binary log has one CREATE WORKTREE and no statements creating wt's
 --echo # tables or objects one by one.

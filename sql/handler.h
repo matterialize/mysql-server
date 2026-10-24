@@ -1835,6 +1835,11 @@ typedef bool (*clone_table_t)(handlerton *hton, THD *thd, const dd::Table &src,
 typedef bool (*worktree_table_op_t)(handlerton *hton, THD *thd,
                                     const dd::Table &table);
 
+/** A schema just became read-only (committed): no write can reach its
+tables any more. */
+typedef void (*worktree_schema_op_t)(handlerton *hton, THD *thd,
+                                     dd::Object_id schema_id);
+
 /**
   Delete SDI for a given SDI key.
   @param[in]  tablespace  tablespace object
@@ -3033,6 +3038,9 @@ struct handlerton {
   /** ALTER WORKTREE ... MATERIALIZE: make a table's files standalone; or
   nullptr. */
   worktree_table_op_t worktree_materialize;
+
+  /** ALTER SCHEMA ... READ ONLY = 1, after its commit; or nullptr. */
+  worktree_schema_op_t worktree_read_only;
 
   /** Clone data transfer interfaces */
   Clone_interface_t clone_interface;

@@ -5505,6 +5505,7 @@ static int innodb_init(void *p) {
   innobase_hton->post_ddl = innobase_post_ddl;
   innobase_hton->clone_table = innobase_clone_table;
   innobase_hton->worktree_refresh = innobase_worktree_refresh;
+  innobase_hton->worktree_read_only = innobase_worktree_read_only;
   innobase_hton->worktree_materialize = innobase_worktree_materialize;
 
   /* Initialize handler clone interfaces for. */

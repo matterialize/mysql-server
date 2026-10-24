@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <string>
+#include "sql/dd/object_id.h"
 
 class THD;
 
@@ -87,5 +88,8 @@ class Sql_cmd_materialize_worktree final : public Sql_cmd_ddl {
   @retval true failure, my_error() was called
 */
 bool worktree_tables_op(THD *thd, const char *db, bool refresh);
+
+/** Tell the engines that a schema became read-only (committed). */
+void worktree_schema_read_only(THD *thd, dd::Object_id schema_id);
 
 #endif /* SQL_WORKTREE_INCLUDED */
