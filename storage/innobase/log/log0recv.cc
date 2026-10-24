@@ -1707,8 +1707,12 @@ static const byte *recv_parse_or_apply_log_rec_body(
         /* For encrypted tablespace, we need to get the encryption key
         information before the page 0 is recovered. Otherwise, redo will not
         find the key to decrypt the data pages. */
+        /* A worktree first-dirty image of page 0 (overlay mode) is a whole
+        page string, not encryption info: parse it like any other string. */
         if (page_no == 0 && !applying_redo &&
             !fsp_is_system_or_temp_tablespace(space_id) &&
+            !(end_ptr >= ptr + 4 &&
+              mach_read_from_2(ptr + 2) != Encryption::INFO_SIZE) &&
             /* For cloned db header page has the encryption information. */
             !recv_sys->is_cloned_db) {
           ut_ad(LSN_MAX != start_lsn);

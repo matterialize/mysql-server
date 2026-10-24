@@ -1,0 +1,161 @@
+# Overlay crash safety (limits/overlay-v3.md §6.4, §7.2, §8, §11) beyond
+# worktree.crash: freeze abort and retry, kills inside flatten and refresh,
+# torn and zeroed writes (what a power loss may leave, addendum A7), and a
+# lost page that redo cannot rebuild being detected, not read stale.
+call mtr.add_suppression("Worktree freeze of .* aborted");
+call mtr.add_suppression("Database page corruption on disk or a failed file read");
+call mtr.add_suppression("Trying to recover it from the doublewrite file");
+call mtr.add_suppression("is corrupted.*Dumping|page dump");
+call mtr.add_suppression("Cannot open datafile for read-only: '.*wtt/t.ibd'");
+call mtr.add_suppression("Operating system error number 2 in a file operation");
+call mtr.add_suppression("The error means the system cannot find the path specified");
+call mtr.add_suppression("Tablespace [0-9]+, name 'wtt/t', file '.*' is missing");
+call mtr.add_suppression("innodb_force_recovery is on");
+call mtr.add_suppression("in InnoDB read-only mode");
+call mtr.add_suppression("Failed to compress the gtid_executed table");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+SELECT n, CONCAT('row', n) FROM s;
+#
+# 1. A freeze that sees the source change aborts cleanly and retries
+#    (v3 §7.1 F4f, O7): no fatal, no stray layer, and the clone is right.
+SET SESSION debug = '+d,wt_freeze_force_abort';
+CREATE WORKTREE wt FROM src;
+SET SESSION debug = '-d,wt_freeze_force_abort';
+Pattern "Worktree freeze of src/t aborted .* attempt 1" found
+SELECT COUNT(*), SUM(id) FROM wt.t;
+COUNT(*)	SUM(id)
+20000	200010000
+UPDATE wt.t SET v = 'wt' WHERE id <= 100;
+UPDATE src.t SET v = 'src' WHERE id BETWEEN 101 AND 200;
+#
+# 2. kill -9 inside flatten (v3 §8): the worktree is still an overlay with
+#    the same content, and MATERIALIZE then completes.
+SET SESSION debug = '+d,wt_crash_flatten_adopt';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+COUNT(*)	SUM(v = 'wt')	SUM(v = 'src')
+20000	100	0
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+SET SESSION debug = '+d,wt_crash_flatten_after_flush';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+COUNT(*)	SUM(v = 'wt')	SUM(v = 'src')
+20000	100	0
+ALTER WORKTREE wt MATERIALIZE;
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+COUNT(*)	SUM(v = 'wt')	SUM(v = 'src')
+20000	100	0
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+#
+# 3. kill -9 inside a refresh (addendum A2): the schema stays read-only,
+#    the table already frozen stays readable, and the refresh then
+#    completes; the worktree linked live is unaffected throughout.
+ALTER SCHEMA src READ ONLY = 1;
+CREATE WORKTREE wtl FROM src;
+SET SESSION debug = '+d,wt_crash_refresh_after_freeze';
+ALTER SCHEMA src READ ONLY = 0;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT SCHEMA_NAME, OPTIONS FROM INFORMATION_SCHEMA.SCHEMATA_EXTENSIONS WHERE SCHEMA_NAME = 'src';
+SCHEMA_NAME	OPTIONS
+src	READ ONLY=1
+SELECT COUNT(*), SUM(v = 'src') FROM src.t;
+COUNT(*)	SUM(v = 'src')
+20000	100
+ALTER SCHEMA src READ ONLY = 0;
+UPDATE src.t SET v = 'src2' WHERE id BETWEEN 201 AND 300;
+SELECT COUNT(*), SUM(v = 'src'), SUM(v = 'src2') FROM wtl.t;
+COUNT(*)	SUM(v = 'src')	SUM(v = 'src2')
+20000	100	0
+SELECT COUNT(*), SUM(v = 'src'), SUM(v = 'src2') FROM src.t;
+COUNT(*)	SUM(v = 'src')	SUM(v = 'src2')
+20000	100	100
+CHECK TABLE src.t, wtl.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+wtl.t	check	status	OK
+#
+# 4. Torn writes (v3 §6.4 "first flush torn"): every data-file write of
+#    the worktree lands torn (first 4 KB, then zeros), then the server
+#    dies. Each torn page is restored from its doublewrite copy.
+CREATE WORKTREE wtt FROM src;
+UPDATE wtt.t SET v = CONCAT('torn', id) WHERE id <= 5000;
+SET GLOBAL debug = '+d,wt_tear_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_tear_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# restart
+SELECT COUNT(*), SUM(v LIKE 'torn%') FROM wtt.t;
+COUNT(*)	SUM(v LIKE 'torn%')
+20000	5000
+SELECT COUNT(*) FROM wtt.t FORCE INDEX (v) WHERE v LIKE 'torn%';
+COUNT(*)
+5000
+CHECK TABLE wtt.t;
+Table	Op	Msg_type	Msg_text
+wtt.t	check	status	OK
+Pattern "Trying to recover it from the doublewrite file" found
+#
+# 5. Zeroed writes (v3 §6.4 "second flush torn to zeros"): a page that is
+#    all zeros locally would read from the layer; its doublewrite copy,
+#    newer than the freeze, is restored instead.
+UPDATE wtt.t SET v = CONCAT('zero', id) WHERE id <= 5000;
+SET GLOBAL debug = '+d,wt_zero_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_zero_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# restart
+SELECT COUNT(*), SUM(v LIKE 'zero%'), SUM(v LIKE 'torn%') FROM wtt.t;
+COUNT(*)	SUM(v LIKE 'zero%')	SUM(v LIKE 'torn%')
+20000	5000	0
+CHECK TABLE wtt.t;
+Table	Op	Msg_type	Msg_text
+wtt.t	check	status	OK
+#
+# 6. A page whose write was lost and whose doublewrite copy is gone too
+#    (v3 §6.3 case C3): its redo since the checkpoint no longer starts
+#    with its image, so recovery stops instead of reading the layer's
+#    stale version.
+UPDATE wtt.t SET v = CONCAT('lost', id) WHERE id <= 300;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+UPDATE wtt.t SET v = CONCAT('later', id) WHERE id <= 300;
+SET GLOBAL debug = '+d,wt_zero_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_zero_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# (the doublewrite files are lost as well)
+Pattern "Overlay page \[page id: space=[0-9]+, page number=[0-9]+\] of wtt/t lost" found
+# Remove the damaged worktree; the rest of the server recovers.
+# (recovery skips the missing files under force-recovery, which is
+# read-only; a clean shutdown then lets a normal start drop wtt)
+# restart: --innodb-force-recovery=1
+# restart
+DROP DATABASE wtt;
+SELECT COUNT(*), SUM(v = 'src2') FROM src.t;
+COUNT(*)	SUM(v = 'src2')
+20000	100
+SELECT COUNT(*), SUM(v = 'wt') FROM wt.t;
+COUNT(*)	SUM(v = 'wt')
+20000	100
+CHECK TABLE src.t, wt.t, wtl.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+wt.t	check	status	OK
+wtl.t	check	status	OK
+DROP DATABASE wtl;
+DROP DATABASE wt;
+DROP DATABASE src;

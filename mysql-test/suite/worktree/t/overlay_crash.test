@@ -1,0 +1,163 @@
+--echo # Overlay crash safety (limits/overlay-v3.md §6.4, §7.2, §8, §11) beyond
+--echo # worktree.crash: freeze abort and retry, kills inside flatten and refresh,
+--echo # torn and zeroed writes (what a power loss may leave, addendum A7), and a
+--echo # lost page that redo cannot rebuild being detected, not read stale.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+let $error_log = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+call mtr.add_suppression("Worktree freeze of .* aborted");
+call mtr.add_suppression("Database page corruption on disk or a failed file read");
+call mtr.add_suppression("Trying to recover it from the doublewrite file");
+call mtr.add_suppression("is corrupted.*Dumping|page dump");
+# Section 6 deletes the damaged worktree's file and starts once with
+# innodb_force_recovery.
+call mtr.add_suppression("Cannot open datafile for read-only: '.*wtt/t.ibd'");
+call mtr.add_suppression("Operating system error number 2 in a file operation");
+call mtr.add_suppression("The error means the system cannot find the path specified");
+call mtr.add_suppression("Tablespace [0-9]+, name 'wtt/t', file '.*' is missing");
+call mtr.add_suppression("innodb_force_recovery is on");
+call mtr.add_suppression("in InnoDB read-only mode");
+call mtr.add_suppression("Failed to compress the gtid_executed table");
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+  SELECT n, CONCAT('row', n) FROM s;
+
+--echo #
+--echo # 1. A freeze that sees the source change aborts cleanly and retries
+--echo #    (v3 §7.1 F4f, O7): no fatal, no stray layer, and the clone is right.
+SET SESSION debug = '+d,wt_freeze_force_abort';
+CREATE WORKTREE wt FROM src;
+SET SESSION debug = '-d,wt_freeze_force_abort';
+--let SEARCH_FILE = $error_log
+--let SEARCH_PATTERN = Worktree freeze of src/t aborted .* attempt 1
+--source include/search_pattern.inc
+SELECT COUNT(*), SUM(id) FROM wt.t;
+UPDATE wt.t SET v = 'wt' WHERE id <= 100;
+UPDATE src.t SET v = 'src' WHERE id BETWEEN 101 AND 200;
+
+--echo #
+--echo # 2. kill -9 inside flatten (v3 §8): the worktree is still an overlay with
+--echo #    the same content, and MATERIALIZE then completes.
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_flatten_adopt';
+--error CR_SERVER_LOST
+ALTER WORKTREE wt MATERIALIZE;
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+CHECK TABLE wt.t;
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_flatten_after_flush';
+--error CR_SERVER_LOST
+ALTER WORKTREE wt MATERIALIZE;
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+ALTER WORKTREE wt MATERIALIZE;
+SELECT COUNT(*), SUM(v = 'wt'), SUM(v = 'src') FROM wt.t;
+CHECK TABLE wt.t;
+
+--echo #
+--echo # 3. kill -9 inside a refresh (addendum A2): the schema stays read-only,
+--echo #    the table already frozen stays readable, and the refresh then
+--echo #    completes; the worktree linked live is unaffected throughout.
+ALTER SCHEMA src READ ONLY = 1;
+CREATE WORKTREE wtl FROM src;
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_refresh_after_freeze';
+--error CR_SERVER_LOST
+ALTER SCHEMA src READ ONLY = 0;
+--source include/start_mysqld.inc
+SELECT SCHEMA_NAME, OPTIONS FROM INFORMATION_SCHEMA.SCHEMATA_EXTENSIONS WHERE SCHEMA_NAME = 'src';
+SELECT COUNT(*), SUM(v = 'src') FROM src.t;
+ALTER SCHEMA src READ ONLY = 0;
+UPDATE src.t SET v = 'src2' WHERE id BETWEEN 201 AND 300;
+SELECT COUNT(*), SUM(v = 'src'), SUM(v = 'src2') FROM wtl.t;
+SELECT COUNT(*), SUM(v = 'src'), SUM(v = 'src2') FROM src.t;
+CHECK TABLE src.t, wtl.t;
+
+--echo #
+--echo # 4. Torn writes (v3 §6.4 "first flush torn"): every data-file write of
+--echo #    the worktree lands torn (first 4 KB, then zeros), then the server
+--echo #    dies. Each torn page is restored from its doublewrite copy.
+CREATE WORKTREE wtt FROM src;
+UPDATE wtt.t SET v = CONCAT('torn', id) WHERE id <= 5000;
+SET GLOBAL debug = '+d,wt_tear_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_tear_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v LIKE 'torn%') FROM wtt.t;
+SELECT COUNT(*) FROM wtt.t FORCE INDEX (v) WHERE v LIKE 'torn%';
+CHECK TABLE wtt.t;
+--let SEARCH_PATTERN = Trying to recover it from the doublewrite file
+--source include/search_pattern.inc
+
+--echo #
+--echo # 5. Zeroed writes (v3 §6.4 "second flush torn to zeros"): a page that is
+--echo #    all zeros locally would read from the layer; its doublewrite copy,
+--echo #    newer than the freeze, is restored instead.
+UPDATE wtt.t SET v = CONCAT('zero', id) WHERE id <= 5000;
+SET GLOBAL debug = '+d,wt_zero_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_zero_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v LIKE 'zero%'), SUM(v LIKE 'torn%') FROM wtt.t;
+CHECK TABLE wtt.t;
+
+--echo #
+--echo # 6. A page whose write was lost and whose doublewrite copy is gone too
+--echo #    (v3 §6.3 case C3): its redo since the checkpoint no longer starts
+--echo #    with its image, so recovery stops instead of reading the layer's
+--echo #    stale version.
+UPDATE wtt.t SET v = CONCAT('lost', id) WHERE id <= 300;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+UPDATE wtt.t SET v = CONCAT('later', id) WHERE id <= 300;
+SET GLOBAL debug = '+d,wt_zero_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_zero_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+--echo # (the doublewrite files are lost as well)
+perl;
+  opendir(my $d, $ENV{WT_DD}) or die;
+  for (grep { /\.dblwr$/ } readdir($d)) { my $f = "$ENV{WT_DD}/$_"; my $n = -s $f;
+    open(my $h, '+<:raw', $f) or die; syswrite($h, "\0" x $n); close($h); }
+EOF
+let $c3_log = $MYSQLTEST_VARDIR/log/overlay_c3.err;
+--error 1,2
+--exec $MYSQLD_CMD --log-error=$c3_log > /dev/null 2>&1
+let SEARCH_FILE = $c3_log;
+--let SEARCH_PATTERN = Overlay page \[page id: space=[0-9]+, page number=[0-9]+\] of wtt/t lost
+--source include/search_pattern.inc
+--remove_file $c3_log
+--echo # Remove the damaged worktree; the rest of the server recovers.
+--remove_files_wildcard $datadir/wtt *.ibd
+--echo # (recovery skips the missing files under force-recovery, which is
+--echo # read-only; a clean shutdown then lets a normal start drop wtt)
+--let $restart_parameters = restart: --innodb-force-recovery=1
+--source include/start_mysqld.inc
+--let $restart_parameters = restart
+--source include/restart_mysqld.inc
+--disable_warnings
+DROP DATABASE wtt;
+--enable_warnings
+SELECT COUNT(*), SUM(v = 'src2') FROM src.t;
+SELECT COUNT(*), SUM(v = 'wt') FROM wt.t;
+CHECK TABLE src.t, wt.t, wtl.t;
+
+DROP DATABASE wtl;
+DROP DATABASE wt;
+DROP DATABASE src;
