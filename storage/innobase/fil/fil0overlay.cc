@@ -28,6 +28,7 @@ Free Software Foundation.
 #include "srv0srv.h"
 
 bool srv_wt_overlay = false;
+std::atomic<bool> wt_images_margin{false};
 std::atomic<int> wt_overlay_spaces{0};
 #ifdef UNIV_DEBUG
 std::atomic<bool> wt_writes_injected{false};

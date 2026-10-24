@@ -1038,10 +1038,10 @@ sn_t log_concurrency_margin(lsn_t log_capacity, bool &is_safe) {
       LOG_CHECKPOINT_FREE_PER_THREAD * UNIV_PAGE_SIZE.
   @note The aforementioned checks of free space are handled by calls to
   log_free_check(). */
-  /* Overlay mode: each thread may also write up to WT_K_INT first-dirty
+  /* Overlays: each thread may also write up to WT_K_INT first-dirty
 page images between free checks (limits/overlay-v3.md §5.2 O5). */
   const auto margin_per_thread =
-      (LOG_CHECKPOINT_FREE_PER_THREAD + (srv_wt_overlay ? WT_K_INT : 0)) *
+      (LOG_CHECKPOINT_FREE_PER_THREAD + (wt_images_margin.load() ? WT_K_INT : 0)) *
       UNIV_PAGE_SIZE;
 
   /* We have guarantee to have at most max_threads concurrent threads.

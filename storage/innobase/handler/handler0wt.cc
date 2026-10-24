@@ -41,6 +41,7 @@ Free Software Foundation.
 #include "fil0overlay.h"
 #include "log0buf.h"
 #include "log0chkp.h"
+#include "log0files_governor.h"
 #include "trx0sys.h"
 #include "buf0dblwr.h"
 #include <sys/stat.h>
@@ -1399,6 +1400,7 @@ bool innobase_wt_select_mode() {
     }
   }
   srv_wt_overlay = overlay;
+  wt_images_margin.store(overlay && have_layers);
   /* innodb_worktree_mode shows the mode chosen (AUTO resolves at startup). */
   srv_wt_mode = overlay ? 2 : 1;
   ib::info() << "CREATE WORKTREE uses "
@@ -1412,6 +1414,10 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   DBUG_TRACE;
   if (srv_read_only_mode) return wt_error("CREATE WORKTREE in read-only mode");
   const bool overlay = srv_wt_overlay;
+  /* Widen the redo margin before the first overlay exists (as a SET of
+  innodb_thread_concurrency does), so the check below sees it. */
+  if (overlay && !wt_images_margin.exchange(true))
+    log_files_thread_concurrency_updated(*log_sys);
   if (overlay && overlay_check_config()) return true;
   const bool src_read_only = overlay && schema_read_only(thd, src_dd);
 

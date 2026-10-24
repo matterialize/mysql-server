@@ -71,6 +71,11 @@ extern std::atomic<bool> wt_gc_wanted;
 /** Overlay mode was enabled at startup (innodb_worktree_mode). */
 extern bool srv_wt_overlay;
 
+/** First-dirty images may be written (layers existed at startup, or a CREATE
+WORKTREE ran in overlay mode): the redo margin reserves room for them (v3 §5.2
+O5). Until then an overlay-mode server keeps stock's margin. */
+extern std::atomic<bool> wt_images_margin;
+
 /** innodb_worktree_mode: 0 AUTO, 1 REFLINK, 2 OVERLAY. */
 extern ulong srv_wt_mode;
 
