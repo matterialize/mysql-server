@@ -40,6 +40,10 @@ constexpr ulint WT_K_INT = 16;
 /** Pages imaged by the first-dirty hook, and images beyond WT_K_INT in one
 free-check interval (they draw on stock's extra margin). */
 extern std::atomic<uint64_t> wt_images;
+#ifdef UNIV_DEBUG
+/** A debug injector has torn, zeroed or dropped an overlay write. */
+extern std::atomic<bool> wt_writes_injected;
+#endif /* UNIV_DEBUG */
 extern std::atomic<uint64_t> wt_image_overdrafts;
 
 /** Images since this thread's last log_free_check(). */

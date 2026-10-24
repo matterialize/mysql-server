@@ -7920,6 +7920,7 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
     /* "Landed nothing": rewrite the bytes already there. */
     const bool drop = DBUG_EVALUATE_IF("wt_drop_overlay_writes", true, false);
     if (tear || zero || drop) {
+      wt_writes_injected.store(true);
       auto copy = static_cast<byte *>(ut::aligned_alloc(len, UNIV_SECTOR_SIZE));
       memset(copy, 0, len);
       if (tear) memcpy(copy, buf, std::min<ulint>(len, 4096));

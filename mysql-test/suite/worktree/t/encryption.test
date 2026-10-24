@@ -154,16 +154,23 @@ let MYSQLD_SOCK = $MASTER_MYSOCK;
 perl;
   # Wait for startup to finish either way; stop the server if it came up.
   my ($log, $up) = ($ENV{E_LOG}, 0);
-  for (1 .. 600) {
-    my $t = -e $log ? do { local (@ARGV, $/) = $log; <> } : '';
+  my $t = '';
+  for (1 .. 3000) {
+    $t = -e $log ? do { local (@ARGV, $/) = $log; <> } : '';
     if ($t =~ /ready for connections/) { $up = 1; last; }
     last if $t =~ /Aborting|Shutdown complete/;
     select(undef, undef, undef, 0.2);
   }
+  # Neither up nor gone after 10 minutes: stop it before touching its files.
+  if (!$up && $t !~ /Aborting|Shutdown complete/ && $t =~ /starting as process (\d+)/) { kill('KILL', $1); sleep(2); }
   system("$ENV{MYSQLADMIN} -uroot -S $ENV{MYSQLD_SOCK} shutdown >/dev/null 2>&1") if $up;
   # Until the process has exited: it holds the datadir's file locks until then.
-  for (1 .. 300) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /MySQL Server - end/;
+  for (1 .. 1500) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /MySQL Server - end/;
     select(undef, undef, undef, 0.2); }
+  # (and wait for the process itself: it holds the datadir's locks until it exits)
+  # (a zombie answers kill 0: look at its state)
+  if ($t =~ /starting as process (\d+)/) { my $pid = $1;
+    for (1 .. 600) { my $st = `ps -o stat= -p $pid 2>/dev/null`; last if $st !~ /^\s*[^Z\s]/; select(undef, undef, undef, 0.2); } }
   sleep(2);
   sub space_id { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384); return unpack('N', substr($p, 34, 4)); }
   print "source page 0 written into the worktree: ", (space_id($ENV{WT_IBD}) == space_id($ENV{SRC_IBD}) ? "YES" : "no"), "\n";

@@ -29,6 +29,9 @@ Free Software Foundation.
 
 bool srv_wt_overlay = false;
 std::atomic<int> wt_overlay_spaces{0};
+#ifdef UNIV_DEBUG
+std::atomic<bool> wt_writes_injected{false};
+#endif /* UNIV_DEBUG */
 std::atomic<int> wt_layer_names{0};
 ulong srv_wt_mode = 0;
 
@@ -290,8 +293,10 @@ uint8_t fil_wt_read_done(fil_space_t *space, const IORequest &req,
       ov->set(page_no, WT_PRESENT);
       return 0;
     }
-    /* v3 §11.18: a page written since attach never reads back as a hole. */
-    ut_ad(recv_recovery_is_on() || ov->get(page_no) != WT_PRESENT);
+    /* v3 §11.18: a page written since attach never reads back as a hole
+    (unless a debug injector has made writes land as zeros or not at all). */
+    ut_ad(recv_recovery_is_on() || ov->get(page_no) != WT_PRESENT ||
+          wt_writes_injected.load());
     ov->set(page_no, WT_ABSENT);
   } else if (!is_zero(buf, len)) {
     return src;
