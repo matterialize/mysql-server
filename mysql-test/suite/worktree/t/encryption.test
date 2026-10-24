@@ -9,6 +9,8 @@
 --source include/have_innodb_16k.inc
 --source include/have_component_keyring_file.inc
 --source suite/component_keyring_file/inc/setup_component.inc
+# Restarts keep the keyring's --plugin-dir; do not echo the host path.
+let $do_not_echo_parameters = 1;
 
 let $datadir = `SELECT @@datadir`;
 let WT_DD = $datadir;
@@ -177,4 +179,5 @@ DROP DATABASE wt;
 DROP DATABASE src;
 --remove_file $MYSQLTEST_VARDIR/tmp/info_e
 --remove_file $MYSQLTEST_VARDIR/tmp/info_ez
+let $do_not_echo_parameters = 0;
 --source suite/component_keyring_file/inc/teardown_component.inc

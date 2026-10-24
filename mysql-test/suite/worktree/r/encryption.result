@@ -75,7 +75,7 @@ ez: encryption info present: yes, tablespace key same as source: yes
 plaintext in wt/e.ibd: no
 worktree write in clear in wt/e.ibd: no
 plaintext in wt/ez.ibd: no
-# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+# restart
 SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM src.e;
 COUNT(*)	SUM(v LIKE 'src-%')	SUM(v = 'worktree-secret-xyz')
 5000	10	0
@@ -93,7 +93,7 @@ ALTER INSTANCE ROTATE INNODB MASTER KEY;
 SET GLOBAL innodb_fast_shutdown = 0;
 e: master key id src == wt: yes, rotated: yes
 ez: master key id src == wt: yes, rotated: yes
-# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+# restart
 SET SESSION cte_max_recursion_depth = 100000;
 CHECK TABLE src.e, src.ez, wt.e, wt.ez;
 Table	Op	Msg_type	Msg_text
@@ -111,7 +111,7 @@ INSERT INTO wt.e VALUES (100001, 'after-rotation', 2);
 INSERT INTO src.e VALUES (100001, 'src-after-rotation', 2);
 # A worktree of the worktree, after the rotation.
 CREATE WORKTREE wt2 FROM wt;
-# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+# restart
 SELECT NAME, ENCRYPTION FROM information_schema.INNODB_TABLESPACES WHERE NAME LIKE 'wt2/%' ORDER BY NAME;
 NAME	ENCRYPTION
 wt2/e	Y
@@ -152,7 +152,7 @@ SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wt.e SET v = 'enc-after-checkpoint' WHERE id = 5;
 # Kill the server
 source page 0 written into the worktree: no
-# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+# restart
 SELECT v FROM wt.e WHERE id = 5;
 v
 enc-after-checkpoint
