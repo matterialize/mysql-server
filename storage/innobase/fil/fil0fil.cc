@@ -841,6 +841,10 @@ class Fil_shard {
     space_remove_from_lookup_maps(space->id);
 
     m_deleted_spaces.push_back({space->id, space});
+    /* A dropped space's pages are never read or flushed through its overlay
+    again: release the layer now, not when the buffer pool lets go of it. */
+    if (space->wt_ov != nullptr || space->wt_linked) wt_gc_wanted.store(true);
+    fil_wt_overlay_free(space);
 
     space_detach(space);
     ut_a(space->files.size() == 1);
@@ -4629,6 +4633,9 @@ dberr_t Fil_shard::space_delete(space_id_t space_id, buf_remove_t buf_remove) {
     }
 
     m_deleted_spaces.push_back({space->id, space});
+    /* As in space_prepare_for_delete(). */
+    if (space->wt_ov != nullptr || space->wt_linked) wt_gc_wanted.store(true);
+    fil_wt_overlay_free(space);
 #endif /* !UNIV_HOTBACKUP */
 
     space_detach(space);
@@ -7905,10 +7912,14 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
       page_id.page_no() >= 2) {
     const bool tear = DBUG_EVALUATE_IF("wt_tear_overlay_writes", true, false);
     const bool zero = DBUG_EVALUATE_IF("wt_zero_overlay_writes", true, false);
-    if (tear || zero) {
+    /* "Landed nothing": rewrite the bytes already there. */
+    const bool drop = DBUG_EVALUATE_IF("wt_drop_overlay_writes", true, false);
+    if (tear || zero || drop) {
       auto copy = static_cast<byte *>(ut::aligned_alloc(len, UNIV_SECTOR_SIZE));
       memset(copy, 0, len);
       if (tear) memcpy(copy, buf, std::min<ulint>(len, 4096));
+      if (drop && pread(file->handle.m_file, copy, len, offset) < 0)
+        memset(copy, 0, len);
       buf = copy; /* leaked on purpose: debug only, the write is async */
     }
   }

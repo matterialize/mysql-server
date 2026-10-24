@@ -389,6 +389,20 @@ bool overlay_reusable(fil_space_t *space) {
 /** Freeze a writable source (v3 §7.1 F0-F6, addendum A3): its current file
 becomes the immutable layer U, and the source continues, under the same space
 id, as an overlay over U. On success c->link is what a worktree of it links. */
+#ifdef UNIV_DEBUG
+/** Dirty page n of a space with a logged no-op write (fault injection). */
+static void wt_debug_dirty(fil_space_t *space, page_no_t n) {
+  const page_size_t page_size(space->flags);
+  mtr_t mtr;
+  mtr.start();
+  buf_block_t *b = buf_page_get(page_id_t(space->id, n), page_size, RW_X_LATCH,
+                                UT_LOCATION_HERE, &mtr);
+  byte *field = b->frame + FIL_PAGE_TYPE;
+  mlog_write_ulint(field, mach_read_from_2(field), MLOG_2BYTES, &mtr);
+  mtr.commit();
+}
+#endif /* UNIV_DEBUG */
+
 bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
   const space_id_t s = c->src->space;
   fil_space_t *space = fil_space_acquire(s);
@@ -409,6 +423,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
       return wt_error(
           "CREATE WORKTREE in overlay mode while recovered transactions are "
           "being rolled back");
+    ib::info() << "Worktree freeze of " << space->name << " begins";
     space->wt_freezing.store(true);
     auto unfreeze = create_scope_guard([space]() {
       space->wt_freezing.store(false);
@@ -421,6 +436,23 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     page_no_t size1;
     fil_wt_counters(s, &mc1, &size1);
     const lsn_t F = log_get_lsn(*log_sys);
+    DBUG_EXECUTE_IF("wt_crash_freeze_after_flush", DBUG_SUICIDE(););
+    DEBUG_SYNC(thd, "wt_freeze_after_flush");
+#ifdef UNIV_DEBUG
+    /* v3 §11.22: what background work may do to the source between F1 and
+    F4 (CREATE WORKTREE's MDL keeps SQL writes out). First attempt only. */
+    if (attempt == 1) {
+      DBUG_EXECUTE_IF("wt_freeze_inject_dirty", wt_debug_dirty(space, 0););
+      DBUG_EXECUTE_IF("wt_freeze_inject_write", {
+        wt_debug_dirty(space, 0);
+        buf_LRU_flush_or_remove_pages(s, BUF_REMOVE_FLUSH_WRITE, trx);
+      });
+      DBUG_EXECUTE_IF("wt_freeze_inject_extend",
+                      (void)fil_space_extend(space, size1 + 64););
+      DBUG_EXECUTE_IF("wt_freeze_inject_commit_ref",
+                      space->wt_commit_refs.fetch_add(1););
+    }
+#endif /* UNIV_DEBUG */
 
     /* F2 */
     const std::string uuid = wt_new_uuid();
@@ -506,6 +538,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
                  << "), attempt " << attempt;
       fil_wt_gate_open(s);
       mtr.commit();
+      DBUG_EXECUTE_IF("wt_crash_freeze_in_abort", DBUG_SUICIDE(););
       unlink(layer.c_str());
       wt_layer_names.fetch_sub(1);
       (void)sync_dir(WT_LAYER_DIR);
@@ -522,6 +555,9 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
       if (std::chrono::steady_clock::now() > deadline) clean = false;
       std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
+    DBUG_EXECUTE_IF("wt_freeze_inject_commit_ref", {
+      if (attempt == 1) space->wt_commit_refs.fetch_sub(1);
+    });
     DBUG_EXECUTE_IF("wt_freeze_force_abort", {
       static int forced = 0;
       if (forced++ == 0) clean = false;
@@ -541,6 +577,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
       if (attempt < 3) continue;
       return wt_error("CREATE WORKTREE: the source stayed busy during its freeze");
     }
+    DBUG_EXECUTE_IF("wt_crash_freeze_in_gate", DBUG_SUICIDE(););
     /* (g) the commit point */
     if (rename(tmp.c_str(), c->src_path.c_str()) != 0) {
       abort("rename failed");
@@ -556,6 +593,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
       ib::fatal(UT_LOCATION_HERE)
           << "Cannot reopen " << c->src_path << " after its freeze";
     fil_wt_set(space, map);
+    DEBUG_SYNC(thd, "wt_freeze_after_reopen");
     /* A read-only source linked live is now a new inode: no longer a layer. */
     space->wt_linked = false;
     for (auto [block, page] : {std::pair{b0, page0}, std::pair{b1, page1}}) {
@@ -565,10 +603,13 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     if (chmod(layer.c_str(), 0444) != 0)
       ib::warn() << "chmod 0444 " << layer << ": " << strerror(errno);
 
-    /* F6 */
+    /* F6 (the gate opens while still freezing: a page dirtied meanwhile is
+    imaged, which is merely conservative) */
+    fil_wt_gate_open(s);
+    /* v3 §6.4 row 11: a page dirtied after the F4 check, before F6. */
+    DBUG_EXECUTE_IF("wt_freeze_inject_dirty_late", wt_debug_dirty(space, 3););
     unfreeze.reset();
     space->wt_freezing.store(false);
-    fil_wt_gate_open(s);
     mtr.commit();
     layer_lock.unlock();
     DBUG_EXECUTE_IF("wt_crash_freeze_after_open", DBUG_SUICIDE(););
@@ -589,6 +630,7 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
   if (wt_op_acquire(thd, space, 2)) return true;
   auto slot = create_scope_guard([space]() { wt_op_release(space); });
   ib::info() << "Worktree flatten of " << space->name << " begins";
+  DBUG_EXECUTE_IF("wt_crash_flatten_begin", DBUG_SUICIDE(););
   const page_size_t page_size(space->flags);
   const std::string gen_uuid = space->wt_ov->link.uuid;
   const uint64_t gen = space->wt_gen;
@@ -627,6 +669,9 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
     if (space->wt_ov->get(n) != WT_PRESENT)
       return wt_error("CREATE WORKTREE: flatten lost a page; retry");
   }
+  DBUG_EXECUTE_IF("wt_crash_flatten_after_check", DBUG_SUICIDE(););
+  DEBUG_SYNC(thd, "wt_flatten_after_check");
+  DBUG_EXECUTE_IF("wt_flatten_bump_gen", ++space->wt_gen;);
   /* Step 4: generation check, then clear the link and the map (logged). */
   {
     mtr_t mtr;
@@ -650,9 +695,11 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
                      MLOG_4BYTES, &mtr);
     mtr.commit();
   }
+  DBUG_EXECUTE_IF("wt_crash_flatten_after_clear", DBUG_SUICIDE(););
   /* Step 5: durable, then the space stands alone. */
   buf_LRU_flush_or_remove_pages(s, BUF_REMOVE_FLUSH_WRITE, trx);
   fil_flush(s);
+  DBUG_EXECUTE_IF("wt_crash_flatten_after_final_flush", DBUG_SUICIDE(););
   fil_wt_detach(s);
   ib::info() << "Worktree flatten of " << space->name << " done";
   return false;
@@ -1518,6 +1565,7 @@ bool innobase_worktree_refresh(handlerton *, THD *thd, const dd::Table &table) {
     ib::info() << "Worktree refresh of " << slot_space->name << " begins";
     const bool failed = overlay_freeze(thd, trx, &c, true);
     DBUG_EXECUTE_IF("wt_crash_refresh_after_freeze", DBUG_SUICIDE(););
+    if (!failed) ib::info() << "Worktree refresh of " << slot_space->name << " done";
     wt_op_release(slot_space);
     fil_space_release(slot_space);
     if (failed) return true;

@@ -33,6 +33,9 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "mtr0mtr.h"
 
+#include <chrono>
+#include <thread>
+
 #include "buf0flu.h"
 #include "fil0overlay.h"
 #include "fsp0fsp.h"
@@ -801,6 +804,15 @@ void mtr_t::commit() {
       Wt_image_hook hook{this, &m_impl.m_wt_spaces, {}};
       Iterate<Wt_image_hook> iterator(hook);
       m_impl.m_memo.for_each_block_in_reverse(iterator);
+      /* v3 §6.4 row 1: an image built, its redo not yet written. */
+      DBUG_EXECUTE_IF("wt_crash_image_before_log", {
+        if (!hook.m_imaged.empty()) DBUG_SUICIDE();
+      });
+      /* v3 §11.22: an mtr between the hook and log_buffer_reserve. */
+      DBUG_EXECUTE_IF("wt_mtr_hold_after_hook", {
+        if (!m_impl.m_wt_spaces.empty())
+          std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+      });
     }
 #endif /* !UNIV_HOTBACKUP */
 

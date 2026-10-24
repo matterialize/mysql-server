@@ -1172,6 +1172,10 @@ struct export_var_t {
   ulint innodb_pages_read;             /*!< buf_pool->stat.n_pages_read */
   ulint innodb_pages_written;          /*!< buf_pool->stat.n_pages_written */
   bool innodb_redo_log_enabled;        /*!< srv_redo_log */
+  ulint innodb_worktree_images;           /*!< wt_images */
+  ulint innodb_worktree_image_overdrafts; /*!< wt_image_overdrafts */
+  ulint innodb_worktree_overlays;         /*!< wt_overlay_spaces */
+  ulint innodb_worktree_layers;           /*!< wt_layer_names */
   ulint innodb_row_lock_waits;         /*!< srv_n_lock_wait_count */
   ulint innodb_row_lock_current_waits; /*!< srv_n_lock_wait_current_count */
   int64_t innodb_row_lock_time;        /*!< srv_n_lock_wait_time

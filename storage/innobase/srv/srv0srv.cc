@@ -96,6 +96,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "trx0purge.h"
 #include "usr0sess.h"
 #include "ut0crc32.h"
+#include "fil0overlay.h"
 #endif /* !UNIV_HOTBACKUP */
 #include "ut0mem.h"
 
@@ -1659,6 +1660,14 @@ void srv_export_innodb_status(void) {
   export_vars.innodb_pages_written = stat.n_pages_written;
 
   export_vars.innodb_redo_log_enabled = srv_redo_log;
+
+  export_vars.innodb_worktree_images = wt_images.load();
+
+  export_vars.innodb_worktree_image_overdrafts = wt_image_overdrafts.load();
+
+  export_vars.innodb_worktree_overlays = wt_overlay_spaces.load();
+
+  export_vars.innodb_worktree_layers = wt_layer_names.load();
 
   export_vars.innodb_row_lock_waits = srv_stats.n_lock_wait_count;
 

@@ -164,6 +164,8 @@ Table	Op	Msg_type	Msg_text
 wt.e	check	status	OK
 src.e	check	status	OK
 # Control: stock FOR EXPORT does write them, and the listing shows them.
+# (In overlay mode src was frozen; MATERIALIZE makes it stock-format.)
+ALTER WORKTREE src MATERIALIZE;
 FLUSH TABLES src.e FOR EXPORT;
 e.cfg
 e.cfp

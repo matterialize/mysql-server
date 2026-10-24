@@ -21,7 +21,9 @@ Free Software Foundation.
 #include <random>
 
 #include "fil0wt.h"
+#include "my_dbug.h"
 #include "fsp0fsp.h"
+#include "log0recv.h"
 #include "mach0data.h"
 #include "srv0srv.h"
 
@@ -204,6 +206,9 @@ bool fil_wt_overlay_attach(fil_space_t *space, const wt_link_t &link,
     if (p < ov->presence.size()) ov->presence[p] = WT_PRESENT;
   }
   /* Only durable bytes may later read as "local, non-zero" (v3 §6.1 step 2). */
+  DBUG_EXECUTE_IF("wt_crash_attach_before_fsync", {
+    if (recv_recovery_is_on()) DBUG_SUICIDE();
+  });
   (void)fsync(raw);
   space->wt_ov = ov;
   wt_overlay_spaces.fetch_add(1);
