@@ -140,7 +140,7 @@ DROP DATABASE junk;
 CREATE WORKTREE wt2 FROM wt;
 SET DEBUG_SYNC = 'now SIGNAL go';
 SET DEBUG_SYNC = 'RESET';
-wt overlay bit 1; wt2 overlay bit 1, chain depth 1; wt3 chain depth 7; unreferenced layers 0
+wt overlay bit 1; wt2 overlay bit 1, chain depth 1; wt3 linked, within the cap: yes; unreferenced layers 0
 # restart
 SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt2.t;
 COUNT(*)	SUM(v = 'gen')	SUM(LENGTH(b))

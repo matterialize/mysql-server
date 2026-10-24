@@ -282,6 +282,8 @@ uint8_t fil_wt_read_done(fil_space_t *space, const IORequest &req,
       ov->set(page_no, WT_PRESENT);
       return 0;
     }
+    /* v3 §11.18: a page written since attach never reads back as a hole. */
+    ut_ad(recv_recovery_is_on() || ov->get(page_no) != WT_PRESENT);
     ov->set(page_no, WT_ABSENT);
   } else if (!is_zero(buf, len)) {
     return src;
@@ -306,6 +308,9 @@ uint8_t fil_wt_read_done(fil_space_t *space, const IORequest &req,
 }
 
 void fil_wt_note_write(fil_space_t *space, page_no_t page_no) {
+  /* v3 §11.18 (O1/I2): a page is imaged or initialised before it is written. */
+  ut_ad(page_no < 2 || recv_recovery_is_on() ||
+        space->wt_ov->get(page_no) == WT_PRESENT);
   if (page_no != 0) space->wt_ov->set(page_no, WT_PRESENT);
 }
 

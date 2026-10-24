@@ -1,0 +1,136 @@
+--echo # Overlay configuration guards (limits/overlay-v3.md §5.4, §11.12, §11.19,
+--echo # §11.23) beyond worktree.overlay: unsafe redo margins at runtime, the
+--echo # table and statement refusals, every startup refusal while overlays
+--echo # exist, read-only and force-recovery starts (overlays readable; no
+--echo # freeze, flatten or GC), and 64 KB pages.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
+let WT_MYSQLD = $MYSQLD_CMD;
+let WT_TMP = $MYSQLTEST_VARDIR/tmp;
+call mtr.add_suppression("innodb_force_recovery is on");
+call mtr.add_suppression("in InnoDB read-only mode");
+call mtr.add_suppression("Failed to compress the gtid_executed table");
+call mtr.add_suppression("Skip re-populating collations");
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+  SELECT n, CONCAT('row', n) FROM s;
+CREATE WORKTREE wt FROM src;
+
+--echo #
+--echo # 1. Runtime: a thread concurrency or a redo capacity whose redo margin
+--echo #    is unsafe is refused (O4/O5); safe changes are not.
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_thread_concurrency = 1000;
+SET GLOBAL innodb_thread_concurrency = 4;
+SET GLOBAL innodb_thread_concurrency = 8;
+SET GLOBAL innodb_thread_concurrency = 200;
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_redo_log_capacity = 8388608;
+SET GLOBAL innodb_thread_concurrency = 8;
+SELECT @@innodb_thread_concurrency, @@innodb_redo_log_capacity;
+
+--echo #
+--echo # 2. Refused sources and statements (v3 §5.3, §11.23): a table with a
+--echo #    DATA DIRECTORY, and CLONE while overlays exist.
+CREATE DATABASE src2;
+--replace_result $MYSQL_TMP_DIR MYSQL_TMP_DIR
+eval CREATE TABLE src2.d (id INT PRIMARY KEY) DATA DIRECTORY = '$MYSQL_TMP_DIR/wt_dd';
+--error ER_NOT_SUPPORTED_YET
+CREATE WORKTREE wd FROM src2;
+DROP DATABASE src2;
+--replace_result $CLONE_PLUGIN CLONE_PLUGIN
+eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN';
+--replace_result $MYSQL_TMP_DIR MYSQL_TMP_DIR
+--error ER_NOT_SUPPORTED_YET
+eval CLONE LOCAL DATA DIRECTORY = '$MYSQL_TMP_DIR/wt_clone';
+UNINSTALL PLUGIN clone;
+
+--echo #
+--echo # 3. Startup while overlays exist (§5.4, §11.12): each unsafe setting
+--echo #    is refused before InnoDB opens a file; REFLINK mode too.
+--source include/shutdown_mysqld.inc
+perl;
+  require $ENV{WT_PL};
+  my $log = "$ENV{WT_TMP}/guard.err";
+  for my $opt ("--innodb-flush-method=nosync", "--innodb-flush-method=littlesync",
+               "--innodb-flush-method=O_DIRECT_NO_FSYNC", "--innodb-doublewrite=OFF",
+               "--innodb-doublewrite=DETECT_ONLY", "--innodb-checksum-algorithm=none",
+               "--innodb-checksum-algorithm=strict_none", "--innodb-thread-concurrency=0",
+               "--innodb-worktree-mode=REFLINK") {
+    unlink($log);
+    my $failed = system("$ENV{WT_MYSQLD} --log-error=$log $opt > /dev/null 2>&1") != 0;
+    my $said = count_in_log($log, qr/has worktree (overlays and the server is configured with|layers)/);
+    printf("%-42s refused %s, says why %s\n", $opt, $failed ? "yes" : "NO", $said ? "yes" : "no");
+  }
+  unlink($log);
+EOF
+--echo # A safe non-default setting starts.
+--let $restart_parameters = restart: --innodb-doublewrite=DETECT_AND_RECOVER
+--source include/start_mysqld.inc
+SELECT @@innodb_doublewrite;
+SELECT COUNT(*) FROM wt.t;
+
+--echo #
+--echo # 4. Read-only and force-recovery starts: overlays are readable, and
+--echo #    nothing is frozen, flattened or garbage-collected (a stray layer
+--echo #    survives until a normal start).
+perl;
+  require $ENV{WT_PL}; my ($l) = layer_files();
+  open(my $i, '<:raw', "$ENV{WT_DD}/#wtlayers/$l") or die; local $/; my $d = <$i>;
+  open(my $o, '>:raw', "$ENV{WT_DD}/#wtlayers/ffffffffffffffffffffffffffffffff.ibl") or die; print $o $d;
+EOF
+--let $restart_parameters = restart: --innodb-read-only
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(id) FROM wt.t;
+--error ER_READ_ONLY_MODE,ER_INNODB_READ_ONLY,ER_NOT_SUPPORTED_YET
+CREATE WORKTREE wr FROM src;
+--let $restart_parameters = restart: --innodb-force-recovery=1
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(id) FROM wt.t;
+--error ER_READ_ONLY_MODE,ER_INNODB_READ_ONLY,ER_NOT_SUPPORTED_YET,ER_INNODB_FORCED_RECOVERY
+CREATE WORKTREE wr FROM src;
+--error ER_READ_ONLY_MODE,ER_INNODB_READ_ONLY,ER_NOT_SUPPORTED_YET,ER_INNODB_FORCED_RECOVERY
+ALTER WORKTREE wt MATERIALIZE;
+perl;
+  printf("stray layer after read-only and force-recovery starts: %s\n",
+         -e "$ENV{WT_DD}/#wtlayers/ffffffffffffffffffffffffffffffff.ibl" ? "kept" : "REMOVED");
+EOF
+--let $restart_parameters = restart
+--source include/restart_mysqld.inc
+perl;
+  printf("stray layer after a normal start: %s\n",
+         -e "$ENV{WT_DD}/#wtlayers/ffffffffffffffffffffffffffffffff.ibl" ? "KEPT" : "removed");
+EOF
+
+--echo #
+--echo # 5. 64 KB pages (§5.4): CREATE WORKTREE in overlay mode is refused.
+let $dd64 = $MYSQL_TMP_DIR/wt_64k;
+--exec $MYSQLD --no-defaults --initialize-insecure --innodb-page-size=64k --datadir=$dd64 --secure-file-priv="" > $MYSQLTEST_VARDIR/tmp/init64.log 2>&1
+--let $restart_parameters = restart: --datadir=$dd64 --innodb-page-size=64k
+--replace_result $dd64 DD64
+--source include/restart_mysqld.inc
+SELECT @@innodb_page_size;
+CREATE DATABASE a;
+CREATE TABLE a.t (id INT PRIMARY KEY);
+--error ER_NOT_SUPPORTED_YET
+CREATE WORKTREE b FROM a;
+--let $restart_parameters = restart
+--source include/restart_mysqld.inc
+--force-rmdir $dd64
+--remove_file $MYSQLTEST_VARDIR/tmp/init64.log
+
+DROP DATABASE wt;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';

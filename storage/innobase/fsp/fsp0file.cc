@@ -955,6 +955,33 @@ dberr_t Datafile::restore_from_doublewrite(page_no_t restore_page_no) {
 
   ut_a(page_get_page_no(page) == restore_page_no);
 
+  /* An overlay's page 0 comes back only as a copy written after its freeze
+  (v3 §6.2): one with bit 15 and the link its page-1 witness carries. A
+  pre-freeze copy would detach the file from its layer. */
+  if (restore_page_no == 0 && !FSP_FLAGS_GET_ENCRYPTION(flags)) {
+    auto p1 = static_cast<byte *>(
+        ut::aligned_alloc(page_size.physical(), page_size.physical()));
+    IORequest read(IORequest::READ);
+    read.disable_compression();
+    wt_link_t want, got;
+    const bool witness =
+        os_file_read_no_error_handling(read, m_filepath, m_handle, p1,
+                                       page_size.physical(),
+                                       page_size.physical(), nullptr) ==
+            DB_SUCCESS &&
+        wt_link_peek(p1, page_size, 1, &want);
+    ut::aligned_free(p1);
+    if (witness && (!(flags & FSP_FLAGS_MASK_WT_OVERLAY) ||
+                    !wt_link_peek(page, page_size, 0, &got) ||
+                    strcmp(got.uuid, want.uuid) != 0)) {
+      ib::fatal(UT_LOCATION_HERE)
+          << "Page 0 of worktree overlay '" << m_filepath
+          << "' is corrupt and the doublewrite buffer has only a copy from "
+             "before its freeze (layer "
+          << want.uuid << "); refusing to restore it";
+    }
+  }
+
   ib::info(ER_IB_MSG_413) << "Restoring page "
                           << page_id_t(m_space_id, restore_page_no)
                           << " of datafile '" << m_filepath

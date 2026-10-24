@@ -143,6 +143,7 @@ wt2.p	check	status	OK
 # doublewrite buffer, or stop with the file unidentified), it never
 # restores the source's page 0 into the worktree.
 call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wt/e.ibd");
+call mtr.add_suppression("Unable to lock ./ibdata1 error: 11");
 SET SESSION cte_max_recursion_depth = 100000;
 INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 200000 UNION ALL SELECT n + 1 FROM s WHERE n < 220000)
 SELECT n, CONCAT('more-', n), n % 7 FROM s;

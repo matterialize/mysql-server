@@ -1,0 +1,127 @@
+--echo # Overlay concurrency (limits/overlay-v3.md §11.18 O3, §11.20 O5): reads
+--echo # of a source in flight across its freeze, with the freeze gate's windows
+--echo # widened by debug sleeps (between complete_io and page completion, after
+--echo # space_flush lets go, inside space_extend); and 64 threads first-dirtying
+--echo # an overlay's pages under forced checkpoints with no image overdraft.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(40), pad CHAR(200), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 40000)
+  SELECT n, 'row', REPEAT('p', 200) FROM s;
+CREATE WORKTREE w0 FROM src;
+
+--echo #
+--echo # 1. O3: twelve freezes, each of a worktree whose pages are being read in
+--echo #    (a full scan with read-ahead) from its layer at the same time.
+SET GLOBAL innodb_random_read_ahead = ON;
+SET GLOBAL innodb_read_ahead_threshold = 0;
+SET GLOBAL debug = '+d,wt_slow_io_complete,wt_slow_space_flush,wt_slow_extend';
+connect (con1, localhost, root,,);
+connection default;
+--disable_query_log
+let $i = 1;
+while ($i <= 12)
+{
+  let $p = `SELECT $i - 1`;
+  eval UPDATE w$p.t SET v = 'r' WHERE id = $i;
+  connection con1;
+  send_eval SELECT COUNT(*), SUM(LENGTH(pad)) FROM w$p.t FORCE INDEX (PRIMARY);
+  connection default;
+  eval CREATE WORKTREE w$i FROM w$p;
+  connection con1;
+  reap;
+  connection default;
+  inc $i;
+}
+--enable_query_log
+disconnect con1;
+SET GLOBAL debug = '-d,wt_slow_io_complete,wt_slow_space_flush,wt_slow_extend';
+SET GLOBAL innodb_random_read_ahead = DEFAULT;
+SET GLOBAL innodb_read_ahead_threshold = DEFAULT;
+SELECT COUNT(*), SUM(v = 'r') FROM w12.t;
+SELECT COUNT(*), SUM(v = 'r') FROM w6.t;
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(v = 'r') FROM w12.t;
+CHECK TABLE w0.t, w6.t, w11.t, w12.t;
+
+--echo #
+--echo # 2. O5: 64 threads first-dirty and split pages of a fresh overlay while
+--echo #    another session forces checkpoints; no hang, no image overdraft.
+SET GLOBAL innodb_thread_concurrency = 64;
+CREATE WORKTREE big FROM src;
+DELIMITER |;
+CREATE PROCEDURE src.spam()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 300 DO
+    SET GLOBAL innodb_log_checkpoint_now = ON;
+    DO SLEEP(0.01);
+    SET i = i + 1;
+  END WHILE;
+END|
+CREATE PROCEDURE src.work(n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < n DO
+    UPDATE big.t SET v = 'slap' WHERE id = 1 + FLOOR(RAND() * 40000);
+    INSERT IGNORE INTO big.t VALUES (40000 + FLOOR(RAND() * 2000000), 'ins', REPEAT('i', 200));
+    SET i = i + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+let $over0 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_image_overdrafts', Value, 1);
+let $img0 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_images', Value, 1);
+connect (con2, localhost, root,,);
+send CALL src.spam();
+connection default;
+--echo # 64 clients at once, 200 updates and 200 inserts each
+perl;
+  my @pids;
+  for (1 .. 64) {
+    my $pid = fork() // die "fork: $!";
+    if ($pid == 0) { exec("$ENV{MYSQL} -e 'CALL src.work(200)'") or die; }
+    push(@pids, $pid);
+  }
+  my $failed = 0;
+  for (@pids) { waitpid($_, 0); $failed++ if $? != 0; }
+  print "clients that failed: $failed\n";
+EOF
+connection con2;
+reap;
+disconnect con2;
+connection default;
+SELECT COUNT(*) > 40000, SUM(v = 'slap') > 0 FROM big.t;
+let $over1 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_image_overdrafts', Value, 1);
+let $img1 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_images', Value, 1);
+--let $assert_text = images were logged
+--let $assert_cond = $img1 > $img0
+--source include/assert.inc
+--let $assert_text = no image overdraft (more than K_INT images between checks)
+--let $assert_cond = $over1 = $over0
+--source include/assert.inc
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*) > 40000, SUM(v = 'slap') > 0 FROM big.t;
+CHECK TABLE big.t;
+SET GLOBAL innodb_thread_concurrency = 8;
+
+DROP DATABASE big;
+let $i = 12;
+--disable_query_log
+while ($i >= 0)
+{
+  eval DROP DATABASE w$i;
+  dec $i;
+}
+--enable_query_log
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';

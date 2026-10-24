@@ -6556,6 +6556,11 @@ bool Fil_shard::space_extend(fil_space_t *space, page_no_t size) {
       is used to synchronize threads to execute space extension in order. */
 
       file->is_being_extended = true;
+      /* v3 §11.18 (c): widen the window inside space_extend. */
+      DBUG_EXECUTE_IF("wt_slow_extend", {
+        if (space->wt_ov != nullptr || space->wt_freezing.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      });
 
       break;
     }
@@ -8031,6 +8036,13 @@ void fil_aio_wait(ulint segment) {
 
   shard->mutex_release();
 
+  /* v3 §11.18 (a): widen the window between complete_io and the page's
+  I/O completion. */
+  DBUG_EXECUTE_IF("wt_slow_io_complete", {
+    if (file->space->wt_ov != nullptr || file->space->wt_freezing.load())
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+
   ut_ad(fil_validate_skip());
 
   /* Do the i/o handling */
@@ -8217,6 +8229,11 @@ void Fil_shard::space_flush(space_id_t space_id) {
 
       mutex_release();
 
+      /* v3 §11.18 (b): widen the window after space_flush lets go. */
+      DBUG_EXECUTE_IF("wt_slow_space_flush", {
+        if (space->wt_ov != nullptr || space->wt_freezing.load())
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      });
       os_file_flush(file.handle);
 
       file.flush_size = file.size;

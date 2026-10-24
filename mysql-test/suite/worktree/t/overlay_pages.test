@@ -203,6 +203,40 @@ SELECT COUNT(*), SUM(v = 'grow') FROM w7.s;
 CHECK TABLE w7.s;
 
 --echo #
+--echo # 7b. The same with only a pre-freeze copy of page 0 (impossible without
+--echo #     an A0 violation, injected here): startup refuses to restore it and
+--echo #     says so, never detaching the overlay from its layer.
+CREATE TABLE src.s9 (id INT PRIMARY KEY, v VARCHAR(40));
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.s9 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+  SELECT n, 'pre' FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'src/s9'`;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+CREATE WORKTREE w7b FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  my $f = "$ENV{WT_DD}/src/s9.ibd";
+  my @c = dblwr_copies($ENV{WT_S}, 0);
+  my $post = grep { open(my $h, '<:raw', $_->[0]); sysseek($h, $_->[1], 0); my $p; sysread($h, $p, 16384);
+                    (unpack('N', substr($p, 54, 4)) >> 15) & 1 } @c;
+  printf("copies of src/s9 page 0: pre-freeze %s, post-freeze %d\n", @c - $post > 0 ? "yes" : "no", $post);
+  my $saved = page_n($f, 0);
+  tear($f, 0);
+  my $log = "$ENV{WT_TMP}/stale_page0.err";
+  my $failed = start_fails("", $log);
+  printf("startup with a torn page 0 and only a pre-freeze copy: failed %s, says why %s\n", $failed ? "yes" : "NO",
+         count_in_log($log, qr/only a copy from before its freeze/) ? "yes" : "no");
+  unlink($log);
+  patch($f, 0, $saved);
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'pre') FROM src.s9;
+SELECT COUNT(*), SUM(v = 'pre') FROM w7b.s9;
+
+--echo #
 --echo # 8. A layer missing while redo needs it (v2 test 10): startup stops
 --echo #    naming it, never discards the redo; with the layer back, it recovers.
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
@@ -278,6 +312,7 @@ SELECT COUNT(*), SUM(v = 'twice') FROM w1.t;
 CHECK TABLE w1.t, w5.s, w7.s, w9.t, src.t, src.s;
 
 DROP DATABASE w9;
+DROP DATABASE w7b;
 DROP DATABASE w7;
 DROP DATABASE w5;
 DROP DATABASE w1;

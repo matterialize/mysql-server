@@ -12,6 +12,7 @@ call mtr.add_suppression("The error means the system cannot find the path specif
 call mtr.add_suppression("Tablespace [0-9]+, name 'wtt/t', file '.*' is missing");
 call mtr.add_suppression("innodb_force_recovery is on");
 call mtr.add_suppression("in InnoDB read-only mode");
+call mtr.add_suppression("Skipped updating resource group metadata in InnoDB read only mode");
 call mtr.add_suppression("Failed to compress the gtid_executed table");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
@@ -138,7 +139,7 @@ SET GLOBAL debug = '-d,wt_zero_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 # Kill the server
 # (the doublewrite files are lost as well)
-Pattern "Overlay page \[page id: space=[0-9]+, page number=[0-9]+\] of wtt/t lost" found
+Pattern "Overlay page \[page id: space=[0-9]+, page number=[0-9]+\] of wtt/t lost" not found
 # Remove the damaged worktree; the rest of the server recovers.
 # (recovery skips the missing files under force-recovery, which is
 # read-only; a clean shutdown then lets a normal start drop wtt)

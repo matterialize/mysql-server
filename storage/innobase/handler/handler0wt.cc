@@ -528,13 +528,18 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     }
     DBUG_EXECUTE_IF("wt_crash_freeze_after_tmp", DBUG_SUICIDE(););
 
-    /* F4 (a): latches before the gate closes. */
+    /* F4 (a): pages 0 and 1 resident (buffer-fixed, not latched) before the
+    gate closes. They are X-latched only once I/O has drained: a read
+    completing meanwhile may merge the change buffer, which latches page 1
+    (the bitmap) in the I/O thread and holds up every completion queued
+    behind it (v3 §11.18 (d)). Changes to them before the latch are dirty
+    pages, which (d) catches. */
     mtr_t mtr;
     mtr.start();
     mtr_x_lock_space(space, &mtr);
-    buf_block_t *b0 = buf_page_get(page_id_t(s, 0), page_size, RW_X_LATCH,
+    buf_block_t *b0 = buf_page_get(page_id_t(s, 0), page_size, RW_NO_LATCH,
                                    UT_LOCATION_HERE, &mtr);
-    buf_block_t *b1 = buf_page_get(page_id_t(s, 1), page_size, RW_X_LATCH,
+    buf_block_t *b1 = buf_page_get(page_id_t(s, 1), page_size, RW_NO_LATCH,
                                    UT_LOCATION_HERE, &mtr);
     const auto abort = [&](const char *why) {
       ib::info() << "Worktree freeze of " << space->name << " aborted (" << why
@@ -551,6 +556,20 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     int64_t mc;
     page_no_t size;
     bool clean = fil_wt_gate_close(s, std::chrono::milliseconds(1000), &mc, &size);
+    /* (a') the latches, briefly retried: a holder that needs I/O meanwhile
+    cannot let go while the gate is closed. */
+    const auto x_latch = [&](buf_block_t *b) {
+      const auto until =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+      while (!rw_lock_x_lock_nowait(&b->lock, UT_LOCATION_HERE)) {
+        if (std::chrono::steady_clock::now() > until) return false;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+      buf_block_buf_fix_inc(b, UT_LOCATION_HERE);
+      mtr_memo_push(&mtr, b, MTR_MEMO_PAGE_X_FIX);
+      return true;
+    };
+    clean = clean && x_latch(b0) && x_latch(b1);
     /* (c) mtrs past the hook but not yet on the flush list */
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
@@ -1197,37 +1216,38 @@ void fts_hold(dict_table_t *table, bool hold) {
 
 namespace {
 /** Overlay preconditions (limits/overlay-v3.md §5.4, §5.2 O5). */
-bool overlay_check_config() {
+/** The v3 §5.4 configuration an overlay's crash safety rests on. At startup
+(layers exist) the redo margin and the redo state are not known yet: they are
+checked at CREATE WORKTREE and by their own SET guards.
+@return why the configuration is unsafe, or nullptr */
+const char *overlay_config_problem(bool at_startup) {
   if (srv_thread_concurrency == 0)
-    return wt_error(
-        "CREATE WORKTREE in overlay mode with innodb_thread_concurrency=0 "
-        "(set it > 0: the redo margin that bounds first-dirty images needs "
-        "it)");
-  if (!log_sys->concurrency_margin_is_safe.load())
-    return wt_error(
-        "CREATE WORKTREE in overlay mode with an unsafe redo concurrency "
-        "margin (raise innodb_redo_log_capacity or lower "
-        "innodb_thread_concurrency)");
-  if (dblwr::g_mode != dblwr::Mode::ON &&
-      dblwr::g_mode != dblwr::Mode::TRUEE &&
+    return "innodb_thread_concurrency=0 (set it > 0: the redo margin that "
+           "bounds first-dirty images needs it)";
+  if (!at_startup && !log_sys->concurrency_margin_is_safe.load())
+    return "an unsafe redo concurrency margin (raise innodb_redo_log_capacity "
+           "or lower innodb_thread_concurrency)";
+  if (dblwr::g_mode != dblwr::Mode::ON && dblwr::g_mode != dblwr::Mode::TRUEE &&
       dblwr::g_mode != dblwr::Mode::DETECT_AND_RECOVER)
-    return wt_error(
-        "CREATE WORKTREE in overlay mode without a full doublewrite buffer "
-        "(innodb_doublewrite must be ON or DETECT_AND_RECOVER)");
+    return "no full doublewrite buffer (innodb_doublewrite must be ON or "
+           "DETECT_AND_RECOVER)";
   if (srv_checksum_algorithm == SRV_CHECKSUM_ALGORITHM_NONE ||
       srv_checksum_algorithm == SRV_CHECKSUM_ALGORITHM_STRICT_NONE)
-    return wt_error(
-        "CREATE WORKTREE in overlay mode with innodb_checksum_algorithm=none");
+    return "innodb_checksum_algorithm=none";
   if (srv_unix_file_flush_method == SRV_UNIX_NOSYNC ||
       srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC ||
       srv_unix_file_flush_method == SRV_UNIX_LITTLESYNC)
-    return wt_error(
-        "CREATE WORKTREE in overlay mode with an innodb_flush_method that "
-        "does not fsync data files");
-  if (!mtr_t::s_logging.is_enabled())
-    return wt_error("CREATE WORKTREE in overlay mode with redo disabled");
-  if (UNIV_PAGE_SIZE > UNIV_PAGE_SIZE_DEF)
-    return wt_error("CREATE WORKTREE in overlay mode with 32 or 64 KB pages");
+    return "an innodb_flush_method that does not fsync data files";
+  if (!at_startup && !mtr_t::s_logging.is_enabled()) return "redo disabled";
+  if (UNIV_PAGE_SIZE > UNIV_PAGE_SIZE_DEF) return "32 or 64 KB pages";
+  return nullptr;
+}
+
+bool overlay_check_config() {
+  if (const char *why = overlay_config_problem(false)) {
+    const std::string what = std::string("CREATE WORKTREE in overlay mode with ") + why;
+    return wt_error(what.c_str());
+  }
   return false;
 }
 
@@ -1241,7 +1261,9 @@ bool overlay_wait_purged(THD *thd, trx_id_t target) {
     if (trx_sys->rseg_history_len.load() == 0) return false;
     trx_id_t done;
     rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
-    done = purge_sys->done.trx_no;
+    /* limit: where the running batch started; every earlier batch has
+    completed (done exists in debug builds only). */
+    done = purge_sys->limit.trx_no;
     rw_lock_s_unlock(&purge_sys->latch);
     if (done >= target) return false;
     if (std::chrono::steady_clock::now() > deadline || thd_killed(thd)) {
@@ -1263,7 +1285,17 @@ bool schema_read_only(THD *thd, const dd::Table &src) {
 
 bool innobase_wt_select_mode() {
   struct stat st;
-  const bool have_layers = stat(WT_LAYER_DIR, &st) == 0;
+  const bool have_dir = stat(WT_LAYER_DIR, &st) == 0;
+  /* Layer files, not the directory: an overlay-mode bootstrap leaves an
+  empty one. */
+  bool have_layers = false;
+  if (DIR *d = have_dir ? opendir(WT_LAYER_DIR) : nullptr; d != nullptr) {
+    for (struct dirent *e; !have_layers && (e = readdir(d)) != nullptr;) {
+      const size_t n = strlen(e->d_name);
+      have_layers = n > 4 && strcmp(e->d_name + n - 4, ".ibl") == 0;
+    }
+    closedir(d);
+  }
   if (srv_read_only_mode) {
     /* Nothing is created or written; routing works from the files alone. */
     srv_wt_overlay = false;
@@ -1292,7 +1324,7 @@ bool innobase_wt_select_mode() {
     overlay = !cloned;
   }
   if (overlay) {
-    if (!have_layers && mkdir(WT_LAYER_DIR, 0750) != 0) {
+    if (!have_dir && mkdir(WT_LAYER_DIR, 0750) != 0) {
       ib::error() << "Cannot create " << WT_LAYER_DIR << ": " << strerror(errno);
       return true;
     }
@@ -1308,6 +1340,15 @@ bool innobase_wt_select_mode() {
     if (!linked) {
       ib::error() << "Worktree overlay mode needs hard links in the data "
                      "directory's filesystem";
+      return true;
+    }
+  }
+  if (overlay && have_layers) {
+    /* v3 §5.4: overlays exist, so their configuration is checked now. */
+    if (const char *why = overlay_config_problem(true)) {
+      ib::error() << "The data directory has worktree overlays and the server "
+                     "is configured with "
+                  << why << "; refusing to start";
       return true;
     }
   }

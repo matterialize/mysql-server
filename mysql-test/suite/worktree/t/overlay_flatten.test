@@ -104,9 +104,12 @@ connection default;
 SET DEBUG_SYNC = 'RESET';
 perl;
   require $ENV{WT_PL};
-  printf("wt overlay bit %d; wt2 overlay bit %d, chain depth %d; wt3 chain depth %d; unreferenced layers %d\n",
+  # (wt3's depth depends on whether the filesystem reports holes: src was
+  # reused or frozen again after each restart above)
+  my $d3 = depth("$ENV{WT_DD}/wt3/t.ibd");
+  printf("wt overlay bit %d; wt2 overlay bit %d, chain depth %d; wt3 linked, within the cap: %s; unreferenced layers %d\n",
          overlay_bit("$ENV{WT_DD}/wt/t.ibd"), overlay_bit("$ENV{WT_DD}/wt2/t.ibd"), depth("$ENV{WT_DD}/wt2/t.ibd"),
-         depth("$ENV{WT_DD}/wt3/t.ibd"), stray());
+         $d3 >= 1 && $d3 <= 16 ? "yes" : "NO ($d3)", stray());
 EOF
 --source include/restart_mysqld.inc
 SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt2.t;
