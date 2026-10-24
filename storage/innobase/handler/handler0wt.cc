@@ -109,12 +109,14 @@ bool wt_reflink_error(const std::string &path) {
   for (int code : {EOPNOTSUPP, ENOTSUP, EXDEV, EINVAL, ENOTTY})
     unsupported |= err == code;
   if (unsupported) {
+    const std::string where =
+        path.find('/') == std::string::npos
+            ? std::string("in the data directory")
+            : "at '" + path.substr(0, path.rfind('/')) + "'";
     const std::string what =
         "CREATE WORKTREE on a filesystem without copy-on-write file clones "
-        "(reflink) at '" +
-        (path.find('/') == std::string::npos ? std::string(".")
-                                              : path.substr(0, path.rfind('/'))) +
-        "'; it needs APFS, XFS with reflink=1, or btrfs";
+        "(reflink) " +
+        where + "; it needs APFS, XFS with reflink=1, or btrfs";
     my_error(ER_NOT_SUPPORTED_YET, MYF(0), what.c_str());
     return true;
   }
