@@ -1,0 +1,20 @@
+# A filesystem without copy-on-write file clones (ext4, HFS+) is refused
+# with a clear error before anything is quiesced or written, and nothing
+# is left behind.
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v INT);
+INSERT INTO src.t VALUES (1, 1), (2, 2);
+CREATE WORKTREE wt FROM src;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE on a filesystem without copy-on-write file clones (reflink) in the data directory; it needs APFS, XFS with reflink=1, or btrfs'
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+# Nothing left in src either:
+t.ibd
+# The source is untouched and writable.
+INSERT INTO src.t VALUES (3, 3);
+SELECT * FROM src.t ORDER BY id;
+id	v
+1	1
+2	2
+3	3
+DROP DATABASE src;
