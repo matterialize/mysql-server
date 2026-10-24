@@ -7897,6 +7897,23 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
     err = os_file_write(req_type, file->name, file->handle, buf, offset, len);
   }
 #else /* UNIV_HOTBACKUP */
+#ifdef UNIV_DEBUG
+  /* Torn/lost overlay writes (limits/overlay-v3-addendum.md A7): what the OS
+  may leave after a power loss, which kill -9 never does. The data file gets
+  a torn (first 4 KB, then zeros) or an all-zero copy of the page. */
+  if (space->wt_ov != nullptr && req_type.is_write() && !req_type.is_dblwr() &&
+      page_id.page_no() >= 2) {
+    const bool tear = DBUG_EVALUATE_IF("wt_tear_overlay_writes", true, false);
+    const bool zero = DBUG_EVALUATE_IF("wt_zero_overlay_writes", true, false);
+    if (tear || zero) {
+      auto copy = static_cast<byte *>(ut::aligned_alloc(len, UNIV_SECTOR_SIZE));
+      memset(copy, 0, len);
+      if (tear) memcpy(copy, buf, std::min<ulint>(len, 4096));
+      buf = copy; /* leaked on purpose: debug only, the write is async */
+    }
+  }
+#endif /* UNIV_DEBUG */
+
   /* Overlay read routing (v3 §4): the same single request, to the chosen
   file; completion accounting stays on this space's node (m1). Doublewrite
   reads are raw-local. */

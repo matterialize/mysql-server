@@ -964,6 +964,13 @@ static void doublewrite_update(THD *thd [[maybe_unused]],
     return;
   }
 
+  /* Overlay worktrees need full page copies (limits/overlay-v3.md §5.4). */
+  if (wt_overlays_exist() && dblwr::Mode::is_reduced_low(new_value)) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "innodb_doublewrite=DETECT_ONLY while worktree overlays exist");
+    return;
+  }
+
   /* Handle DETECT_AND_RECOVER to DETECT_ONLY
   1. Check if DETECT_ONLY setup is already initialized. If not, initialize
      DETECT_ONLY files and structures.
@@ -4468,6 +4475,13 @@ static bool innobase_redo_set_state(THD *thd, bool enable) {
     return (true);
   }
 
+  /* Overlay worktrees rely on first-dirty page images in redo. */
+  if (!enable && wt_overlays_exist()) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+             "disabling the redo log while worktree overlays exist");
+    return true;
+  }
+
   int err = 0;
 
   if (enable) {
@@ -5013,8 +5027,15 @@ static void innobase_post_ddl(THD *thd) {
       ib::fatal(UT_LOCATION_HERE, ER_IB_MSG_DDL_LOG_FAIL_POST_DDL);
     }
   }
-  /* An overlay or a live-linked source was dropped: collect its layers. */
-  if (wt_gc_wanted.exchange(false)) innobase_wt_gc(false);
+  /* An overlay or a live-linked source may have been dropped: collect the
+  layers nothing links any more (limits/overlay-v3.md §9). */
+  const auto cmd = thd_sql_command(thd);
+  if (wt_gc_wanted.exchange(false) ||
+      (wt_layer_names.load() > 0 &&
+       (cmd == SQLCOM_DROP_DB || cmd == SQLCOM_DROP_TABLE ||
+        cmd == SQLCOM_ALTER_DB))) {
+    innobase_wt_gc(false);
+  }
 }
 
 // simple (no measurement attributes supported) metric callback
@@ -15436,6 +15457,13 @@ int ha_innobase::discard_or_import_tablespace(bool discard,
     return HA_ERR_TABLE_READONLY;
   }
 
+  /* An overlay file holds only its own pages (overlay-v3 §5.3 row 11). */
+  if (fil_space_is_wt_overlay(m_prebuilt->table->space)) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+             "DISCARD or IMPORT TABLESPACE of a worktree overlay table");
+    return HA_ERR_UNSUPPORTED;
+  }
+
   dict_table_t *dict_table = m_prebuilt->table;
 
   if (dict_table->is_temporary()) {
@@ -19027,6 +19055,14 @@ int ha_innobase::external_lock(THD *thd, /*!< in: handle to the user thread */
           return HA_ERR_NO_SUCH_TABLE;
         }
 
+        /* An overlay file holds only its own pages (overlay-v3 §5.3). */
+        if (fil_space_is_wt_overlay(m_prebuilt->table->space)) {
+          my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                   "FLUSH TABLES ... FOR EXPORT of a worktree overlay table "
+                   "(ALTER WORKTREE ... MATERIALIZE it first)");
+          return HA_ERR_UNSUPPORTED;
+        }
+
         row_quiesce_table_start(m_prebuilt->table, trx);
 
         /* Use the transaction instance to track UNLOCK
@@ -22182,6 +22218,21 @@ static void innodb_log_writer_threads_update(THD *, SYS_VAR *, void *var_ptr,
 value. This function is registered as a callback with MySQL.
 @param[in]  thd       thread handle
 @param[in]  save      immediate result from check function */
+/** innodb_checksum_algorithm: a torn overlay page must fail its checksum
+(limits/overlay-v3.md §5.4), so "none" is refused while overlays exist. */
+static void innodb_checksum_algorithm_update(THD *, SYS_VAR *, void *var_ptr,
+                                             const void *save) {
+  const ulong new_value = *static_cast<const ulong *>(save);
+  if (wt_overlays_exist() &&
+      (new_value == SRV_CHECKSUM_ALGORITHM_NONE ||
+       new_value == SRV_CHECKSUM_ALGORITHM_STRICT_NONE)) {
+    my_error(ER_WRONG_ARGUMENTS, MYF(0),
+             "innodb_checksum_algorithm=none while worktree overlays exist");
+    return;
+  }
+  *static_cast<ulong *>(var_ptr) = new_value;
+}
+
 static void innodb_redo_log_capacity_update(THD *thd, SYS_VAR *, void *,
                                             const void *save) {
   const auto new_value = *static_cast<const ulonglong *>(save);
@@ -22194,6 +22245,18 @@ static void innodb_redo_log_capacity_update(THD *thd, SYS_VAR *, void *,
     my_error(ER_CANT_CHANGE_SYS_VAR_IN_READ_ONLY_MODE, MYF(0),
              "innodb-redo-log-capacity");
     return;
+  }
+
+  /* Overlay worktrees: the redo margin must stay a bound (overlay-v3 §5.2). */
+  if (wt_overlays_exist()) {
+    bool safe = false;
+    (void)log_concurrency_margin(new_value, safe);
+    if (!safe) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "innodb_redo_log_capacity: too small for a safe redo margin "
+               "while worktree overlays exist");
+      return;
+    }
   }
 
   srv_redo_log_capacity = new_value;
@@ -22224,7 +22287,23 @@ value. This function is registered as a callback with MySQL.
 @param[in]      save      immediate result from check function */
 static void innodb_thread_concurrency_update(THD *thd, SYS_VAR *, void *,
                                              const void *save) {
-  srv_thread_concurrency = *static_cast<const ulong *>(save);
+  const ulong new_value = *static_cast<const ulong *>(save);
+  /* Overlay worktrees: the redo margin must stay a bound (overlay-v3 §5.2). */
+  if (wt_overlays_exist()) {
+    const ulong old_value = srv_thread_concurrency;
+    srv_thread_concurrency = new_value;
+    bool safe = false;
+    (void)log_concurrency_margin(log_sys->m_capacity.soft_logical_capacity(),
+                                 safe);
+    srv_thread_concurrency = old_value;
+    if (new_value == 0 || !safe) {
+      my_error(ER_WRONG_ARGUMENTS, MYF(0),
+               "innodb_thread_concurrency: worktree overlays need a value > 0 "
+               "with a safe redo margin");
+      return;
+    }
+  }
+  srv_thread_concurrency = new_value;
 
   ib::info(ER_IB_MSG_THREAD_CONCURRENCY_CHANGED, srv_thread_concurrency);
 
@@ -22280,7 +22359,7 @@ static MYSQL_SYSVAR_ENUM(
     " magic number when reading;"
     " Files updated when this option is set to crc32 or strict_crc32 will"
     " not be readable by MySQL versions older than 5.6.3",
-    nullptr, nullptr, SRV_CHECKSUM_ALGORITHM_CRC32,
+    nullptr, innodb_checksum_algorithm_update, SRV_CHECKSUM_ALGORITHM_CRC32,
     &innodb_checksum_algorithm_typelib);
 
 static MYSQL_SYSVAR_BOOL(

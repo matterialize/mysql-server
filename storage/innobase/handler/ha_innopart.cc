@@ -47,6 +47,7 @@ Created Nov 22, 2013 Mattias Jonsson */
 #include <algorithm>
 #include <new>
 
+#include "fil0overlay.h"
 #include "dd/dd.h"
 #include "dd/dictionary.h"
 #include "dd/properties.h"
@@ -4078,6 +4079,12 @@ int ha_innopart::external_lock(THD *thd, int lock_type) {
             return (HA_ERR_NO_SUCH_TABLE);
           }
 
+          if (fil_space_is_wt_overlay(table->space)) {
+            my_error(ER_NOT_SUPPORTED_YET, MYF(0),
+                     "FLUSH TABLES ... FOR EXPORT of a worktree overlay table "
+                     "(ALTER WORKTREE ... MATERIALIZE it first)");
+            return HA_ERR_UNSUPPORTED;
+          }
           row_quiesce_table_start(table, m_prebuilt->trx);
 
           /* Use the transaction instance to track

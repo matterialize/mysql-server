@@ -1,0 +1,151 @@
+# Overlay mode (limits/overlay-v3.md, limits/overlay-v3-addendum.md): sparse
+# worktree files over immutable layers in #wtlayers, for filesystems
+# without copy-on-write file clones (forced on others for testing).
+SET SESSION cte_max_recursion_depth = 100000;
+#
+# Overlay CREATE WORKTREE needs innodb_thread_concurrency > 0 (the redo
+# margin that bounds first-dirty images).
+SET GLOBAL innodb_thread_concurrency = 0;
+CREATE DATABASE golden;
+CREATE TABLE golden.t (id INT PRIMARY KEY, v VARCHAR(40), KEY (v));
+INSERT INTO golden.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+SELECT n, CONCAT('g', n) FROM s;
+CREATE WORKTREE wt FROM golden;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE in overlay mode with innodb_thread_concurrency=0 (set it > 0: the redo margin that bounds first-dirty images needs it)'
+SET GLOBAL innodb_thread_concurrency = 8;
+#
+# 1. A read-only golden is linked live: its own file is the layer (one
+#    inode, two names), stays stock-format, and is never written, even by
+#    purge of its old history.
+DELETE FROM golden.t WHERE id % 10 = 0;
+ALTER SCHEMA golden READ ONLY = 1;
+CREATE WORKTREE wt FROM golden;
+golden: overlay bit 0, names of its inode 2; wt: overlay bit 1, chain depth 1
+UPDATE wt.t SET v = 'wt' WHERE id <= 100;
+INSERT INTO wt.t VALUES (90000, 'wt-only');
+SET GLOBAL innodb_purge_run_now = ON;
+SET GLOBAL innodb_fast_shutdown = 0;
+# restart
+golden file byte-identical after purge, writes to wt and a restart: yes
+SET SESSION cte_max_recursion_depth = 100000;
+SELECT COUNT(*), SUM(v = 'wt') FROM wt.t;
+COUNT(*)	SUM(v = 'wt')
+4501	90
+SELECT COUNT(*), SUM(v = 'wt') FROM golden.t;
+COUNT(*)	SUM(v = 'wt')
+4500	0
+SELECT COUNT(*) FROM wt.t FORCE INDEX (v) WHERE v LIKE 'g1%';
+COUNT(*)
+990
+CHECK TABLE wt.t, golden.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+golden.t	check	status	OK
+#
+# 2. Refresh: making golden writable freezes its linked file first.
+#    Golden becomes an overlay over the old generation; wt is unaffected.
+ALTER SCHEMA golden READ ONLY = 0;
+UPDATE golden.t SET v = 'golden2' WHERE id <= 200;
+golden: overlay bit 1, names of its inode 1, chain depth 1
+SELECT SUM(v = 'wt'), SUM(v = 'golden2') FROM wt.t;
+SUM(v = 'wt')	SUM(v = 'golden2')
+90	0
+SELECT SUM(v = 'wt'), SUM(v = 'golden2') FROM golden.t;
+SUM(v = 'wt')	SUM(v = 'golden2')
+0	180
+#
+# 3. A writable source is frozen at CREATE WORKTREE: its old file becomes
+#    a read-only layer, it continues as an overlay with the same space id.
+CREATE WORKTREE wt2 FROM golden;
+same space id after the freeze: 1
+UPDATE golden.t SET v = 'golden3' WHERE id <= 300;
+UPDATE wt2.t SET v = 'wt2' WHERE id BETWEEN 1000 AND 1099;
+SELECT SUM(v = 'golden2'), SUM(v = 'golden3'), SUM(v = 'wt2') FROM golden.t;
+SUM(v = 'golden2')	SUM(v = 'golden3')	SUM(v = 'wt2')
+0	270	0
+SELECT SUM(v = 'golden2'), SUM(v = 'golden3'), SUM(v = 'wt2') FROM wt2.t;
+SUM(v = 'golden2')	SUM(v = 'golden3')	SUM(v = 'wt2')
+180	0	90
+frozen layers are read-only files: yes
+#
+# 4. The depth cap (addendum A5): a source frozen over and over is
+#    flattened before its chain would exceed 16 layers.
+deepest chain of 20 worktrees of a source frozen 20 times: at most 16: yes
+SELECT v FROM wtc0.t WHERE id = 1;
+v
+round0
+SELECT v FROM wtc19.t WHERE id = 1;
+v
+round19
+SELECT v FROM golden.t WHERE id = 1;
+v
+round19
+CHECK TABLE wtc0.t, wtc10.t, wtc19.t, golden.t;
+Table	Op	Msg_type	Msg_text
+wtc0.t	check	status	OK
+wtc10.t	check	status	OK
+wtc19.t	check	status	OK
+golden.t	check	status	OK
+#
+# 5. MATERIALIZE: a standalone stock-format file, under writes.
+CHECKSUM TABLE wt2.t;
+Table	Checksum
+wt2.t	2578678929
+UPDATE wt2.t SET v = CONCAT(v, '+') WHERE id BETWEEN 4000 AND 4999;
+ALTER WORKTREE wt2 MATERIALIZE;
+wt2: overlay bit 0, map present no
+SELECT COUNT(*), SUM(v = 'wt2'), SUM(v LIKE '%+') FROM wt2.t;
+COUNT(*)	SUM(v = 'wt2')	SUM(v LIKE '%+')
+4500	90	900
+# restart
+SELECT COUNT(*), SUM(v = 'wt2'), SUM(v LIKE '%+') FROM wt2.t;
+COUNT(*)	SUM(v = 'wt2')	SUM(v LIKE '%+')
+4500	90	900
+CHECK TABLE wt2.t;
+Table	Op	Msg_type	Msg_text
+wt2.t	check	status	OK
+ALTER WORKTREE wt2 MATERIALIZE_NOW;
+ERROR 42000: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'MATERIALIZE_NOW' at line 1
+#
+# 6. Runtime guards while overlays exist (v3 §5.4).
+SET GLOBAL innodb_doublewrite = DETECT_ONLY;
+ERROR HY000: Incorrect arguments to innodb_doublewrite=DETECT_ONLY while worktree overlays exist
+SET GLOBAL innodb_checksum_algorithm = none;
+ERROR HY000: Incorrect arguments to innodb_checksum_algorithm=none while worktree overlays exist
+SET GLOBAL innodb_checksum_algorithm = strict_none;
+ERROR HY000: Incorrect arguments to innodb_checksum_algorithm=none while worktree overlays exist
+SET GLOBAL innodb_thread_concurrency = 0;
+ERROR HY000: Incorrect arguments to innodb_thread_concurrency: worktree overlays need a value > 0 with a safe redo margin
+ALTER INSTANCE DISABLE INNODB REDO_LOG;
+ERROR 42000: This version of MySQL doesn't yet support 'disabling the redo log while worktree overlays exist'
+SET GLOBAL innodb_checksum_algorithm = strict_crc32;
+SET GLOBAL innodb_checksum_algorithm = crc32;
+SELECT @@innodb_doublewrite, @@innodb_checksum_algorithm, @@innodb_thread_concurrency;
+@@innodb_doublewrite	@@innodb_checksum_algorithm	@@innodb_thread_concurrency
+ON	crc32	8
+#
+# 7. Refusals on overlay tables (v3 §5.3).
+FLUSH TABLES wt.t FOR EXPORT;
+ERROR 42000: This version of MySQL doesn't yet support 'FLUSH TABLES ... FOR EXPORT of a worktree overlay table (ALTER WORKTREE ... MATERIALIZE it first)'
+ALTER TABLE wt.t DISCARD TABLESPACE;
+ERROR 42000: This version of MySQL doesn't yet support 'DISCARD or IMPORT TABLESPACE of a worktree overlay table'
+ALTER TABLE wt.t COMPRESSION = 'zlib', ALGORITHM = INPLACE;
+ERROR 0A000: ALGORITHM=INPLACE is not supported. Reason: COMPRESSION= on a worktree overlay table needs ALGORITHM=COPY. Try ALGORITHM=COPY.
+CREATE TABLE wt.empty_t (id INT PRIMARY KEY, v VARCHAR(40));
+CREATE WORKTREE wt3 FROM wt;
+LOAD DATA INFILE 'VARDIR/tmp/wt_bulk.txt' INTO TABLE wt3.empty_t ALGORITHM = BULK;
+Got one of the listed errors
+#
+# 8. GC (v3 §9): after the drops, and again at startup, no layer is
+#    left that no link reaches.
+DROP DATABASE wt3;
+DROP DATABASE wt;
+DROP DATABASE wt2;
+unreferenced layers after the drops: 0
+# restart
+SELECT COUNT(*), SUM(v = 'golden3') FROM golden.t;
+COUNT(*)	SUM(v = 'golden3')
+4500	269
+ALTER WORKTREE golden MATERIALIZE;
+DROP DATABASE golden;
+layers left once nothing links them: 0

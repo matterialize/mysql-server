@@ -427,6 +427,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     const std::string layer = wt_layer_path(uuid);
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
+    wt_layer_names.fetch_add(1);
     if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
     DBUG_EXECUTE_IF("wt_crash_freeze_after_link", DBUG_SUICIDE(););
 
@@ -506,6 +507,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
       fil_wt_gate_open(s);
       mtr.commit();
       unlink(layer.c_str());
+      wt_layer_names.fetch_sub(1);
       (void)sync_dir(WT_LAYER_DIR);
       unlink(tmp.c_str());
     };
@@ -711,6 +713,7 @@ bool overlay_snapshot(Space_clone *c, bool live) {
     const std::string layer = wt_layer_path(uuid);
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
+    wt_layer_names.fetch_add(1);
     if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
     DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
   }
@@ -1667,17 +1670,21 @@ void innobase_wt_gc(bool startup) {
   }
   if (unsafe) {
     ib::warn() << "Worktree GC skipped: a link could not be read";
+    wt_layer_names.store(static_cast<int>(layers.size()));
     return;
   }
   std::set<ino_t> live;
+  int kept = 0;
   for (const auto &[uuid, ino] : layers) {
     if (reached.count(uuid) != 0) {
       live.insert(ino);
+      ++kept;
       continue;
     }
     ib::info() << "Worktree GC: removing unreferenced layer " << uuid;
     unlink(wt_layer_path(uuid).c_str());
   }
+  wt_layer_names.store(kept);
   /* A read-only source whose live file is still a layer must not be
   written (addendum A2); one whose layers are gone is an ordinary table. */
   for (const auto &[ino, space_id] : ibds) {

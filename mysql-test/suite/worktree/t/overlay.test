@@ -1,0 +1,222 @@
+--echo # Overlay mode (limits/overlay-v3.md, limits/overlay-v3-addendum.md): sparse
+--echo # worktree files over immutable layers in #wtlayers, for filesystems
+--echo # without copy-on-write file clones (forced on others for testing).
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+SET SESSION cte_max_recursion_depth = 100000;
+--write_file $MYSQLTEST_VARDIR/tmp/wt_overlay.pl
+use strict;
+# Facts about a tablespace file, as the tests below print them.
+sub page0 { my $f = shift; open(my $h, '<:raw', $f) or die "$f: $!"; my $p; sysread($h, $p, 16384); return $p; }
+sub overlay_bit { return (unpack('N', substr(page0(shift), 38 + 16, 4)) >> 15) & 1; }
+sub link_of {
+  my $p = page0(shift);
+  return undef unless (unpack('N', substr($p, 38 + 16, 4)) >> 15) & 1;
+  my $o = 16384 - 8 - 4096;
+  return undef unless substr($p, $o, 4) eq 'WTM2';
+  my ($na, $ni, $nr) = unpack('NNN', substr($p, $o + 4, 12));
+  return substr($p, $o + 32 + 4 * $na + 16 * $ni + 4 * $nr, 32);
+}
+sub depth { my ($f, $d) = (shift, 0); while (my $u = link_of($f)) { $d++; $f = "$ENV{WT_DD}/#wtlayers/$u.ibl"; } return $d; }
+sub nlink { return (stat(shift))[3]; }
+sub layers { opendir(my $d, "$ENV{WT_DD}/#wtlayers") or die; my @l = grep { /\.ibl$/ } readdir($d); return scalar @l; }
+1;
+EOF
+let WT_PL = $MYSQLTEST_VARDIR/tmp/wt_overlay.pl;
+
+--echo #
+--echo # Overlay CREATE WORKTREE needs innodb_thread_concurrency > 0 (the redo
+--echo # margin that bounds first-dirty images).
+SET GLOBAL innodb_thread_concurrency = 0;
+CREATE DATABASE golden;
+CREATE TABLE golden.t (id INT PRIMARY KEY, v VARCHAR(40), KEY (v));
+INSERT INTO golden.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+  SELECT n, CONCAT('g', n) FROM s;
+--error ER_NOT_SUPPORTED_YET
+CREATE WORKTREE wt FROM golden;
+SET GLOBAL innodb_thread_concurrency = 8;
+
+--echo #
+--echo # 1. A read-only golden is linked live: its own file is the layer (one
+--echo #    inode, two names), stays stock-format, and is never written, even by
+--echo #    purge of its old history.
+DELETE FROM golden.t WHERE id % 10 = 0;
+ALTER SCHEMA golden READ ONLY = 1;
+CREATE WORKTREE wt FROM golden;
+perl;
+  require $ENV{WT_PL}; my $g = "$ENV{WT_DD}/golden/t.ibd";
+  printf("golden: overlay bit %d, names of its inode %d; wt: overlay bit %d, chain depth %d\n",
+         overlay_bit($g), nlink($g), overlay_bit("$ENV{WT_DD}/wt/t.ibd"), depth("$ENV{WT_DD}/wt/t.ibd"));
+  open(my $h, '<:raw', $g) or die; local $/; my $d = <$h>;
+  open(my $o, '>:raw', "$ENV{MYSQLTEST_VARDIR}/tmp/golden.copy") or die; print $o $d;
+EOF
+UPDATE wt.t SET v = 'wt' WHERE id <= 100;
+INSERT INTO wt.t VALUES (90000, 'wt-only');
+SET GLOBAL innodb_purge_run_now = ON;
+--source include/wait_innodb_all_purged.inc
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/restart_mysqld.inc
+perl;
+  my ($a, $b);
+  { open(my $h, '<:raw', "$ENV{WT_DD}/golden/t.ibd") or die; local $/; $a = <$h>; }
+  { open(my $h, '<:raw', "$ENV{MYSQLTEST_VARDIR}/tmp/golden.copy") or die; local $/; $b = <$h>; }
+  print "golden file byte-identical after purge, writes to wt and a restart: ", ($a eq $b ? "yes" : "NO"), "\n";
+EOF
+--remove_file $MYSQLTEST_VARDIR/tmp/golden.copy
+SET SESSION cte_max_recursion_depth = 100000;
+SELECT COUNT(*), SUM(v = 'wt') FROM wt.t;
+SELECT COUNT(*), SUM(v = 'wt') FROM golden.t;
+SELECT COUNT(*) FROM wt.t FORCE INDEX (v) WHERE v LIKE 'g1%';
+CHECK TABLE wt.t, golden.t;
+
+--echo #
+--echo # 2. Refresh: making golden writable freezes its linked file first.
+--echo #    Golden becomes an overlay over the old generation; wt is unaffected.
+ALTER SCHEMA golden READ ONLY = 0;
+UPDATE golden.t SET v = 'golden2' WHERE id <= 200;
+perl;
+  require $ENV{WT_PL}; my $g = "$ENV{WT_DD}/golden/t.ibd";
+  printf("golden: overlay bit %d, names of its inode %d, chain depth %d\n", overlay_bit($g), nlink($g), depth($g));
+EOF
+SELECT SUM(v = 'wt'), SUM(v = 'golden2') FROM wt.t;
+SELECT SUM(v = 'wt'), SUM(v = 'golden2') FROM golden.t;
+
+--echo #
+--echo # 3. A writable source is frozen at CREATE WORKTREE: its old file becomes
+--echo #    a read-only layer, it continues as an overlay with the same space id.
+let $space = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME = 'golden/t'`;
+CREATE WORKTREE wt2 FROM golden;
+let $space2 = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLES WHERE NAME = 'golden/t'`;
+let $same = `SELECT $space = $space2`;
+--echo same space id after the freeze: $same
+UPDATE golden.t SET v = 'golden3' WHERE id <= 300;
+UPDATE wt2.t SET v = 'wt2' WHERE id BETWEEN 1000 AND 1099;
+SELECT SUM(v = 'golden2'), SUM(v = 'golden3'), SUM(v = 'wt2') FROM golden.t;
+SELECT SUM(v = 'golden2'), SUM(v = 'golden3'), SUM(v = 'wt2') FROM wt2.t;
+perl;
+  require $ENV{WT_PL};
+  opendir(my $d, "$ENV{WT_DD}/#wtlayers") or die;
+  my $ro = 0; for (grep { /\.ibl$/ } readdir($d)) { $ro++ unless (stat("$ENV{WT_DD}/#wtlayers/$_"))[2] & 0222; }
+  print "frozen layers are read-only files: ", ($ro >= 1 ? "yes" : "no"), "\n";
+EOF
+
+--echo #
+--echo # 4. The depth cap (addendum A5): a source frozen over and over is
+--echo #    flattened before its chain would exceed 16 layers.
+let $i = 0;
+while ($i < 20)
+{
+  --disable_query_log
+  eval UPDATE golden.t SET v = 'round$i' WHERE id = 1;
+  eval CREATE WORKTREE wtc$i FROM golden;
+  --enable_query_log
+  inc $i;
+}
+perl;
+  require $ENV{WT_PL};
+  my $max = 0; for my $i (0 .. 19) { my $d = depth("$ENV{WT_DD}/wtc$i/t.ibd"); $max = $d if $d > $max; }
+  printf("deepest chain of 20 worktrees of a source frozen 20 times: at most 16: %s\n", $max <= 16 ? "yes" : "NO ($max)");
+EOF
+SELECT v FROM wtc0.t WHERE id = 1;
+SELECT v FROM wtc19.t WHERE id = 1;
+SELECT v FROM golden.t WHERE id = 1;
+CHECK TABLE wtc0.t, wtc10.t, wtc19.t, golden.t;
+let $i = 0;
+while ($i < 20)
+{
+  --disable_query_log
+  eval DROP DATABASE wtc$i;
+  --enable_query_log
+  inc $i;
+}
+
+--echo #
+--echo # 5. MATERIALIZE: a standalone stock-format file, under writes.
+CHECKSUM TABLE wt2.t;
+connect (con1, localhost, root,,);
+send UPDATE wt2.t SET v = CONCAT(v, '+') WHERE id BETWEEN 4000 AND 4999;
+connection default;
+ALTER WORKTREE wt2 MATERIALIZE;
+connection con1;
+reap;
+disconnect con1;
+connection default;
+perl;
+  require $ENV{WT_PL}; my $f = "$ENV{WT_DD}/wt2/t.ibd";
+  my $p = page0($f); my $o = 16384 - 8 - 4096;
+  printf("wt2: overlay bit %d, map present %s\n", overlay_bit($f), substr($p, $o, 3) eq 'WTM' ? 'yes' : 'no');
+EOF
+SELECT COUNT(*), SUM(v = 'wt2'), SUM(v LIKE '%+') FROM wt2.t;
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(v = 'wt2'), SUM(v LIKE '%+') FROM wt2.t;
+CHECK TABLE wt2.t;
+--error ER_PARSE_ERROR
+ALTER WORKTREE wt2 MATERIALIZE_NOW;
+
+--echo #
+--echo # 6. Runtime guards while overlays exist (v3 §5.4).
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_doublewrite = DETECT_ONLY;
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_checksum_algorithm = none;
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_checksum_algorithm = strict_none;
+--error ER_WRONG_ARGUMENTS
+SET GLOBAL innodb_thread_concurrency = 0;
+--error ER_NOT_SUPPORTED_YET
+ALTER INSTANCE DISABLE INNODB REDO_LOG;
+SET GLOBAL innodb_checksum_algorithm = strict_crc32;
+SET GLOBAL innodb_checksum_algorithm = crc32;
+SELECT @@innodb_doublewrite, @@innodb_checksum_algorithm, @@innodb_thread_concurrency;
+
+--echo #
+--echo # 7. Refusals on overlay tables (v3 §5.3).
+--error ER_NOT_SUPPORTED_YET
+FLUSH TABLES wt.t FOR EXPORT;
+--error ER_NOT_SUPPORTED_YET
+ALTER TABLE wt.t DISCARD TABLESPACE;
+--error ER_ALTER_OPERATION_NOT_SUPPORTED_REASON
+ALTER TABLE wt.t COMPRESSION = 'zlib', ALGORITHM = INPLACE;
+CREATE TABLE wt.empty_t (id INT PRIMARY KEY, v VARCHAR(40));
+--disable_query_log
+eval SELECT * FROM golden.t WHERE id <= 10 INTO OUTFILE '$MYSQLTEST_VARDIR/tmp/wt_bulk.txt';
+--enable_query_log
+CREATE WORKTREE wt3 FROM wt;
+# This server build refuses ALGORITHM=BULK outright, so the bulk loader (a
+# direct writer, v3 §5.3 row 2) never reaches an overlay; InnoDB's own
+# overlay check in bulk_load_check is the backstop.
+--replace_result $MYSQLTEST_VARDIR VARDIR
+--error ER_FEATURE_UNSUPPORTED,ER_NOT_SUPPORTED_YET
+eval LOAD DATA INFILE '$MYSQLTEST_VARDIR/tmp/wt_bulk.txt' INTO TABLE wt3.empty_t ALGORITHM = BULK;
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_bulk.txt
+
+--echo #
+--echo # 8. GC (v3 §9): after the drops, and again at startup, no layer is
+--echo #    left that no link reaches.
+DROP DATABASE wt3;
+DROP DATABASE wt;
+DROP DATABASE wt2;
+perl;
+  require $ENV{WT_PL}; my %reach;
+  for my $f (glob("$ENV{WT_DD}/*/*.ibd")) { my $x = $f; while (my $u = link_of($x)) { $reach{$u} = 1; $x = "$ENV{WT_DD}/#wtlayers/$u.ibl"; } }
+  opendir(my $d, "$ENV{WT_DD}/#wtlayers") or die;
+  my @stray = grep { /\.ibl$/ && !$reach{substr($_, 0, 32)} } readdir($d);
+  print "unreferenced layers after the drops: ", scalar(@stray), "\n";
+EOF
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(v = 'golden3') FROM golden.t;
+ALTER WORKTREE golden MATERIALIZE;
+DROP DATABASE golden;
+perl;
+  require $ENV{WT_PL};
+  print "layers left once nothing links them: ", layers(), "\n";
+EOF
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_overlay.pl

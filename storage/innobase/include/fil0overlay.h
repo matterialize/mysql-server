@@ -45,6 +45,22 @@ extern std::atomic<uint64_t> wt_image_overdrafts;
 /** Images since this thread's last log_free_check(). */
 extern thread_local ulint wt_img_since_check;
 
+/** Overlay tablespaces attached now. While any exist, settings that would
+break their crash safety are refused (limits/overlay-v3.md §5.4). */
+extern std::atomic<int> wt_overlay_spaces;
+
+/** Layer names in #wtlayers (set by GC, adjusted by links and aborts). */
+extern std::atomic<int> wt_layer_names;
+
+/** @return true while any overlay may exist: one is attached, or a layer
+(which only an overlay can reference) is on disk. */
+inline bool wt_overlays_exist() {
+  return wt_overlay_spaces.load() > 0 || wt_layer_names.load() > 0;
+}
+
+/** @return true if the space is an overlay (its first file was opened) */
+bool fil_space_is_wt_overlay(space_id_t space_id);
+
 /** An overlay or live-linked space was freed: run layer GC after the DDL. */
 extern std::atomic<bool> wt_gc_wanted;
 

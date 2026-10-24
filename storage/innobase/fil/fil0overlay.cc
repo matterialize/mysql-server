@@ -26,6 +26,8 @@ Free Software Foundation.
 #include "srv0srv.h"
 
 bool srv_wt_overlay = false;
+std::atomic<int> wt_overlay_spaces{0};
+std::atomic<int> wt_layer_names{0};
 ulong srv_wt_mode = 0;
 
 namespace {
@@ -204,6 +206,7 @@ bool fil_wt_overlay_attach(fil_space_t *space, const wt_link_t &link,
   /* Only durable bytes may later read as "local, non-zero" (v3 §6.1 step 2). */
   (void)fsync(raw);
   space->wt_ov = ov;
+  wt_overlay_spaces.fetch_add(1);
   return true;
 }
 
@@ -227,8 +230,20 @@ bool fil_wt_read_chain(fil_space_t *space, page_no_t page_no,
   return true;
 }
 
+bool fil_space_is_wt_overlay(space_id_t space_id) {
+  /* Opening the file reads page 0, which tells (bit 15) and attaches. */
+  if (!fil_space_open(space_id)) return false;
+  fil_space_t *space = fil_space_acquire_silent(space_id);
+  if (space == nullptr) return false;
+  const bool overlay = space->wt_ov != nullptr ||
+                       (space->flags & FSP_FLAGS_MASK_WT_OVERLAY) != 0;
+  fil_space_release(space);
+  return overlay;
+}
+
 void fil_wt_overlay_free(fil_space_t *space) {
   if (space->wt_ov == nullptr) return;
+  wt_overlay_spaces.fetch_sub(1);
   if (!space->wt_ov->chain.empty()) wt_layer_release(space->wt_ov->chain[0]);
   ut::delete_(space->wt_ov);
   space->wt_ov = nullptr;

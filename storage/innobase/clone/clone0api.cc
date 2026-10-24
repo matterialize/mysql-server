@@ -33,6 +33,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <fstream>
 #include <iostream>
 
+#include "fil0overlay.h"
 #include "clone0api.h"
 #include "clone0clone.h"
 #include "os0thread-create.h"
@@ -394,6 +395,11 @@ static int get_ddl_timeout(THD *thd) {
 
 int innodb_clone_begin(handlerton *, THD *thd, const byte *&loc, uint &loc_len,
                        uint &task_id, Ha_clone_type type, Ha_clone_mode mode) {
+  /* A donor would copy the overlays' holes (overlay-v3 §5.3 row 13). */
+  if (wt_overlays_exist()) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0), "CLONE while worktree overlays exist");
+    return ER_NOT_SUPPORTED_YET;
+  }
   /* Check if reference locator is valid */
   if (loc != nullptr && !clone_validate_locator(loc, loc_len)) {
     int err = ER_CLONE_PROTOCOL;
@@ -783,6 +789,10 @@ int innodb_clone_end(handlerton *, THD *thd, const byte *loc, uint loc_len,
 int innodb_clone_apply_begin(handlerton *, THD *thd, const byte *&loc,
                              uint &loc_len, uint &task_id, Ha_clone_mode mode,
                              const char *data_dir) {
+  if (wt_overlays_exist()) {
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0), "CLONE while worktree overlays exist");
+    return ER_NOT_SUPPORTED_YET;
+  }
   /* Check if reference locator is valid */
   if (loc != nullptr && !clone_validate_locator(loc, loc_len)) {
     int err = ER_CLONE_PROTOCOL;

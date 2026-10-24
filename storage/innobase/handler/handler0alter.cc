@@ -46,6 +46,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include <sql_table.h>
 #include <sql_thd_internal_api.h>
 #include <sys/types.h>
+#include "fil0overlay.h"
 #include "btr0btr.h"
 #include "ha_prototypes.h"
 
@@ -1024,6 +1025,16 @@ while prepare_inplace_alter_table() is executing)
 enum_alter_inplace_result ha_innobase::check_if_supported_inplace_alter(
     TABLE *altered_table, Alter_inplace_info *ha_alter_info) {
   DBUG_TRACE;
+
+  /* Transparent page compression punches holes (overlay-v3 §5.3 row 12): an
+  overlay file keeps no COMPRESSION= in place; a copying ALTER makes a new
+  standalone file. */
+  if ((ha_alter_info->create_info->used_fields & HA_CREATE_USED_COMPRESS) &&
+      fil_space_is_wt_overlay(m_prebuilt->table->space)) {
+    ha_alter_info->unsupported_reason =
+        "COMPRESSION= on a worktree overlay table needs ALGORITHM=COPY";
+    return HA_ALTER_INPLACE_NOT_SUPPORTED;
+  }
 
   if (srv_sys_space.created_new_raw()) {
     return HA_ALTER_INPLACE_NOT_SUPPORTED;
@@ -11229,6 +11240,13 @@ func_exit:
 bool ha_innobase::bulk_load_check(THD *) const {
   /* Check if the table is empty (not even del-marked records). */
   dict_table_t *table = m_prebuilt->table;
+
+  /* The bulk loader writes past the buffer pool (overlay-v3 §5.3 row 2). */
+  if (fil_space_is_wt_overlay(table->space)) {
+    my_error(ER_FEATURE_UNSUPPORTED, MYF(0), "a worktree overlay table",
+             "LOAD DATA ALGORITHM = BULK");
+    return false;
+  }
 
   rec_format_t format = dict_tf_get_rec_format(table->flags);
 
