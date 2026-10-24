@@ -166,6 +166,14 @@ int sync_dir(const char *dir) {
   return ret;
 }
 
+/** Make #wtlayers with the first layer (durably), so a data directory that
+never had one stays as stock leaves it: --initialize refuses a non-empty one.
+@return false on error (errno set) */
+bool layer_dir_ready() {
+  if (mkdir(WT_LAYER_DIR, 0750) == 0) return sync_dir(".") == 0;
+  return errno == EEXIST;
+}
+
 using Id_map = std::vector<std::pair<space_index_t, space_index_t>>;
 
 /** Rewrite the two header pages of a clone: page 0 (new space id, primary
@@ -469,6 +477,7 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     /* F2 */
     const std::string uuid = wt_new_uuid();
     const std::string layer = wt_layer_path(uuid);
+    if (!layer_dir_ready()) return wt_os_error("create", WT_LAYER_DIR);
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
     wt_layer_names.fetch_add(1);
@@ -832,6 +841,7 @@ bool overlay_snapshot(Space_clone *c, bool live) {
   const std::string uuid = live ? wt_new_uuid() : std::string(c->link.uuid);
   if (live) {
     const std::string layer = wt_layer_path(uuid);
+    if (!layer_dir_ready()) return wt_os_error("create", WT_LAYER_DIR);
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
     wt_layer_names.fetch_add(1);
@@ -1327,8 +1337,7 @@ bool schema_read_only(THD *thd, const dd::Table &src) {
 bool innobase_wt_select_mode() {
   struct stat st;
   const bool have_dir = stat(WT_LAYER_DIR, &st) == 0;
-  /* Layer files, not the directory: an overlay-mode bootstrap leaves an
-  empty one. */
+  /* Layer files, not the directory: GC can leave an empty one. */
   bool have_layers = false;
   if (DIR *d = have_dir ? opendir(WT_LAYER_DIR) : nullptr; d != nullptr) {
     for (struct dirent *e; !have_layers && (e = readdir(d)) != nullptr;) {
@@ -1365,12 +1374,8 @@ bool innobase_wt_select_mode() {
     overlay = !cloned;
   }
   if (overlay) {
-    if (!have_dir && mkdir(WT_LAYER_DIR, 0750) != 0) {
-      ib::error() << "Cannot create " << WT_LAYER_DIR << ": " << strerror(errno);
-      return true;
-    }
-    /* Layers are hard links (v3 §3). */
-    const std::string a = std::string(WT_LAYER_DIR) + "/#probe", b = a + ".link";
+    /* Layers are hard links (v3 §3); #wtlayers waits for the first one. */
+    const std::string a = "#wt_probe_link", b = a + ".link";
     unlink(a.c_str());
     unlink(b.c_str());
     const int fd = open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
