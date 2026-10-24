@@ -2194,7 +2194,13 @@ static const byte *recv_parse_or_apply_log_rec_body(
     }
 
     case MLOG_WRITE_STRING: {
-      ut_ad(!page || page_type != FIL_PAGE_TYPE_ALLOCATED || page_no == 0);
+      /* A worktree first-dirty image (offset 4, the whole page) may land on
+      any page: flatten adopts inherited map overflow pages, which keep type
+      ALLOCATED (limits/overlay-v3.md §6.1, §8). */
+      ut_ad(!page || page_type != FIL_PAGE_TYPE_ALLOCATED || page_no == 0 ||
+            (end_ptr >= ptr + 4 && mach_read_from_2(ptr) == 4 &&
+             mach_read_from_2(ptr + 2) ==
+                 block->page.size.physical() - 4 - FIL_PAGE_DATA_END));
       bool is_encryption = check_encryption(page_no, space_id, ptr, end_ptr);
 
 #ifndef UNIV_HOTBACKUP

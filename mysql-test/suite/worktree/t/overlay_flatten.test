@@ -158,6 +158,34 @@ CHECK TABLE wf.f;
 DROP DATABASE wf;
 DROP DATABASE fsrc;
 
+--echo #
+--echo # 6. Flatten adopts inherited map overflow pages: a worktree of a worktree
+--echo #    of a 1 KB compressed table inherits its parent's overflow pages (map
+--echo #    data in pages of type ALLOCATED). kill -9 while adopting, before they
+--echo #    are flushed: recovery replays their images over the layer's copies.
+CREATE DATABASE osrc;
+CREATE TABLE osrc.z (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), KEY ka (a), KEY kb (b), KEY kc (c, a))
+  ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+INSERT INTO osrc.z WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+  SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13) FROM s;
+CREATE WORKTREE wo1 FROM osrc;
+CREATE WORKTREE wo2 FROM wo1;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wo2.z SET b = CONCAT('o', id) WHERE id % 41 = 0;
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_flatten_adopt';
+--error CR_SERVER_LOST
+ALTER WORKTREE wo2 MATERIALIZE;
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(b LIKE 'o%'), SUM(a) FROM wo2.z;
+CHECK TABLE wo2.z;
+ALTER WORKTREE wo2 MATERIALIZE;
+SELECT COUNT(*), SUM(b LIKE 'o%'), SUM(a) FROM wo2.z;
+CHECK TABLE wo2.z, wo1.z, osrc.z;
+DROP DATABASE wo2;
+DROP DATABASE wo1;
+DROP DATABASE osrc;
+
 DROP DATABASE wt3;
 DROP DATABASE wt2;
 DROP DATABASE wt;
