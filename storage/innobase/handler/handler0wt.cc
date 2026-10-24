@@ -266,7 +266,10 @@ struct Space_clone {
   dd::Object_id dd_space_id{dd::INVALID_OBJECT_ID};
   /* Overlay mode: the parent link (layer name, source size, F). */
   bool overlay{};
+  bool src_read_only{};
   wt_link_t link;
+  /* The source's operation slot, while this clone holds it. */
+  fil_space_t *slot{};
 };
 
 /** Phase 1 (before the quiesce): new identities and the DDL log entries that
@@ -310,10 +313,268 @@ bool prepare_clone(trx_t *trx, dict_table_t *src, const std::string &name,
   return false;
 }
 
-/** Overlay mode, read-only source (addendum A2): hard-link the source's live
-file into #wtlayers as the parent layer, and create the clone as a sparse file
-of the same size holding only pages 0 and 1 (rewritten in phase 3). */
-bool overlay_snapshot(Space_clone *c) {
+/** Overlay mode: excludes GC and other freezes during F0-F6, and guards the
+per-space operation slots (limits/overlay-v3.md §7.1). */
+std::mutex wt_layer_mutex;
+
+/** Take the operation slot of a space (v3 I8), waiting up to
+lock_wait_timeout. @return true on timeout (error reported) */
+bool wt_op_acquire(THD *thd, fil_space_t *space, uint8_t op) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(thd_lock_wait_timeout(thd));
+  for (;;) {
+    {
+      const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+      if (space->wt_op == 0) {
+        space->wt_op = op;
+        return false;
+      }
+    }
+    if (std::chrono::steady_clock::now() > deadline || thd_killed(thd)) {
+      my_error(ER_LOCK_WAIT_TIMEOUT, MYF(0));
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+}
+
+void wt_op_release(fil_space_t *space) {
+  const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+  space->wt_op = 0;
+}
+
+/** Read two header pages of a file, page 1 through the tablespace key. */
+bool read_header_pages(const std::string &path, const page_size_t &page_size,
+                       const Encryption_metadata &enc, byte *pages) {
+  const int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) return wt_os_error("open", path);
+  auto guard = create_scope_guard([fd]() { close(fd); });
+  pfs_os_file_t file;
+#ifdef UNIV_PFS_IO
+  file.m_psi = nullptr;
+#endif
+  file.m_file = fd;
+  const ulint len = page_size.physical();
+  IORequest read1(IORequest::READ);
+  if (enc.can_encrypt()) read1.get_encryption_info().set(enc);
+  if (pread(fd, pages, len, 0) != static_cast<ssize_t>(len) ||
+      os_file_read(read1, path.c_str(), file, pages + len, len, len) !=
+          DB_SUCCESS)
+    return wt_os_error("read header pages of", path);
+  return false;
+}
+
+/** The reuse rule (v3 §7.1): an overlay with nothing local but pages 0 and 1
+and nothing dirty can be linked through its own parent without a freeze. */
+bool overlay_reusable(fil_space_t *space) {
+  wt_overlay_t *ov = space->wt_ov;
+  if (ov == nullptr || space->size != ov->link.parent_size) return false;
+  {
+    const std::lock_guard<std::mutex> guard(ov->presence_mutex);
+    for (size_t p = 2; p < ov->presence.size(); ++p) {
+      if (ov->presence[p] != WT_ABSENT) return false;
+    }
+  }
+  ulint dirty = 0;
+  for (ulint i = 0; i < srv_buf_pool_instances; ++i) {
+    dirty += buf_pool_get_dirty_pages_count(buf_pool_from_array(i), space->id,
+                                            nullptr);
+  }
+  return dirty == 0;
+}
+
+/** Freeze a writable source (v3 §7.1 F0-F6, addendum A3): its current file
+becomes the immutable layer U, and the source continues, under the same space
+id, as an overlay over U. On success c->link is what a worktree of it links. */
+bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c) {
+  const space_id_t s = c->src->space;
+  fil_space_t *space = fil_space_acquire(s);
+  auto release = create_scope_guard([space]() { fil_space_release(space); });
+  const page_size_t page_size(space->flags);
+  const ulint len = page_size.physical();
+  const Encryption_metadata enc = space->m_encryption_metadata;
+
+  if (overlay_reusable(space)) {
+    c->link = space->wt_ov->link;
+    return false;
+  }
+
+  for (int attempt = 1;; ++attempt) {
+    std::unique_lock<std::mutex> layer_lock(wt_layer_mutex);
+    /* F0 */
+    if (srv_thread_is_active(srv_threads.m_trx_recovery_rollback))
+      return wt_error(
+          "CREATE WORKTREE in overlay mode while recovered transactions are "
+          "being rolled back");
+    space->wt_freezing.store(true);
+    auto unfreeze = create_scope_guard([space]() {
+      space->wt_freezing.store(false);
+    });
+
+    /* F1: every page with modification LSN <= F that was dirty is written. */
+    buf_LRU_flush_or_remove_pages(s, BUF_REMOVE_FLUSH_WRITE, trx);
+    fil_flush(s);
+    int64_t mc1;
+    page_no_t size1;
+    fil_wt_counters(s, &mc1, &size1);
+    const lsn_t F = log_get_lsn(*log_sys);
+
+    /* F2 */
+    const std::string uuid = wt_new_uuid();
+    const std::string layer = wt_layer_path(uuid);
+    if (link(c->src_path.c_str(), layer.c_str()) != 0)
+      return wt_os_error("hard-link the source as layer", layer);
+    if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
+    DBUG_EXECUTE_IF("wt_crash_freeze_after_link", DBUG_SUICIDE(););
+
+    /* F3: the new file: pages 0 and 1 (the witness), linking U. */
+    wt_link_t new_link;
+    snprintf(new_link.uuid, sizeof(new_link.uuid), "%s", uuid.c_str());
+    new_link.parent_space = s;
+    new_link.parent_size = size1;
+    new_link.freeze_lsn = F;
+    wt_map_t map;
+    if (const wt_map_t *old = fil_wt_map(space); old != nullptr) map = *old;
+    map.self = s;
+    if (map.generation == 0) map.generation = 1;
+    map.has_link = true;
+    map.link = new_link;
+
+    const std::string tmp = c->src_path + ".wttmp";
+    std::vector<byte> buf(3 * len + len);
+    byte *pages = reinterpret_cast<byte *>(ut_align(buf.data(), len));
+    if (read_header_pages(c->src_path, page_size, enc, pages)) return true;
+    byte *page0 = pages, *page1 = pages + len;
+    std::vector<byte> old0(page0, page0 + len), old1(page1, page1 + len);
+    /* An old overflow map stays where it is (now in U), read through it. */
+    ulint stub_len = 0;
+    std::vector<page_no_t> stub0, stub1;
+    const bool inline0 = wt_map_write(map, page0, page_size, 0);
+    bool ok = inline0 && wt_map_write(map, page1, page_size, 1);
+    if (!ok) {
+      ok = wt_overflow_pages_of(old0.data(), page_size, 0, &stub_len, &stub0) &&
+           wt_overflow_pages_of(old1.data(), page_size, 1, &stub_len, &stub1) &&
+           wt_stub_write(map, stub_len, stub0, page0, page_size, 0) &&
+           wt_stub_write(map, stub_len, stub1, page1, page_size, 1);
+    }
+    if (!ok) {
+      /* The map was inline: keep it inline in page 1 (larger), with a stub
+      in page 0 that carries the link. */
+      ok = wt_map_write(map, page1, page_size, 1) &&
+           wt_stub_write(map, 0, {}, page0, page_size, 0);
+    }
+    if (!ok)
+      return wt_error(
+          "CREATE WORKTREE: the source's map and link do not fit its page size");
+    mach_write_to_4(page0 + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS,
+                    fsp_header_get_flags(page0) | FSP_FLAGS_MASK_WT_OVERLAY);
+    wt_page_recalc_checksum(page0, page_size);
+    wt_page_recalc_checksum(page1, page_size);
+    {
+      const int fd = open(tmp.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0640);
+      if (fd < 0) return wt_os_error("create", tmp);
+      auto guard = create_scope_guard([fd]() { close(fd); });
+      pfs_os_file_t file;
+#ifdef UNIV_PFS_IO
+      file.m_psi = nullptr;
+#endif
+      file.m_file = fd;
+      IORequest write1(IORequest::WRITE);
+      if (enc.can_encrypt()) write1.get_encryption_info().set(enc);
+      if (pwrite(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
+          os_file_write(write1, tmp.c_str(), file, page1, len, len) !=
+              DB_SUCCESS ||
+          ftruncate(fd, os_offset_t{size1} * len) != 0 || fsync(fd) != 0)
+        return wt_os_error("write", tmp);
+    }
+    DBUG_EXECUTE_IF("wt_crash_freeze_after_tmp", DBUG_SUICIDE(););
+
+    /* F4 (a): latches before the gate closes. */
+    mtr_t mtr;
+    mtr.start();
+    mtr_x_lock_space(space, &mtr);
+    buf_block_t *b0 = buf_page_get(page_id_t(s, 0), page_size, RW_X_LATCH,
+                                   UT_LOCATION_HERE, &mtr);
+    buf_block_t *b1 = buf_page_get(page_id_t(s, 1), page_size, RW_X_LATCH,
+                                   UT_LOCATION_HERE, &mtr);
+    const auto abort = [&](const char *why) {
+      ib::info() << "Worktree freeze of " << space->name << " aborted (" << why
+                 << "), attempt " << attempt;
+      fil_wt_gate_open(s);
+      mtr.commit();
+      unlink(layer.c_str());
+      (void)sync_dir(WT_LAYER_DIR);
+      unlink(tmp.c_str());
+    };
+    /* (b) */
+    int64_t mc;
+    page_no_t size;
+    bool clean = fil_wt_gate_close(s, std::chrono::milliseconds(1000), &mc, &size);
+    /* (c) mtrs past the hook but not yet on the flush list */
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (clean && space->wt_commit_refs.load() != 0) {
+      if (std::chrono::steady_clock::now() > deadline) clean = false;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    DBUG_EXECUTE_IF("wt_freeze_force_abort", {
+      static int forced = 0;
+      if (forced++ == 0) clean = false;
+    });
+    /* (d) */
+    ulint dirty = 0;
+    for (ulint i = 0; clean && i < srv_buf_pool_instances; ++i) {
+      dirty += buf_pool_get_dirty_pages_count(buf_pool_from_array(i), s,
+                                              nullptr);
+    }
+    clean = clean && dirty == 0 && mc == mc1 && size == size1;
+    /* (e) */
+    clean = clean && fil_wt_flush_gated(s);
+    if (!clean) {
+      /* (f) */
+      abort("the source changed or was busy");
+      if (attempt < 3) continue;
+      return wt_error("CREATE WORKTREE: the source stayed busy during its freeze");
+    }
+    /* (g) the commit point */
+    if (rename(tmp.c_str(), c->src_path.c_str()) != 0) {
+      abort("rename failed");
+      return wt_os_error("rename", tmp);
+    }
+    const std::string dir = c->src_path.substr(0, c->src_path.rfind('/'));
+    if (sync_dir(dir.c_str()) != 0)
+      ib::fatal(UT_LOCATION_HERE) << "fsync of " << dir << " failed in a freeze";
+    DBUG_EXECUTE_IF("wt_crash_freeze_after_rename", DBUG_SUICIDE(););
+
+    /* F5: the source is now an overlay over U. */
+    if (!fil_wt_reopen_gated(s, new_link))
+      ib::fatal(UT_LOCATION_HERE)
+          << "Cannot reopen " << c->src_path << " after its freeze";
+    fil_wt_set(space, map);
+    for (auto [block, page] : {std::pair{b0, page0}, std::pair{b1, page1}}) {
+      memcpy(block->frame, page, len);
+      if (page_size.is_compressed()) memcpy(block->page.zip.data, page, len);
+    }
+    if (chmod(layer.c_str(), 0444) != 0)
+      ib::warn() << "chmod 0444 " << layer << ": " << strerror(errno);
+
+    /* F6 */
+    unfreeze.reset();
+    space->wt_freezing.store(false);
+    fil_wt_gate_open(s);
+    mtr.commit();
+    layer_lock.unlock();
+    DBUG_EXECUTE_IF("wt_crash_freeze_after_open", DBUG_SUICIDE(););
+    c->link = new_link;
+    return false;
+  }
+}
+
+/** Overlay mode (addendum A2): create the clone as a sparse file of the
+source's size holding only pages 0 and 1 (rewritten in phase 3). A read-only
+source's live file is hard-linked into #wtlayers as the parent layer; a
+writable source was frozen first and c->link already names its layer. */
+bool overlay_snapshot(Space_clone *c, bool live) {
   const int src = open(c->src_path.c_str(), O_RDONLY);
   if (src < 0) return wt_os_error("open", c->src_path);
   auto src_guard = create_scope_guard([src]() { close(src); });
@@ -323,12 +584,14 @@ bool overlay_snapshot(Space_clone *c) {
   const ulint len = page_size.physical();
   ut_a(st.st_size % len == 0);
 
-  const std::string uuid = wt_new_uuid();
-  const std::string layer = wt_layer_path(uuid);
-  if (link(c->src_path.c_str(), layer.c_str()) != 0)
-    return wt_os_error("hard-link the source as layer", layer);
-  if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
-  DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
+  const std::string uuid = live ? wt_new_uuid() : std::string(c->link.uuid);
+  if (live) {
+    const std::string layer = wt_layer_path(uuid);
+    if (link(c->src_path.c_str(), layer.c_str()) != 0)
+      return wt_os_error("hard-link the source as layer", layer);
+    if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
+    DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
+  }
 
   const int dst = open(c->tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
   if (dst < 0) return wt_os_error("create", c->tmp_path);
@@ -339,17 +602,19 @@ bool overlay_snapshot(Space_clone *c) {
       ftruncate(dst, st.st_size) != 0)
     return wt_os_error("write", c->tmp_path);
 
-  snprintf(c->link.uuid, sizeof(c->link.uuid), "%s", uuid.c_str());
-  c->link.parent_space = c->src->space;
-  c->link.parent_size = static_cast<page_no_t>(st.st_size / len);
-  /* The source is flushed: every page in its file has LSN <= F. */
-  c->link.freeze_lsn = log_get_lsn(*log_sys);
+  if (live) {
+    snprintf(c->link.uuid, sizeof(c->link.uuid), "%s", uuid.c_str());
+    c->link.parent_space = c->src->space;
+    c->link.parent_size = static_cast<page_no_t>(st.st_size / len);
+    /* The source is flushed: every page in its file has LSN <= F. */
+    c->link.freeze_lsn = log_get_lsn(*log_sys);
+  }
   return false;
 }
 
 /** Phase 2 (quiesced): merge the change buffer and flush the source so its
 file is a complete image, then reflink it under the temporary name. */
-bool snapshot_clone(trx_t *trx, Space_clone *c) {
+bool snapshot_clone(THD *thd, trx_t *trx, Space_clone *c) {
   const space_id_t space = c->src->space;
   while (ibuf_merge_space(space) != 0) {
   }
@@ -363,7 +628,16 @@ bool snapshot_clone(trx_t *trx, Space_clone *c) {
       fsp_sdi_get_root_page_num(space, page_size_t(c->src->flags), &mtr));
   mtr_commit(&mtr);
 
-  if (c->overlay) return overlay_snapshot(c);
+  if (c->overlay) {
+    /* The slot is held through phase 3 (v3 I8: no flatten meanwhile). */
+    fil_space_t *src = fil_space_acquire(c->src->space);
+    const bool busy = wt_op_acquire(thd, src, 1);
+    if (!busy) c->slot = src;
+    fil_space_release(src);
+    if (busy) return true;
+    if (c->src_read_only) return overlay_snapshot(c, true);
+    return overlay_freeze(thd, trx, c) || overlay_snapshot(c, false);
+  }
   if (reflink(c->src_path.c_str(), c->tmp_path.c_str()) != 0)
     return wt_reflink_error(c->tmp_path);
   return false;
@@ -575,8 +849,8 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
     return true;
   }
 
-  /* The source's live file is now a layer: never written again. */
-  if (c->overlay) {
+  /* A read-only source's live file is now a layer: never written again. */
+  if (c->overlay && c->src_read_only) {
     fil_space_t *src_space = fil_space_acquire(c->src->space);
     src_space->wt_linked = true;
     fil_space_release(src_space);
@@ -827,10 +1101,7 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   if (srv_read_only_mode) return wt_error("CREATE WORKTREE in read-only mode");
   const bool overlay = srv_wt_overlay;
   if (overlay && overlay_check_config()) return true;
-  if (overlay && !schema_read_only(thd, src_dd))
-    return wt_error(
-        "CREATE WORKTREE in overlay mode from a writable schema (not built "
-        "yet)");
+  const bool src_read_only = overlay && schema_read_only(thd, src_dd);
 
   trx_t *trx = check_trx_exists(thd);
   innobase_register_trx(hton, thd, trx);
@@ -951,6 +1222,14 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   auto fts_guard = create_scope_guard([&]() {
     if (has_fts) fts_hold(fts_src, false);
   });
+  auto slot_guard = create_scope_guard([&]() {
+    for (auto &c : clones) {
+      if (c.slot != nullptr) wt_op_release(c.slot);
+    }
+    for (auto &a : aux) {
+      if (a.clone.slot != nullptr) wt_op_release(a.clone.slot);
+    }
+  });
   DBUG_EXECUTE_IF("wt_crash_after_ddl_log", DBUG_SUICIDE(););
 
   /* Encrypted (§10.4): the clone shares the source's tablespace key, copied
@@ -965,9 +1244,16 @@ so both files carry the key encrypted under the same master key. */
 
   /* A live link must never be written again: purge must be done with every
   transaction that may still touch the source (addendum A2). */
-  for (auto &c : clones) c.overlay = overlay;
-  for (auto &a : aux) a.clone.overlay = overlay;
-  if (overlay && overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no()))
+  for (auto &c : clones) {
+    c.overlay = overlay;
+    c.src_read_only = src_read_only;
+  }
+  for (auto &a : aux) {
+    a.clone.overlay = overlay;
+    a.clone.src_read_only = src_read_only;
+  }
+  if (src_read_only &&
+      overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no()))
     return true;
 
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
@@ -980,10 +1266,10 @@ so both files carry the key encrypted under the same master key. */
       if (purge_stopped) trx_purge_run();
     });
     for (auto &c : clones) {
-      if (snapshot_clone(trx, &c)) return true;
+      if (snapshot_clone(thd, trx, &c)) return true;
     }
     for (auto &a : aux) {
-      if (snapshot_clone(trx, &a.clone)) return true;
+      if (snapshot_clone(thd, trx, &a.clone)) return true;
     }
   }
   DBUG_EXECUTE_IF("wt_crash_after_reflink", DBUG_SUICIDE(););

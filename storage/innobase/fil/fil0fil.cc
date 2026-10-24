@@ -93,6 +93,7 @@ The tablespace memory cache */
 #include <functional>
 #include <list>
 #include <mutex>
+#include <chrono>
 #include <thread>
 #include <tuple>
 #include <unordered_map>
@@ -2963,23 +2964,35 @@ bool Fil_shard::open_file(fil_node_t *file) {
                                               len, nullptr) == DB_SUCCESS;
       };
       const bool have0 = read(0, pages);
-      if (have0) {
-        fil_wt_load(space, pages, read(1, pages + len) ? pages + len : nullptr,
-                    read);
-      }
+      const bool have1 = have0 && read(1, pages + len);
       /* Overlay (bit 15): the parent chain is needed before any page of the
-      space can be read (v3 §6.1). The bit is the file's: a space created
-      from DD flags learns it here, before its first page read. */
+      space can be read, the map's overflow pages included (v3 §6.1). The bit
+      is the file's: a space created from DD flags learns it here. */
       if (have0 && (fsp_header_get_flags(pages) & FSP_FLAGS_MASK_WT_OVERLAY)) {
         space->flags |= FSP_FLAGS_MASK_WT_OVERLAY;
       }
       if ((space->flags & FSP_FLAGS_MASK_WT_OVERLAY) != 0 &&
-          space->wt_ov == nullptr &&
-          !fil_wt_overlay_attach(space, file->handle, file_size)) {
-        ut::aligned_free(pages);
-        os_file_close(file->handle);
-        file->is_open = false;
-        return false;
+          space->wt_ov == nullptr) {
+        wt_link_t link;
+        if (!(have0 && (wt_link_peek(pages, page_size, 0, &link) ||
+                        (have1 && wt_link_peek(pages + len, page_size, 1,
+                                               &link)))) ||
+            !fil_wt_overlay_attach(space, link, file->handle, file_size)) {
+          ib::error() << "Overlay tablespace file " << file->name
+                      << " has no usable link to its parent layer";
+          ut::aligned_free(pages);
+          os_file_close(file->handle);
+          file->is_open = false;
+          return false;
+        }
+      }
+      if (have0) {
+        const wt_page_reader routed = [&](page_no_t page_no, byte *buf) {
+          return read(page_no, buf) &&
+                 (space->wt_ov == nullptr ||
+                  fil_wt_read_chain(space, page_no, page_size, buf));
+        };
+        fil_wt_load(space, pages, have1 ? pages + len : nullptr, routed);
       }
       ut::aligned_free(pages);
     } else {
@@ -6510,6 +6523,13 @@ bool Fil_shard::space_extend(fil_space_t *space, page_no_t size) {
     mutex_acquire();
     space = get_space_by_id(space->id);
 
+    /* Overlay freeze gate (v3 §7.1 F4): no extension while it is closed. */
+    if (space->wt_gate) {
+      mutex_release();
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+      continue;
+    }
+
     /* Note:If the file is being opened for the first time then
     we don't have the file physical size. There is no guarantee
     that the file has been opened at this stage. */
@@ -7656,6 +7676,14 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
   mutex_acquire();
   auto space = get_space_by_id(page_id.space());
 
+  /* Overlay freeze gate (limits/overlay-v3.md §7.1 F4): new I/O waits. */
+  while (space != nullptr && space->wt_gate) {
+    mutex_release();
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    mutex_acquire();
+    space = get_space_by_id(page_id.space());
+  }
+
   /* If we are deleting a tablespace we don't allow async read
   operations on that. However, we do allow write operations and
   sync read operations. */
@@ -8078,6 +8106,15 @@ void Fil_shard::space_flush(space_id_t space_id) {
       /* Nothing to flush. Just return */
       return;
     }
+  }
+
+  /* Overlay freeze gate (v3 §7.1 F4): no fsync while it is closed. */
+  while (space->wt_gate) {
+    mutex_release();
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    mutex_acquire();
+    space = get_space_by_id(space_id);
+    if (space == nullptr) return;
   }
 
   /* Prevent dropping of the space while we are flushing */
@@ -11870,4 +11907,93 @@ bool fil_space_t::initialize_while_extending() {
   /* Don't initialize added space during bulk operation. The extended area
   would be explicitly flushed with data or zero filled pages. */
   return (tbsp_extend_and_initialize && !is_bulk_operation_in_progress());
+}
+
+/* Overlay freeze support (fil0overlay.h, limits/overlay-v3.md §7.1). */
+
+void fil_wt_counters(space_id_t space_id, int64_t *mc, page_no_t *size) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_space_t *space = shard->get_space_by_id(space_id);
+  *mc = space->files.front().modification_counter;
+  *size = space->size;
+  shard->mutex_release();
+}
+
+bool fil_wt_gate_close(space_id_t space_id, std::chrono::milliseconds timeout,
+                       int64_t *mc, page_no_t *size) {
+  auto shard = fil_system->shard_by_id(space_id);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  shard->mutex_acquire();
+  shard->get_space_by_id(space_id)->wt_gate = true;
+  for (;;) {
+    fil_space_t *space = shard->get_space_by_id(space_id);
+    const fil_node_t &file = space->files.front();
+    /* The condition stock waits for before deleting a space. */
+    if (file.n_pending_ios == 0 && file.n_pending_flushes == 0 &&
+        space->n_pending_flushes == 0 && !file.is_being_extended) {
+      *mc = file.modification_counter;
+      *size = space->size;
+      shard->mutex_release();
+      return true;
+    }
+    const bool late = std::chrono::steady_clock::now() > deadline;
+    shard->mutex_release();
+    if (late) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds(100));
+    shard->mutex_acquire();
+  }
+}
+
+void fil_wt_gate_open(space_id_t space_id) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_space_t *space = shard->get_space_by_id(space_id);
+  if (space != nullptr) space->wt_gate = false;
+  shard->mutex_release();
+}
+
+bool fil_wt_flush_gated(space_id_t space_id) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_node_t &file = shard->get_space_by_id(space_id)->files.front();
+  const bool open = file.is_open;
+  pfs_os_file_t handle = file.handle;
+  shard->mutex_release();
+  /* Gated and drained: nothing else uses the handle (v3 §5.5). */
+  return !open || os_file_flush(handle);
+}
+
+bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_space_t *space = shard->get_space_by_id(space_id);
+  fil_node_t &file = space->files.front();
+  bool success = true;
+  if (file.is_open) {
+    os_file_close(file.handle);
+    file.handle = os_file_create(innodb_data_file_key, file.name, OS_FILE_OPEN,
+                                 OS_DATA_FILE, srv_read_only_mode, &success);
+    if (!success) file.is_open = false;
+  }
+  file.flush_counter = file.modification_counter;
+  /* The new generation: chain U, presence from the new file's holes. */
+  space->flags |= FSP_FLAGS_MASK_WT_OVERLAY;
+  fil_wt_overlay_free(space);
+  if (success) {
+    pfs_os_file_t handle = file.handle;
+    bool opened_here = false;
+    if (!file.is_open) {
+      handle = os_file_create(innodb_data_file_key, file.name, OS_FILE_OPEN,
+                              OS_DATA_FILE, true, &success);
+      opened_here = success;
+    }
+    success = success &&
+              fil_wt_overlay_attach(space, link, handle,
+                                    os_file_get_size(handle));
+    if (opened_here) os_file_close(handle);
+  }
+  ++space->wt_gen;
+  shard->mutex_release();
+  return success;
 }

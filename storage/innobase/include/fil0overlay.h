@@ -19,6 +19,7 @@ Free Software Foundation.
 #define fil0overlay_h
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -84,12 +85,19 @@ struct wt_overlay_t {
   void set(page_no_t page_no, wt_presence_t state);
 };
 
-/** Attach the chain of an overlay space (its map carries the link) and
-initialize presence from the file's holes. Called when its first file is
-opened, after the map is loaded.
+/** Attach the chain of an overlay space and initialize presence from the
+file's holes. Called when its first file is opened, before its map is loaded
+(the map's overflow pages may be in the chain).
 @return false if a layer is unusable (the caller fails the open) */
-bool fil_wt_overlay_attach(fil_space_t *space, const pfs_os_file_t &fd,
-                           os_offset_t file_size);
+bool fil_wt_overlay_attach(fil_space_t *space, const wt_link_t &link,
+                           const pfs_os_file_t &fd, os_offset_t file_size);
+
+/** If buf (page_no of space, as read from the local file) is all zeros,
+replace it with the page from the chain. For metadata reads at open (the
+map's overflow pages), outside the buffer pool.
+@return false on a read error */
+bool fil_wt_read_chain(fil_space_t *space, page_no_t page_no,
+                       const page_size_t &page_size, byte *buf);
 
 /** Free the overlay state of a space being freed. */
 void fil_wt_overlay_free(fil_space_t *space);
@@ -144,5 +152,25 @@ std::string wt_new_uuid();
 
 /** @return path of a layer file */
 std::string wt_layer_path(const std::string &uuid);
+
+/* Freeze support in fil0fil.cc (limits/overlay-v3.md §7.1). */
+
+/** Read the file's modification counter and the space size (F1). */
+void fil_wt_counters(space_id_t space_id, int64_t *mc, page_no_t *size);
+
+/** Close the freeze gate and drain pending I/O, fsync and extension (F4b).
+@return false on timeout; the gate is then still closed */
+bool fil_wt_gate_close(space_id_t space_id, std::chrono::milliseconds timeout,
+                       int64_t *mc, page_no_t *size);
+
+/** Open the gate (F6, or abort). */
+void fil_wt_gate_open(space_id_t space_id);
+
+/** fsync the old file under the closed gate (F4e). */
+bool fil_wt_flush_gated(space_id_t space_id);
+
+/** Swap the space's handle to the file now at its path, and attach its new
+chain (F5a, F5b, F5d). */
+bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link);
 
 #endif /* fil0overlay_h */

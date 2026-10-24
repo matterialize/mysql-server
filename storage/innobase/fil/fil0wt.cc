@@ -47,6 +47,10 @@ constexpr ulint WT_HDR_SIZE = 32;
 /* Overflow stub: magic, map length, n_pages, crc, then (CRC-covered) self,
 generation and the page numbers. */
 constexpr uint32_t WT_STUB_MAGIC = 0x57544F31; /* "WTO1" */
+/* "WTO2": a stub followed by the overlay link. Its pages may be holes, read
+through the chain (a frozen file's map pages live in its layer), and no pages
+means the map is page 1's inline map. */
+constexpr uint32_t WT_STUB_MAGIC_LINK = 0x57544F32;
 constexpr ulint WT_STUB_LEN = 4;
 constexpr ulint WT_STUB_N_PAGES = 8;
 constexpr ulint WT_STUB_CRC = 12;
@@ -107,6 +111,11 @@ bool wt_map_parse(const byte *p, ulint avail, wt_map_t *map) {
   map->has_link = has_link;
   map->link = wt_link_t{};
   if (has_link) {
+    /* A layer name is 32 lowercase hex digits: never a path. */
+    for (ulint i = 0; i < 32; ++i) {
+      const byte ch = q[i];
+      if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+    }
     memcpy(map->link.uuid, q, 32);
     map->link.uuid[32] = '\0';
     map->link.parent_space = mach_read_from_4(q + 32);
@@ -120,13 +129,34 @@ bool wt_map_parse(const byte *p, ulint avail, wt_map_t *map) {
 /** Parse an overflow stub; pages may be nullptr. */
 bool wt_stub_parse(const byte *p, ulint avail, space_id_t *self,
                    uint64_t *generation, ulint *map_len,
-                   std::vector<page_no_t> *pages) {
-  if (avail < WT_STUB_SIZE || mach_read_from_4(p) != WT_STUB_MAGIC) return false;
+                   std::vector<page_no_t> *pages, wt_link_t *link = nullptr) {
+  if (avail < WT_STUB_SIZE) return false;
+  const uint32_t magic = mach_read_from_4(p);
+  if (magic != WT_STUB_MAGIC && magic != WT_STUB_MAGIC_LINK) return false;
+  const bool has_link = magic == WT_STUB_MAGIC_LINK;
   const ulint n = mach_read_from_4(p + WT_STUB_N_PAGES);
-  if (n == 0 || WT_STUB_SIZE + n * 4 > avail ||
+  const ulint extra = has_link ? WT_LINK_BYTES : 0;
+  if ((n == 0 && !has_link) || n > avail ||
+      WT_STUB_SIZE + n * 4 + extra > avail ||
       mach_read_from_4(p + WT_STUB_CRC) !=
-          ut_crc32(p + WT_STUB_SELF, WT_STUB_SIZE - WT_STUB_SELF + n * 4)) {
+          ut_crc32(p + WT_STUB_SELF,
+                   WT_STUB_SIZE - WT_STUB_SELF + n * 4 + extra)) {
     return false;
+  }
+  if (link != nullptr) {
+    *link = wt_link_t{};
+    if (has_link) {
+      const byte *q = p + WT_STUB_SIZE + n * 4;
+      for (ulint i = 0; i < 32; ++i) {
+        const byte ch = q[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+      }
+      memcpy(link->uuid, q, 32);
+      link->uuid[32] = '\0';
+      link->parent_space = mach_read_from_4(q + 32);
+      link->parent_size = mach_read_from_4(q + 36);
+      link->freeze_lsn = mach_read_from_8(q + 40);
+    }
   }
   *self = mach_read_from_4(p + WT_STUB_SELF);
   *generation = mach_read_from_8(p + WT_STUB_GENERATION);
@@ -188,14 +218,33 @@ bool wt_map_read(const byte *page, const page_size_t &page_size,
   uint64_t generation;
   ulint len;
   std::vector<page_no_t> pages;
-  if (!read || !wt_stub_parse(p, avail, &self, &generation, &len, &pages))
+  wt_link_t link;
+  if (!read ||
+      !wt_stub_parse(p, avail, &self, &generation, &len, &pages, &link))
     return false;
-  const ulint cap = wt_overflow_capacity(page_size);
-  if (len > pages.size() * cap) return false;
-
-  std::vector<byte> bytes;
+  const bool has_link = link.uuid[0] != '\0';
   auto buf = static_cast<byte *>(
       ut::aligned_alloc(page_size.physical(), page_size.physical()));
+  if (pages.empty()) {
+    /* The map is page 1's inline map; the stub's link is the current one. */
+    const bool ok = page_no == 0 && read(1, buf) &&
+                    wt_map_parse(buf + wt_map_offset(page_size, 1),
+                                 wt_map_size(page_size, 1), map) &&
+                    map->self == self && map->generation == generation;
+    ut::aligned_free(buf);
+    if (ok) {
+      map->has_link = true;
+      map->link = link;
+    }
+    return ok;
+  }
+  const ulint cap = wt_overflow_capacity(page_size);
+  if (len > pages.size() * cap) {
+    ut::aligned_free(buf);
+    return false;
+  }
+
+  std::vector<byte> bytes;
   bool ok = true;
   for (page_no_t no : pages) {
     if (!read(no, buf) || mach_read_from_4(buf + FIL_PAGE_OFFSET) != no ||
@@ -206,8 +255,43 @@ bool wt_map_read(const byte *page, const page_size_t &page_size,
     bytes.insert(bytes.end(), buf + FIL_PAGE_DATA, buf + FIL_PAGE_DATA + cap);
   }
   ut::aligned_free(buf);
-  return ok && wt_map_parse(bytes.data(), len, map) && map->self == self &&
-         map->generation == generation;
+  ok = ok && wt_map_parse(bytes.data(), len, map) && map->self == self &&
+       map->generation == generation;
+  /* A stub's link is the current one (a frozen file keeps its old map pages
+  in its layer, with the link they had then). */
+  if (ok && has_link) {
+    map->has_link = true;
+    map->link = link;
+  }
+  return ok;
+}
+
+bool wt_overflow_pages_of(const byte *page, const page_size_t &page_size,
+                          page_no_t page_no, ulint *map_len,
+                          std::vector<page_no_t> *pages) {
+  space_id_t self;
+  uint64_t generation;
+  return wt_stub_parse(page + wt_map_offset(page_size, page_no),
+                       wt_map_size(page_size, page_no), &self, &generation,
+                       map_len, pages) &&
+         !pages->empty();
+}
+
+bool wt_link_peek(const byte *page, const page_size_t &page_size,
+                  page_no_t page_no, wt_link_t *link) {
+  const byte *p = page + wt_map_offset(page_size, page_no);
+  const ulint avail = wt_map_size(page_size, page_no);
+  wt_map_t map;
+  if (wt_map_parse(p, avail, &map)) {
+    if (!map.has_link) return false;
+    *link = map.link;
+    return true;
+  }
+  space_id_t self;
+  uint64_t generation;
+  ulint len;
+  return wt_stub_parse(p, avail, &self, &generation, &len, nullptr, link) &&
+         link->uuid[0] != '\0';
 }
 
 std::vector<byte> wt_map_serialize(const wt_map_t &map) {
@@ -267,11 +351,13 @@ ulint wt_overflow_capacity(const page_size_t &page_size) {
 bool wt_stub_write(const wt_map_t &map, ulint map_len,
                    const std::vector<page_no_t> &pages, byte *page,
                    const page_size_t &page_size, page_no_t page_no) {
-  if (WT_STUB_SIZE + pages.size() * 4 > wt_map_size(page_size, page_no))
+  const ulint extra = map.has_link ? WT_LINK_BYTES : 0;
+  if (WT_STUB_SIZE + pages.size() * 4 + extra > wt_map_size(page_size, page_no))
     return false;
+  ut_a(!pages.empty() || map.has_link);
   byte *p = page + wt_map_offset(page_size, page_no);
   memset(p, 0, wt_map_size(page_size, page_no));
-  mach_write_to_4(p, WT_STUB_MAGIC);
+  mach_write_to_4(p, map.has_link ? WT_STUB_MAGIC_LINK : WT_STUB_MAGIC);
   mach_write_to_4(p + WT_STUB_LEN, map_len);
   mach_write_to_4(p + WT_STUB_N_PAGES, pages.size());
   mach_write_to_4(p + WT_STUB_SELF, map.self);
@@ -279,9 +365,17 @@ bool wt_stub_write(const wt_map_t &map, ulint map_len,
   for (ulint i = 0; i < pages.size(); ++i) {
     mach_write_to_4(p + WT_STUB_SIZE + i * 4, pages[i]);
   }
+  if (map.has_link) {
+    byte *q = p + WT_STUB_SIZE + pages.size() * 4;
+    memcpy(q, map.link.uuid, 32);
+    mach_write_to_4(q + 32, map.link.parent_space);
+    mach_write_to_4(q + 36, map.link.parent_size);
+    mach_write_to_8(q + 40, map.link.freeze_lsn);
+  }
   mach_write_to_4(p + WT_STUB_CRC,
                   ut_crc32(p + WT_STUB_SELF,
-                           WT_STUB_SIZE - WT_STUB_SELF + pages.size() * 4));
+                           WT_STUB_SIZE - WT_STUB_SELF + pages.size() * 4 +
+                               extra));
   return true;
 }
 

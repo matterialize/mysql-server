@@ -72,7 +72,12 @@ namespace {
 /** Open one layer file (registry mutex held). Its parents are acquired by
 the caller, which knows them from the layer's own map. */
 wt_layer_t *layer_open(const std::string &uuid, const page_size_t &page_size,
-                       const Encryption_metadata &enc) {
+                       const Encryption_metadata &enc, size_t depth = 0) {
+  /* Chains are capped (addendum A5); a damaged link can't recurse forever. */
+  if (depth > WT_MAX_ANCESTORS) {
+    ib::error() << "Worktree layer chain through " << uuid << " is too deep";
+    return nullptr;
+  }
   auto it = wt_registry.find(uuid);
   if (it != wt_registry.end()) {
     ++it->second->refs;
@@ -119,7 +124,7 @@ wt_layer_t *layer_open(const std::string &uuid, const page_size_t &page_size,
       ut::delete_(layer);
       return nullptr;
     }
-    layer->parent = layer_open(map.link.uuid, page_size, enc);
+    layer->parent = layer_open(map.link.uuid, page_size, enc, depth + 1);
     if (layer->parent == nullptr) {
       ut::aligned_free(buf);
       os_file_close(fd);
@@ -153,33 +158,34 @@ void wt_layer_release(wt_layer_t *layer) {
   layer_release_low(layer);
 }
 
-bool fil_wt_overlay_attach(fil_space_t *space, const pfs_os_file_t &fd,
-                           os_offset_t file_size) {
-  const wt_map_t *map = space->wt_map;
-  if (map == nullptr || !map->has_link) {
-    ib::error() << "Overlay tablespace " << space->name
-                << " has no valid link to its parent layer";
-    return false;
-  }
+bool fil_wt_overlay_attach(fil_space_t *space, const wt_link_t &link,
+                           const pfs_os_file_t &fd, os_offset_t file_size) {
   const page_size_t page_size(space->flags);
   wt_layer_t *top;
   {
     const std::lock_guard<std::mutex> guard(wt_registry_mutex);
-    top = layer_open(map->link.uuid, page_size, space->m_encryption_metadata);
+    top = layer_open(link.uuid, page_size, space->m_encryption_metadata);
   }
   if (top == nullptr) return false;
 
+  if (link.parent_size > top->size) {
+    ib::error() << "Overlay tablespace " << space->name << " links "
+                << link.parent_size << " pages of a " << top->size
+                << "-page layer";
+    wt_layer_release(top);
+    return false;
+  }
   auto ov = ut::new_withkey<wt_overlay_t>(UT_NEW_THIS_FILE_PSI_KEY);
-  ov->link = map->link;
+  ov->link = link;
   for (wt_layer_t *l = top; l != nullptr; l = l->parent) ov->chain.push_back(l);
-  ov->presence.assign(map->link.parent_size, WT_UNKNOWN);
+  ov->presence.assign(link.parent_size, WT_UNKNOWN);
 
   /* Holes are ABSENT; data pages stay UNKNOWN until read (an allocated page
   may still be zero). Pages 0 and 1 are always local. */
   const int raw = fd.m_file;
   const os_offset_t len = page_size.physical();
   const os_offset_t end =
-      std::min<os_offset_t>(file_size, os_offset_t{map->link.parent_size} * len);
+      std::min<os_offset_t>(file_size, os_offset_t{link.parent_size} * len);
   os_offset_t pos = 0;
   while (pos < end) {
     const off_t data = lseek(raw, pos, SEEK_DATA);
@@ -198,6 +204,26 @@ bool fil_wt_overlay_attach(fil_space_t *space, const pfs_os_file_t &fd,
   /* Only durable bytes may later read as "local, non-zero" (v3 §6.1 step 2). */
   (void)fsync(raw);
   space->wt_ov = ov;
+  return true;
+}
+
+bool fil_wt_read_chain(fil_space_t *space, page_no_t page_no,
+                       const page_size_t &page_size, byte *buf) {
+  wt_overlay_t *ov = space->wt_ov;
+  const ulint len = page_size.physical();
+  if (page_no == 0 || page_no >= ov->presence.size() || !is_zero(buf, len))
+    return true;
+  for (wt_layer_t *layer : ov->chain) {
+    if (page_no >= layer->size) continue;
+    IORequest req(IORequest::READ);
+    if (space->m_encryption_metadata.can_encrypt())
+      req.get_encryption_info().set(space->m_encryption_metadata);
+    if (os_file_read_no_error_handling(req, layer->path.c_str(), layer->fd, buf,
+                                       os_offset_t{page_no} * len, len,
+                                       nullptr) != DB_SUCCESS)
+      return false;
+    if (!is_zero(buf, len)) return true;
+  }
   return true;
 }
 

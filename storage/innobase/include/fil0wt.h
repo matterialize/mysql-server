@@ -114,6 +114,19 @@ recomputes the checksum).
 ulint wt_map_offset(const page_size_t &page_size, page_no_t page_no);
 ulint wt_map_size(const page_size_t &page_size, page_no_t page_no);
 
+/** The overlay link of header page page_no, from its inline map or its
+stub, without reading anything else (the chain must be attached before the
+map's overflow pages can be read).
+@return true if the page carries a link */
+bool wt_link_peek(const byte *page, const page_size_t &page_size,
+                  page_no_t page_no, wt_link_t *link);
+
+/** The overflow pages and map length named by the stub in header page
+page_no. @return false if the page has no stub with pages */
+bool wt_overflow_pages_of(const byte *page, const page_size_t &page_size,
+                          page_no_t page_no, ulint *map_len,
+                          std::vector<page_no_t> *pages);
+
 /** The map in its on-disk format, for overflow pages. */
 std::vector<byte> wt_map_serialize(const wt_map_t &map);
 
