@@ -1,0 +1,131 @@
+--echo # Encrypted tables (fork-design.md §10.4): the clone keeps the source's
+--echo # tablespace key, copied with page 0 (never encrypted), and its pages
+--echo # stay encrypted on disk. CREATE WORKTREE writes no .cfg or .cfp file,
+--echo # which would hold the tablespace key in the clear. Master key rotation
+--echo # re-encrypts the key in both files.
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+--source include/have_component_keyring_file.inc
+--source suite/component_keyring_file/inc/setup_component.inc
+
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+SET SESSION cte_max_recursion_depth = 100000;
+
+CREATE DATABASE src DEFAULT ENCRYPTION = 'Y';
+CREATE TABLE src.e (id INT PRIMARY KEY, v VARCHAR(100), w INT, KEY kv (v), KEY kw (w)) ENCRYPTION = 'Y';
+INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+  SELECT n, CONCAT('plaintext-marker-', n), n % 7 FROM s;
+--echo # Encrypted and compressed at 1 KB: the map is in overflow pages, which
+--echo # are encrypted like any other page.
+CREATE TABLE src.ez (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY ka (a), KEY kb (b), KEY kc (c))
+  ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1 ENCRYPTION = 'Y';
+INSERT INTO src.ez WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+  SELECT n, n % 11, CONCAT('zmarker-', n), n * 2 FROM s;
+CREATE TABLE src.p (id INT PRIMARY KEY, v VARCHAR(20)) ENCRYPTION = 'N';
+INSERT INTO src.p VALUES (1, 'plain');
+
+--echo # No .cfg or .cfp at any point, including while the source is quiesced.
+connect (con1, localhost, root,,);
+SET DEBUG_SYNC = 'wt_after_snapshot SIGNAL snapped WAIT_FOR go';
+send CREATE WORKTREE wt FROM src;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR snapped';
+--echo # files matching *.cf? in src and wt while quiesced:
+--list_files $datadir/src *.cf?
+--list_files $datadir/wt *.cf?
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+disconnect con1;
+connection default;
+SET DEBUG_SYNC = 'RESET';
+--echo # files matching *.cf? in src and wt afterwards:
+--list_files $datadir/src *.cf?
+--list_files $datadir/wt *.cf?
+
+SHOW CREATE DATABASE wt;
+SELECT NAME, ENCRYPTION FROM information_schema.INNODB_TABLESPACES WHERE NAME LIKE 'wt/%' ORDER BY NAME;
+SHOW CREATE TABLE wt.e;
+CHECKSUM TABLE src.e, src.ez, src.p;
+CHECKSUM TABLE wt.e, wt.ez, wt.p;
+CHECK TABLE wt.e, wt.ez, wt.p;
+
+--echo # The worktree writes; its pages reach disk encrypted, with the shared key.
+INSERT INTO wt.e VALUES (100000, 'worktree-secret-xyz', 1);
+UPDATE wt.ez SET b = CONCAT('wt-', b) WHERE id <= 1000;
+UPDATE src.e SET v = CONCAT('src-', v) WHERE id <= 10;
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/shutdown_mysqld.inc
+perl;
+  my $dd = $ENV{WT_DD};
+  # Encryption info in page 0: after the XDES array (150 + 40 * physical / 64).
+  sub info { my ($f, $ps) = @_; open(my $h, '<:raw', $f) or die "$f: $!"; my $p;
+    sysread($h, $p, $ps); return substr($p, 150 + 40 * $ps / 64, 115); }
+  sub has { my ($f, $s) = @_; open(my $h, '<:raw', $f) or die "$f: $!"; local $/; my $d = <$h>;
+    return index($d, $s) >= 0 ? 'yes' : 'no'; }
+  for my $t (['e', 16384], ['ez', 1024]) {
+    my ($n, $ps) = @$t;
+    my ($a, $b) = (info("$dd/src/$n.ibd", $ps), info("$dd/wt/$n.ibd", $ps));
+    printf("%s: encryption info present: %s, tablespace key same as source: %s\n", $n,
+           substr($b, 0, 3) =~ /^lC[A-C]$/ ? 'yes' : 'no', $a eq $b ? 'yes' : 'no');
+    open(my $o, '>', "$ENV{MYSQLTEST_VARDIR}/tmp/info_$n") or die; print $o $b; close($o);
+  }
+  print "plaintext in wt/e.ibd: ", has("$dd/wt/e.ibd", 'plaintext-marker-'), "\n";
+  print "worktree write in clear in wt/e.ibd: ", has("$dd/wt/e.ibd", 'worktree-secret-xyz'), "\n";
+  print "plaintext in wt/ez.ibd: ", has("$dd/wt/ez.ibd", 'zmarker-'), "\n";
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM src.e;
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM wt.e;
+SELECT SUM(b LIKE 'wt-%') FROM src.ez;
+SELECT SUM(b LIKE 'wt-%') FROM wt.ez FORCE INDEX (kb);
+
+--echo # Master key rotation re-encrypts the tablespace key in both files.
+ALTER INSTANCE ROTATE INNODB MASTER KEY;
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/shutdown_mysqld.inc
+perl;
+  my $dd = $ENV{WT_DD};
+  sub info { my ($f, $ps) = @_; open(my $h, '<:raw', $f) or die "$f: $!"; my $p;
+    sysread($h, $p, $ps); return substr($p, 150 + 40 * $ps / 64, 115); }
+  for my $t (['e', 16384], ['ez', 1024]) {
+    my ($n, $ps) = @$t;
+    open(my $i, '<', "$ENV{MYSQLTEST_VARDIR}/tmp/info_$n") or die; local $/; my $old = <$i>;
+    my ($a, $b) = (info("$dd/src/$n.ibd", $ps), info("$dd/wt/$n.ibd", $ps));
+    my ($ka, $kb, $ko) = map { unpack('N', substr($_, 3, 4)) } ($a, $b, $old);
+    printf("%s: master key id src == wt: %s, rotated: %s\n", $n, $ka == $kb ? 'yes' : 'no',
+           $kb != $ko && $b ne $old ? 'yes' : 'no');
+  }
+EOF
+--source include/start_mysqld.inc
+SET SESSION cte_max_recursion_depth = 100000;
+CHECK TABLE src.e, src.ez, wt.e, wt.ez;
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM wt.e FORCE INDEX (kv);
+SELECT COUNT(*), SUM(b LIKE 'wt-%') FROM wt.ez FORCE INDEX (kb);
+INSERT INTO wt.e VALUES (100001, 'after-rotation', 2);
+INSERT INTO src.e VALUES (100001, 'src-after-rotation', 2);
+
+--echo # A worktree of the worktree, after the rotation.
+CREATE WORKTREE wt2 FROM wt;
+--source include/restart_mysqld.inc
+SELECT NAME, ENCRYPTION FROM information_schema.INNODB_TABLESPACES WHERE NAME LIKE 'wt2/%' ORDER BY NAME;
+SELECT v FROM wt2.e WHERE id = 100001;
+SELECT v FROM src.e WHERE id = 100001;
+CHECKSUM TABLE wt.e, wt.ez;
+CHECKSUM TABLE wt2.e, wt2.ez;
+CHECK TABLE wt2.e, wt2.ez, wt2.p;
+
+--echo # Control: stock FOR EXPORT does write them, and the listing shows them.
+FLUSH TABLES src.e FOR EXPORT;
+--list_files $datadir/src *.cf?
+UNLOCK TABLES;
+
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+--remove_file $MYSQLTEST_VARDIR/tmp/info_e
+--remove_file $MYSQLTEST_VARDIR/tmp/info_ez
+--source suite/component_keyring_file/inc/teardown_component.inc

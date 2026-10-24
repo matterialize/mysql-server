@@ -44,6 +44,7 @@ Free Software Foundation.
 #include "mysqld_error.h"
 #include "scope_guard.h"
 #include "sql/dd/dd.h"
+#include "sql/debug_sync.h"
 #include "sql/dd/dictionary.h"
 #include "sql/dd/impl/sdi.h"
 #include "sql/dd/types/column.h"
@@ -762,6 +763,7 @@ so both files carry the key encrypted under the same master key. */
     }
   }
   DBUG_EXECUTE_IF("wt_crash_after_reflink", DBUG_SUICIDE(););
+  DEBUG_SYNC(thd, "wt_after_snapshot");
 
   for (size_t i = 0; i < clones.size(); ++i) {
     const dd::Object_id src_space =

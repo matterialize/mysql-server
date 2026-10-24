@@ -116,7 +116,9 @@ bool wt_stub_parse(const byte *p, ulint avail, space_id_t *self,
   if (pages != nullptr) {
     pages->clear();
     for (ulint i = 0; i < n; ++i) {
-      pages->push_back(mach_read_from_4(p + WT_STUB_SIZE + i * 4));
+      const page_no_t no = mach_read_from_4(p + WT_STUB_SIZE + i * 4);
+      if (no <= 1 || no == FIL_NULL) return false;
+      pages->push_back(no);
     }
   }
   return true;

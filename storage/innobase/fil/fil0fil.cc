@@ -2950,9 +2950,11 @@ bool Fil_shard::open_file(fil_node_t *file) {
         if (page_no != 0 && space->m_encryption_metadata.can_encrypt()) {
           request.get_encryption_info().set(space->m_encryption_metadata);
         }
-        return os_offset_t{page_no + 1} * len <= file_size &&
-               os_file_read(request, file->name, file->handle, buf,
-                            os_offset_t{page_no} * len, len) == DB_SUCCESS;
+        /* Speculative metadata reads: a damaged map must not abort startup. */
+        return (os_offset_t{page_no} + 1) * len <= file_size &&
+               os_file_read_no_error_handling(request, file->name, file->handle,
+                                              buf, os_offset_t{page_no} * len,
+                                              len, nullptr) == DB_SUCCESS;
       };
       if (read(0, pages)) {
         fil_wt_load(space, pages, read(1, pages + len) ? pages + len : nullptr,

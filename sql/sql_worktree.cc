@@ -469,6 +469,10 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   if (create_info.default_table_charset != nullptr) {
     create_info.used_fields |= HA_CREATE_USED_DEFAULT_CHARSET;
   }
+  /* DEFAULT ENCRYPTION, checked like an explicit CREATE DATABASE option. */
+  create_info.encrypt_type = src_schema->default_encryption()
+                                 ? LEX_STRING{const_cast<char *>("Y"), 1}
+                                 : LEX_STRING{const_cast<char *>("N"), 1};
 
   const auto populate = [&]() -> bool {
     if (lock_tables(thd, in_schema(wt, names), MDL_EXCLUSIVE)) return true;

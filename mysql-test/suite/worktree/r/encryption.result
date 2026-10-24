@@ -1,0 +1,153 @@
+# Encrypted tables (fork-design.md §10.4): the clone keeps the source's
+# tablespace key, copied with page 0 (never encrypted), and its pages
+# stay encrypted on disk. CREATE WORKTREE writes no .cfg or .cfp file,
+# which would hold the tablespace key in the clear. Master key rotation
+# re-encrypts the key in both files.
+# ----------------------------------------------------------------------
+# Setup
+# Creating local configuration file for keyring component: component_keyring_file
+# Creating manifest file for current MySQL server instance
+# Re-starting mysql server with manifest file
+# ----------------------------------------------------------------------
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src DEFAULT ENCRYPTION = 'Y';
+CREATE TABLE src.e (id INT PRIMARY KEY, v VARCHAR(100), w INT, KEY kv (v), KEY kw (w)) ENCRYPTION = 'Y';
+INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+SELECT n, CONCAT('plaintext-marker-', n), n % 7 FROM s;
+# Encrypted and compressed at 1 KB: the map is in overflow pages, which
+# are encrypted like any other page.
+CREATE TABLE src.ez (id INT PRIMARY KEY, a INT, b VARCHAR(40), c INT, KEY ka (a), KEY kb (b), KEY kc (c))
+ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1 ENCRYPTION = 'Y';
+INSERT INTO src.ez WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 11, CONCAT('zmarker-', n), n * 2 FROM s;
+CREATE TABLE src.p (id INT PRIMARY KEY, v VARCHAR(20)) ENCRYPTION = 'N';
+Warnings:
+Warning	3824	Creating an unencrypted table in a database with default encryption enabled.
+INSERT INTO src.p VALUES (1, 'plain');
+# No .cfg or .cfp at any point, including while the source is quiesced.
+SET DEBUG_SYNC = 'wt_after_snapshot SIGNAL snapped WAIT_FOR go';
+CREATE WORKTREE wt FROM src;
+SET DEBUG_SYNC = 'now WAIT_FOR snapped';
+# files matching *.cf? in src and wt while quiesced:
+SET DEBUG_SYNC = 'now SIGNAL go';
+SET DEBUG_SYNC = 'RESET';
+# files matching *.cf? in src and wt afterwards:
+SHOW CREATE DATABASE wt;
+Database	Create Database
+wt	CREATE DATABASE `wt` /*!40100 DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci */ /*!80016 DEFAULT ENCRYPTION='Y' */
+SELECT NAME, ENCRYPTION FROM information_schema.INNODB_TABLESPACES WHERE NAME LIKE 'wt/%' ORDER BY NAME;
+NAME	ENCRYPTION
+wt/e	Y
+wt/ez	Y
+wt/p	N
+SHOW CREATE TABLE wt.e;
+Table	Create Table
+e	CREATE TABLE `e` (
+  `id` int NOT NULL,
+  `v` varchar(100) DEFAULT NULL,
+  `w` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `kv` (`v`),
+  KEY `kw` (`w`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci ENCRYPTION='Y'
+CHECKSUM TABLE src.e, src.ez, src.p;
+Table	Checksum
+src.e	3643210184
+src.ez	1283519528
+src.p	628512205
+CHECKSUM TABLE wt.e, wt.ez, wt.p;
+Table	Checksum
+wt.e	3643210184
+wt.ez	1283519528
+wt.p	628512205
+CHECK TABLE wt.e, wt.ez, wt.p;
+Table	Op	Msg_type	Msg_text
+wt.e	check	status	OK
+wt.ez	check	status	OK
+wt.p	check	status	OK
+# The worktree writes; its pages reach disk encrypted, with the shared key.
+INSERT INTO wt.e VALUES (100000, 'worktree-secret-xyz', 1);
+UPDATE wt.ez SET b = CONCAT('wt-', b) WHERE id <= 1000;
+UPDATE src.e SET v = CONCAT('src-', v) WHERE id <= 10;
+SET GLOBAL innodb_fast_shutdown = 0;
+e: encryption info present: yes, tablespace key same as source: yes
+ez: encryption info present: yes, tablespace key same as source: yes
+plaintext in wt/e.ibd: no
+worktree write in clear in wt/e.ibd: no
+plaintext in wt/ez.ibd: no
+# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM src.e;
+COUNT(*)	SUM(v LIKE 'src-%')	SUM(v = 'worktree-secret-xyz')
+5000	10	0
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM wt.e;
+COUNT(*)	SUM(v LIKE 'src-%')	SUM(v = 'worktree-secret-xyz')
+5001	0	1
+SELECT SUM(b LIKE 'wt-%') FROM src.ez;
+SUM(b LIKE 'wt-%')
+0
+SELECT SUM(b LIKE 'wt-%') FROM wt.ez FORCE INDEX (kb);
+SUM(b LIKE 'wt-%')
+1000
+# Master key rotation re-encrypts the tablespace key in both files.
+ALTER INSTANCE ROTATE INNODB MASTER KEY;
+SET GLOBAL innodb_fast_shutdown = 0;
+e: master key id src == wt: yes, rotated: yes
+ez: master key id src == wt: yes, rotated: yes
+# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+SET SESSION cte_max_recursion_depth = 100000;
+CHECK TABLE src.e, src.ez, wt.e, wt.ez;
+Table	Op	Msg_type	Msg_text
+src.e	check	status	OK
+src.ez	check	status	OK
+wt.e	check	status	OK
+wt.ez	check	status	OK
+SELECT COUNT(*), SUM(v LIKE 'src-%'), SUM(v = 'worktree-secret-xyz') FROM wt.e FORCE INDEX (kv);
+COUNT(*)	SUM(v LIKE 'src-%')	SUM(v = 'worktree-secret-xyz')
+5001	0	1
+SELECT COUNT(*), SUM(b LIKE 'wt-%') FROM wt.ez FORCE INDEX (kb);
+COUNT(*)	SUM(b LIKE 'wt-%')
+3000	1000
+INSERT INTO wt.e VALUES (100001, 'after-rotation', 2);
+INSERT INTO src.e VALUES (100001, 'src-after-rotation', 2);
+# A worktree of the worktree, after the rotation.
+CREATE WORKTREE wt2 FROM wt;
+# restart: --plugin-dir=/Users/matthewbajorek/Development/mysql-worktrees/build-wt-debug/plugin_output_directory
+SELECT NAME, ENCRYPTION FROM information_schema.INNODB_TABLESPACES WHERE NAME LIKE 'wt2/%' ORDER BY NAME;
+NAME	ENCRYPTION
+wt2/e	Y
+wt2/ez	Y
+wt2/p	N
+SELECT v FROM wt2.e WHERE id = 100001;
+v
+after-rotation
+SELECT v FROM src.e WHERE id = 100001;
+v
+src-after-rotation
+CHECKSUM TABLE wt.e, wt.ez;
+Table	Checksum
+wt.e	3665433840
+wt.ez	2063006343
+CHECKSUM TABLE wt2.e, wt2.ez;
+Table	Checksum
+wt2.e	3665433840
+wt2.ez	2063006343
+CHECK TABLE wt2.e, wt2.ez, wt2.p;
+Table	Op	Msg_type	Msg_text
+wt2.e	check	status	OK
+wt2.ez	check	status	OK
+wt2.p	check	status	OK
+# Control: stock FOR EXPORT does write them, and the listing shows them.
+FLUSH TABLES src.e FOR EXPORT;
+e.cfg
+e.cfp
+UNLOCK TABLES;
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+# ----------------------------------------------------------------------
+# Teardown
+# Removing manifest file for current MySQL server instance
+# Removing local keyring file for keyring component: component_keyring_file
+# Removing local configuration file for keyring component: component_keyring_file
+# Restarting server without the manifest file
+# ----------------------------------------------------------------------
