@@ -48,15 +48,16 @@ CHECK TABLE w1.t;
 Table	Op	Msg_type	Msg_text
 w1.t	check	status	OK
 #
-# 3. The first flush landed nothing (row 4, §11 "0 bytes"): the page is
-#    still a hole; its doublewrite copy or its image restores it.
+# 3. The first flush landed nothing (row 4, §11 "0 bytes"), and its
+#    doublewrite copy is gone too: the pages written for the first time
+#    are holes again after the kill, so recovery rebuilds them from their
+#    images (C2).
 SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE w1.t SET v = 'drop' WHERE id BETWEEN 5000 AND 9000;
-SET GLOBAL debug = '+d,wt_drop_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_drop_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 # Kill the server
+first writes lost with their doublewrite copies: at least one: yes
 # restart
 SELECT COUNT(*), SUM(v = 'drop') FROM w1.t;
 COUNT(*)	SUM(v = 'drop')
@@ -66,16 +67,17 @@ Table	Op	Msg_type	Msg_text
 w1.t	check	status	OK
 #
 # 4. After a checkpoint, the second flush is torn non-zero (row 6, v2
-#    test 3): restored from its doublewrite copy (B).
+#    test 3), as a power loss leaves it (torn after the kill): restored
+#    from its doublewrite copy (B).
 UPDATE w1.t SET v = 's1' WHERE id BETWEEN 10000 AND 12000;
 SET GLOBAL innodb_buf_flush_list_now = ON;
 SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE w1.t SET v = 's2' WHERE id BETWEEN 10000 AND 12000;
-SET GLOBAL debug = '+d,wt_tear_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_tear_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 # Kill the server
+second writes torn after the kill: at least one: yes
 # restart
 SELECT COUNT(*), SUM(v = 's2') FROM w1.t;
 COUNT(*)	SUM(v = 's2')

@@ -139,8 +139,14 @@ SET SESSION cte_max_recursion_depth = 100000;
 INSERT INTO src.e WITH RECURSIVE s(n) AS (SELECT 200000 UNION ALL SELECT n + 1 FROM s WHERE n < 220000)
   SELECT n, CONCAT('more-', n), n % 7 FROM s;
 SET GLOBAL innodb_log_checkpoint_now = ON;
-SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
+--echo # (page 0's last write is the one in flight at the crash: an allocation
+--echo # after the checkpoint, flushed, so its newest copy is in the doublewrite
+--echo # buffer and no older copy can stand in for it)
+INSERT INTO wt.e WITH RECURSIVE s(n) AS (SELECT 300000 UNION ALL SELECT n + 1 FROM s WHERE n < 302000)
+  SELECT n, CONCAT('wt-more-', n), n % 7 FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 UPDATE wt.e SET v = 'enc-after-checkpoint' WHERE id = 5;
 --source include/kill_mysqld.inc
 --copy_file $WT_IBD $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved

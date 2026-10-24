@@ -25,4 +25,32 @@ sub stray {
 }
 sub wttmp { my @t = glob("$ENV{WT_DD}/*/*.wttmp"); return scalar @t; }
 sub count_in_log { my ($f, $re) = @_; open(my $h, '<', $f) or die "$f: $!"; my $n = 0; while (<$h>) { $n++ if /$re/; } return $n; }
+# Damage applied after a kill, as a power loss leaves it: only pages whose
+# copies are in the doublewrite files can have had a write in flight.
+use IO::Handle;
+sub patch { my ($f, $off, $bytes) = @_; open(my $h, '+<:raw', $f) or die "$f: $!"; sysseek($h, $off, 0); syswrite($h, $bytes) == length($bytes) or die; $h->sync or die "fsync $f: $!"; close($h); }
+# { page number => [[dblwr file, offset], ...] } for a space (16 KB pages).
+sub dblwr_pages {
+  my ($space) = @_; my %c;
+  for my $f (glob("$ENV{WT_DD}/#ib_*.dblwr")) {
+    open(my $h, '<:raw', $f) or die; my ($off, $p) = (0, '');
+    while (sysread($h, $p, 16384) == 16384) {
+      push(@{$c{unpack('N', substr($p, 4, 4))}}, [$f, $off, substr($p, 16, 8)]) if $p =~ /[^\0]/ && unpack('N', substr($p, 34, 4)) == $space;
+      $off += 16384;
+    }
+  }
+  return \%c;
+}
+# The pages of a data file whose last write could have been in flight: a
+# doublewrite copy holds exactly the page's current LSN (older copies are of
+# writes that completed long ago).
+sub inflight_pages {
+  my ($space, $file) = @_; my $c = dblwr_pages($space); my @p;
+  for my $pg (sort { $a <=> $b } keys %$c) {
+    next if $pg < 2;
+    my $lsn = substr(page_n($file, $pg), 16, 8);
+    push(@p, $pg) if grep { $_->[2] eq $lsn } @{$c->{$pg}};
+  }
+  return @p;
+}
 1;

@@ -57,8 +57,13 @@ INSERT INTO wt.big WITH RECURSIVE s(n) AS (SELECT 1000 UNION ALL SELECT n + 1 FR
 # Flush page 0 (now changed by the file extension) through the doublewrite
 # buffer, then keep the next change in redo only, so recovery opens the file.
 SET GLOBAL innodb_log_checkpoint_now = ON;
-SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
+--echo # (page 0's last write is the one in flight at the crash: an allocation
+--echo # after the checkpoint, flushed, so its newest copy is in the doublewrite
+--echo # buffer and no older copy can stand in for it)
+INSERT INTO wt.big WITH RECURSIVE s(n) AS (SELECT 20001 UNION ALL SELECT n + 1 FROM s WHERE n < 22000) SELECT n, 'z' FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 UPDATE wt.big SET pad = 'after-checkpoint' WHERE id = 5;
 --source include/kill_mysqld.inc
 perl;
@@ -248,8 +253,13 @@ INSERT INTO src.zc WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM 
 CREATE WORKTREE wz FROM src;
 INSERT INTO wz.zc WITH RECURSIVE s(n) AS (SELECT 10001 UNION ALL SELECT n + 1 FROM s WHERE n < 16000) SELECT n, 'grown' FROM s;
 SET GLOBAL innodb_log_checkpoint_now = ON;
-SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 SET GLOBAL innodb_checkpoint_disabled = ON;
+--echo # (page 0's last write is the one in flight at the crash: an allocation
+--echo # after the checkpoint, flushed, so its newest copy is in the doublewrite
+--echo # buffer and no older copy can stand in for it)
+INSERT INTO wz.zc WITH RECURSIVE s(n) AS (SELECT 20001 UNION ALL SELECT n + 1 FROM s WHERE n < 21000) SELECT n, 'more' FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 UPDATE wz.zc SET v = 'after-checkpoint' WHERE id = 5;
 --source include/kill_mysqld.inc
 --copy_file $WZ_IBD $MYSQLTEST_VARDIR/tmp/wz_zc.ibd.saved
@@ -292,7 +302,7 @@ perl;
 EOF
 --remove_file $G_LOG
 --source include/start_mysqld.inc
-SELECT COUNT(*), SUM(v = 'grown') FROM wz.zc;
+SELECT COUNT(*), SUM(v = 'grown'), SUM(v = 'more') FROM wz.zc;
 CHECK TABLE wz.zc, src.zc;
 DROP DATABASE wz;
 DROP DATABASE src;

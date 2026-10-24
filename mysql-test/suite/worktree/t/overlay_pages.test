@@ -46,8 +46,8 @@ sub dblwr_copies {
   }
   return @c;
 }
-# Durable before mysqld reads it (it may bypass the page cache, F_NOCACHE).
-sub patch { my ($f, $off, $bytes) = @_; open(my $h, '+<:raw', $f) or die "$f: $!"; sysseek($h, $off, 0); syswrite($h, $bytes) == length($bytes) or die; $h->sync or die "fsync $f: $!"; close($h); }
+# (patch: wt_overlay.pl; durable before mysqld reads it, which may bypass the
+# page cache, F_NOCACHE)
 sub tear { my ($f, $n) = @_; patch($f, $n * 16384 + 4096, "\0" x 12288); }
 # Start mysqld once with extra options; true if it failed. Its log in $log.
 sub start_fails { my ($opts, $log) = @_; my $r = system("$ENV{WT_MYSQLD} --log-error=$log $opts > /dev/null 2>&1"); return $r != 0; }
@@ -95,31 +95,53 @@ SELECT COUNT(*), SUM(v = 'kept'), SUM(v LIKE 'new%') FROM w1.t;
 CHECK TABLE w1.t;
 
 --echo #
---echo # 3. The first flush landed nothing (row 4, §11 "0 bytes"): the page is
---echo #    still a hole; its doublewrite copy or its image restores it.
+--echo # 3. The first flush landed nothing (row 4, §11 "0 bytes"), and its
+--echo #    doublewrite copy is gone too: the pages written for the first time
+--echo #    are holes again after the kill, so recovery rebuilds them from their
+--echo #    images (C2).
 SET GLOBAL innodb_checkpoint_disabled = ON;
+let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'w1/t'`;
 UPDATE w1.t SET v = 'drop' WHERE id BETWEEN 5000 AND 9000;
-SET GLOBAL debug = '+d,wt_drop_overlay_writes';
+perl;
+  require $ENV{WT_PAGES}; my $f = "$ENV{WT_DD}/w1/t.ibd"; my @z;
+  for my $n (2 .. (-s $f) / 16384 - 1) { push(@z, $n) if page_is_zero($f, $n); }
+  open(my $o, '>', "$ENV{WT_TMP}/holes") or die; print $o join(' ', @z);
+EOF
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_drop_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES}; my $f = "$ENV{WT_DD}/w1/t.ibd";
+  open(my $i, '<', "$ENV{WT_TMP}/holes") or die; my %hole = map { $_ => 1 } split(' ', <$i> // ''); unlink("$ENV{WT_TMP}/holes");
+  my $c = dblwr_pages($ENV{WT_S}); my $n = 0;
+  for my $pg (grep { $hole{$_} } inflight_pages($ENV{WT_S}, $f)) {
+    patch($f, $pg * 16384, "\0" x 16384);
+    patch($_->[0], $_->[1], "\0" x 16384) for @{$c->{$pg}};
+    $n++;
+  }
+  printf("first writes lost with their doublewrite copies: at least one: %s\n", $n > 0 ? "yes" : "NO");
+EOF
 --source include/start_mysqld.inc
 SELECT COUNT(*), SUM(v = 'drop') FROM w1.t;
 CHECK TABLE w1.t;
 
 --echo #
 --echo # 4. After a checkpoint, the second flush is torn non-zero (row 6, v2
---echo #    test 3): restored from its doublewrite copy (B).
+--echo #    test 3), as a power loss leaves it (torn after the kill): restored
+--echo #    from its doublewrite copy (B).
 UPDATE w1.t SET v = 's1' WHERE id BETWEEN 10000 AND 12000;
 SET GLOBAL innodb_buf_flush_list_now = ON;
 SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE w1.t SET v = 's2' WHERE id BETWEEN 10000 AND 12000;
-SET GLOBAL debug = '+d,wt_tear_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_tear_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES}; my $n = 0;
+  for my $pg (inflight_pages($ENV{WT_S}, "$ENV{WT_DD}/w1/t.ibd")) { patch("$ENV{WT_DD}/w1/t.ibd", $pg * 16384 + 4096, "\0" x 12288); $n++; }
+  printf("second writes torn after the kill: at least one: %s\n", $n > 0 ? "yes" : "NO");
+EOF
 --source include/start_mysqld.inc
 SELECT COUNT(*), SUM(v = 's2') FROM w1.t;
 CHECK TABLE w1.t;

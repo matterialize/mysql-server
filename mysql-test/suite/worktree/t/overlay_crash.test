@@ -12,6 +12,7 @@ if (!$overlay)
 }
 let $datadir = `SELECT @@datadir`;
 let WT_DD = $datadir;
+let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
 # Hand-started servers get the running one's settings (the combination's
 # options are on its command line, not in my.cnf).
 let $wt_opts = `SELECT CONCAT('--innodb-worktree-mode=', @@innodb_worktree_mode, ' --innodb-thread-concurrency=', @@innodb_thread_concurrency, ' --innodb-redo-log-capacity=', @@innodb_redo_log_capacity)`;
@@ -90,18 +91,24 @@ SELECT COUNT(*), SUM(v = 'src'), SUM(v = 'src2') FROM src.t;
 CHECK TABLE src.t, wtl.t;
 
 --echo #
---echo # 4. Torn writes (v3 §6.4 "first flush torn"): every data-file write of
---echo #    the worktree lands torn (first 4 KB, then zeros), then the server
---echo #    dies. Each torn page is restored from its doublewrite copy.
+--echo # 4. Torn writes (v3 §6.4 "first flush torn"), as a power loss leaves
+--echo #    them: the worktree's pages are flushed, the server dies, and every
+--echo #    page whose write could have been in flight (its copy is in the
+--echo #    doublewrite files) is torn on disk (first 4 KB, then zeros). Each is
+--echo #    restored from its doublewrite copy.
 CREATE WORKTREE wtt FROM src;
+let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'wtt/t'`;
 --echo # (no checkpoint past the writes: they were in flight at the crash)
 SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wtt.t SET v = CONCAT('torn', id) WHERE id <= 5000;
-SET GLOBAL debug = '+d,wt_tear_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_tear_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PL}; my $n = 0;
+  for my $pg (inflight_pages($ENV{WT_S}, "$ENV{WT_DD}/wtt/t.ibd")) { patch("$ENV{WT_DD}/wtt/t.ibd", $pg * 16384 + 4096, "\0" x 12288); $n++; }
+  printf("pages torn after the kill: at least one: %s\n", $n > 0 ? "yes" : "NO");
+EOF
 --source include/start_mysqld.inc
 SELECT COUNT(*), SUM(v LIKE 'torn%') FROM wtt.t;
 SELECT COUNT(*) FROM wtt.t FORCE INDEX (v) WHERE v LIKE 'torn%';
@@ -113,12 +120,16 @@ CHECK TABLE wtt.t;
 --echo # 5. Zeroed writes (v3 §6.4 "second flush torn to zeros"): a page that is
 --echo #    all zeros locally would read from the layer; its doublewrite copy,
 --echo #    newer than the freeze, is restored instead.
+SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wtt.t SET v = CONCAT('zero', id) WHERE id <= 5000;
-SET GLOBAL debug = '+d,wt_zero_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_zero_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PL}; my $n = 0;
+  for my $pg (inflight_pages($ENV{WT_S}, "$ENV{WT_DD}/wtt/t.ibd")) { patch("$ENV{WT_DD}/wtt/t.ibd", $pg * 16384, "\0" x 16384); $n++; }
+  printf("pages zeroed after the kill: at least one: %s\n", $n > 0 ? "yes" : "NO");
+EOF
 --source include/start_mysqld.inc
 SELECT COUNT(*), SUM(v LIKE 'zero%'), SUM(v LIKE 'torn%') FROM wtt.t;
 CHECK TABLE wtt.t;
@@ -130,17 +141,17 @@ CHECK TABLE wtt.t;
 --echo #    stale version.
 UPDATE wtt.t SET v = CONCAT('lost', id) WHERE id <= 300;
 SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
 UPDATE wtt.t SET v = CONCAT('later', id) WHERE id <= 300;
-SET GLOBAL debug = '+d,wt_zero_overlay_writes';
 SET GLOBAL innodb_buf_flush_list_now = ON;
-SET GLOBAL debug = '-d,wt_zero_overlay_writes';
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
---echo # (the doublewrite files are lost as well)
+--echo # (the pages written after the checkpoint are lost, and so are the
+--echo # doublewrite files)
 perl;
+  require $ENV{WT_PL}; for my $pg (inflight_pages($ENV{WT_S}, "$ENV{WT_DD}/wtt/t.ibd")) { patch("$ENV{WT_DD}/wtt/t.ibd", $pg * 16384, "\0" x 16384); }
   opendir(my $d, $ENV{WT_DD}) or die;
-  for (grep { /\.dblwr$/ } readdir($d)) { my $f = "$ENV{WT_DD}/$_"; my $n = -s $f;
-    open(my $h, '+<:raw', $f) or die; syswrite($h, "\0" x $n); close($h); }
+  for (grep { /\.dblwr$/ } readdir($d)) { my $f = "$ENV{WT_DD}/$_"; patch($f, 0, "\0" x (-s $f)); }
 EOF
 let $c3_log = $MYSQLTEST_VARDIR/log/overlay_c3.err;
 --error 1,2
