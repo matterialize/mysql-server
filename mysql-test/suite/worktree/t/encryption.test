@@ -159,10 +159,12 @@ perl;
     select(undef, undef, undef, 0.2); }
   sub space_id { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 16384); return unpack('N', substr($p, 34, 4)); }
   print "source page 0 written into the worktree: ", (space_id($ENV{WT_IBD}) == space_id($ENV{SRC_IBD}) ? "YES" : "no"), "\n";
+  # Refused: put the file back so that recovery can run. Recovered: the
+  # worktree already has its own page 0 and its redo applied; keep it.
+  my $saved = "$ENV{MYSQLTEST_VARDIR}/tmp/wt_e.ibd.saved";
+  if (!$up) { require File::Copy; File::Copy::copy($saved, $ENV{WT_IBD}) or die "restore: $!"; }
+  unlink($saved) or die "$saved: $!";
 EOF
---remove_file $WT_IBD
---copy_file $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved $WT_IBD
---remove_file $MYSQLTEST_VARDIR/tmp/wt_e.ibd.saved
 --remove_file $E_LOG
 --source include/start_mysqld.inc
 SELECT v FROM wt.e WHERE id = 5;

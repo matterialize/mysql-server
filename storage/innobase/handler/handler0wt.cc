@@ -145,16 +145,6 @@ bool probe_reflink(THD *thd) {
   return ret != 0 && wt_reflink_error(b);
 }
 
-/** fsync a file or directory. Plain fsync, not F_FULLFSYNC: the same
-durability InnoDB itself uses for data and redo files on macOS. */
-int sync_path(const char *path, int flags) {
-  int fd = open(path, flags);
-  if (fd < 0) return -1;
-  int ret = fsync(fd);
-  close(fd);
-  return ret;
-}
-
 using Id_map = std::vector<std::pair<space_index_t, space_index_t>>;
 
 /** Rewrite the two header pages of a clone: page 0 (new space id, primary
@@ -451,10 +441,9 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
   }
 
   /* Only now may the startup scan see it as an .ibd (no duplicate space id). */
+  /* The schema directory is fsynced once, before the commit (sql_worktree). */
   if (rename(c->tmp_path.c_str(), c->path.c_str()) != 0)
     return wt_os_error("rename", c->tmp_path);
-  const std::string dir = c->path.substr(0, c->path.rfind('/'));
-  if (sync_path(dir.c_str(), O_RDONLY) != 0) return wt_os_error("fsync", dir);
   DBUG_EXECUTE_IF("wt_crash_after_rename", DBUG_SUICIDE(););
   /* Kill with some files of a multi-file clone published and some not. */
   DBUG_EXECUTE_IF("wt_crash_after_third_rename", {

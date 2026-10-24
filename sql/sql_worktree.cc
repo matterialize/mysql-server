@@ -6,6 +6,9 @@
 
 #include "sql/sql_worktree.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -615,6 +618,19 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     yet; rebuild that from the stored foreign keys. */
     for (const auto &name : names) {
       if (adjust_fk_parents(thd, wt, name.c_str(), true, nullptr)) return true;
+    }
+
+    /* The clone files got their .ibd names with plain renames; make them
+    durable once, before the commit publishes the tables. A crash before this
+    point leaves files the DDL log deletes under either name. */
+    char dir[FN_REFLEN + 1];
+    build_table_filename(dir, sizeof(dir) - 1, wt, "", "", 0);
+    const int dir_fd = open(dir, O_RDONLY);
+    const bool synced = dir_fd >= 0 && fsync(dir_fd) == 0;
+    if (dir_fd >= 0) close(dir_fd);
+    if (!synced) {
+      my_error(ER_ERROR_ON_WRITE, MYF(0), dir, errno, strerror(errno));
+      return true;
     }
 
     DBUG_EXECUTE_IF("wt_crash_before_commit", DBUG_SUICIDE(););

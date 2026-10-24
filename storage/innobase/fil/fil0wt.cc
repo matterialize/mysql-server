@@ -20,6 +20,7 @@ Free Software Foundation.
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 
 #include "buf0checksum.h"
@@ -399,17 +400,27 @@ std::mutex wt_ancestors_mutex;
 
 bool wt_ancestors_record(
     const std::vector<std::pair<space_id_t, std::string>> &ancestors) {
-  std::string text;
-  for (const auto &[id, path] : ancestors) {
-    text += std::to_string(id) + " " + path + "\n";
-  }
+  /* Lines already made durable by this process: clones of the same source
+  need no write and no fsync. */
+  static std::set<std::string> durable;
   const std::lock_guard<std::mutex> guard(wt_ancestors_mutex);
+  std::string text;
+  std::vector<std::string> lines;
+  for (const auto &[id, path] : ancestors) {
+    std::string line = std::to_string(id) + " " + path + "\n";
+    if (durable.count(line) == 0) {
+      text += line;
+      lines.push_back(std::move(line));
+    }
+  }
+  if (lines.empty()) return false;
   const int fd = open(WT_ANCESTORS_FILE, O_WRONLY | O_CREAT | O_APPEND, 0640);
   if (fd < 0) return true;
   const bool fail = write(fd, text.data(), text.size()) !=
                         static_cast<ssize_t>(text.size()) ||
                     fsync(fd) != 0;
   close(fd);
+  if (!fail) durable.insert(lines.begin(), lines.end());
   return fail;
 }
 
