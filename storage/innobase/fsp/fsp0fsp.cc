@@ -764,6 +764,14 @@ static void fsp_space_modify_check(space_id_t id, const mtr_t *mtr) {
 static void fsp_init_file_page(buf_block_t *block, mtr_t *mtr) {
   fsp_init_file_page_low(block);
 
+  /* Overlay: the page's first record in this mtr is INIT_FILE_PAGE2, so the
+  first-dirty hook needs no image of it (limits/overlay-v3.md §5.2 rule 1). */
+  const fil_space_t *space = block->page.get_space();
+  if (space != nullptr &&
+      (space->wt_ov != nullptr || space->wt_freezing.load())) {
+    block->wt_init_mtr = mtr;
+  }
+
   ut_d(fsp_space_modify_check(block->page.id.space(), mtr));
   mlog_write_initial_log_record(buf_block_get_frame(block),
                                 MLOG_INIT_FILE_PAGE2, mtr);

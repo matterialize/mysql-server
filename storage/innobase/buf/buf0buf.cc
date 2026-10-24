@@ -5754,8 +5754,11 @@ static bool sync_read_page_verify_pageid(buf_page_t *bpage, IORequest *type,
   buf_frame_t *frame = buf_block_get_frame(block);
   bool is_wrong_page_id = true;
 
+  /* Overlay or freezing: the local re-read would bypass routing and the
+  freeze gate (limits/overlay-v3.md §4 rule 4). */
   if (recv_recovery_is_on() || is_compressed || node == nullptr ||
-      type == nullptr) {
+      type == nullptr || bpage->get_space()->wt_ov != nullptr ||
+      bpage->get_space()->wt_freezing.load()) {
     /* We don't attempt to read the page from disk to verify page id. */
     return is_wrong_page_id;
   }
@@ -5925,6 +5928,7 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
     - The next log record to apply is initializing
     - No redo log record for the page yet (brand new page) */
     if (recv_recovery_is_on() && (is_corrupted || is_wrong_page_id) &&
+        !(bpage->get_space()->wt_ov != nullptr && bpage->wt_src != 0) &&
         recv_page_is_brand_new((buf_block_t *)bpage)) {
       memset(frame, 0, bpage->size.logical());
       is_corrupted = false;

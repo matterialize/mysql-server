@@ -177,6 +177,7 @@ enum class Fil_state {
 
 struct fil_space_t;
 struct wt_map_t;
+struct wt_overlay_t;
 
 /** File node of a tablespace or the log data space */
 struct fil_node_t {
@@ -487,6 +488,33 @@ struct fil_space_t {
 
   /** True once page 0 has been checked for an ancestor map. */
   bool wt_map_loaded{};
+
+  /** Overlay mode (fil0overlay.h): the overlay state if this space is an
+  overlay, else nullptr. Set when its first file is opened. */
+  wt_overlay_t *wt_ov{};
+
+  /** Overlay mode: a freeze is turning this space into a layer (v3 §7.1);
+  every page dirtied meanwhile is imaged. */
+  std::atomic<bool> wt_freezing{false};
+
+  /** Overlay mode: mtrs that passed the first-dirty hook for this space and
+  have not yet added their dirty pages to the flush list (v3 §5.2 step 0). */
+  std::atomic<int> wt_commit_refs{0};
+
+  /** Overlay mode: the freeze gate is closed (v3 §7.1 F4); new I/O, fsync
+  and extension of the space wait. Protected by the shard mutex. */
+  bool wt_gate{};
+
+  /** Overlay mode: the file's inode is also a layer (a read-only source
+  linked live, addendum A2); no page >= 1 may be written. */
+  bool wt_linked{};
+
+  /** Overlay mode: the operation holding the space (v3 I8): 0 none,
+  1 freeze or create, 2 flatten. Protected by wt_layer_mutex. */
+  uint8_t wt_op{};
+
+  /** Overlay mode: bumped by every freeze (v3 §8 generation check). */
+  uint64_t wt_gen{};
 
   /** Throttles writing to log a message about long waiting for file to perform
   rename. */

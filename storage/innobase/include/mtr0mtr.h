@@ -220,6 +220,10 @@ struct mtr_t {
 
     /** Owning mini-transaction */
     mtr_t *m_mtr;
+
+    /** Overlay mode: spaces whose wt_commit_refs this mtr holds from the
+    first-dirty hook until its dirty pages are on the flush list. */
+    std::vector<fil_space_t *> m_wt_spaces;
   };
 
 #ifndef UNIV_HOTBACKUP

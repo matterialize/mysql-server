@@ -37,6 +37,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fil0fil.h"
 #include "fsp0file.h"
 #include "fil0wt.h"
+#include "fil0overlay.h"
 #include "fsp0sysspace.h"
 #include "fsp0types.h"
 #include "os0file.h"
@@ -399,11 +400,12 @@ dberr_t Datafile::validate_to_dd(space_id_t space_id, uint32_t flags,
   the row format and zip page size. */
 
   /* We exclude SDI & DATA_DIR space flags because they are not stored
-  in table flags in dictionary */
+  in table flags in dictionary; nor is the worktree overlay bit, which is the
+  file's own (fil0overlay.h). */
 
   if (m_space_id == space_id &&
       !((m_flags ^ flags) & ~(FSP_FLAGS_MASK_DATA_DIR | FSP_FLAGS_MASK_SHARED |
-                              FSP_FLAGS_MASK_SDI))) {
+                              FSP_FLAGS_MASK_SDI | FSP_FLAGS_MASK_WT_OVERLAY))) {
     /* Datafile matches the tablespace expected. */
     return (DB_SUCCESS);
   }

@@ -33,6 +33,10 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "mtr0mtr.h"
 
+#include "buf0flu.h"
+#include "fil0overlay.h"
+#include "fsp0fsp.h"
+
 #include "buf0buf.h"
 #include "buf0flu.h"
 #include "clone0api.h"
@@ -401,6 +405,15 @@ class mtr_t::Command {
   /** Add blocks modified in this mini-transaction to the flush list. */
   void add_dirty_blocks_to_flush_list(lsn_t start_lsn, lsn_t end_lsn);
 
+  /** Overlay mode: drop the commit references the first-dirty hook took,
+  now that the dirty pages are on the flush list (v3 §5.2 step 0). */
+  void wt_release_commit_refs() {
+    for (fil_space_t *space : m_impl->m_wt_spaces) {
+      space->wt_commit_refs.fetch_sub(1);
+    }
+    m_impl->m_wt_spaces.clear();
+  }
+
   /** Release both the latches and blocks used in the mini-transaction. */
   void release_all();
 
@@ -579,6 +592,7 @@ void mtr_t::start(bool sync) {
   new (&m_impl.m_memo) mtr_buf_t();
 
   m_impl.m_mtr = this;
+  m_impl.m_wt_spaces.clear();
   m_impl.m_log_mode = MTR_LOG_ALL;
   m_impl.m_inside_ibuf = false;
   m_impl.m_modifications = false;
@@ -659,6 +673,108 @@ void mtr_t::Command::release_resources() {
 }
 
 /** Commit a mini-transaction. */
+#ifndef UNIV_HOTBACKUP
+std::atomic<uint64_t> wt_images{0};
+std::atomic<uint64_t> wt_image_overdrafts{0};
+thread_local ulint wt_img_since_check = 0;
+
+namespace {
+/** Log a full image of one page, [4, physical - 8), from the bytes that are
+written to disk (zip.data for a compressed page that has no frame content of
+its own), as a WRITE_STRING record with an explicit page id. */
+void wt_log_image(mtr_t *mtr, const buf_block_t *block) {
+  const page_size_t &size = block->page.size;
+  const bool zip_only =
+      size.is_compressed() && !page_is_uncompressed_type(block->frame);
+  ut_a(!zip_only || fil_page_get_type(block->page.zip.data) == FIL_PAGE_TYPE_ZBLOB ||
+       fil_page_get_type(block->page.zip.data) == FIL_PAGE_TYPE_ZBLOB2 ||
+       fil_page_get_type(block->page.zip.data) == FIL_PAGE_SDI_ZBLOB);
+  const byte *src = zip_only ? block->page.zip.data : block->frame;
+  const ulint len = size.physical() - 4 - FIL_PAGE_DATA_END;
+  byte *log_ptr = nullptr;
+  if (!mlog_open(mtr, 30, log_ptr)) return;
+  log_ptr = mlog_write_initial_log_record_low(
+      MLOG_WRITE_STRING, block->page.id.space(), block->page.id.page_no(),
+      log_ptr, mtr);
+  mach_write_to_2(log_ptr, 4);
+  log_ptr += 2;
+  mach_write_to_2(log_ptr, len);
+  log_ptr += 2;
+  mlog_close(mtr, log_ptr);
+  mlog_catenate_string(mtr, src + 4, len);
+}
+
+/** The first-dirty hook (limits/overlay-v3.md §5.2): runs on the memo slots
+that commit will dirty, before the redo is written. */
+struct Wt_image_hook {
+  mtr_t *m_mtr;
+  std::vector<fil_space_t *> *m_spaces;
+  std::vector<const buf_block_t *> m_imaged;
+
+  bool operator()(mtr_memo_slot_t *slot) {
+    if (slot->object == nullptr) return true;
+    auto block = reinterpret_cast<buf_block_t *>(slot->object);
+    if (slot->type == MTR_MEMO_BUF_FIX) {
+      /* Rule 6: only intrinsic and temporary paths dirty without a latch. */
+      ut_a(!block->made_dirty_with_no_latch ||
+           block->page.get_space() == nullptr ||
+           block->page.get_space()->wt_ov == nullptr);
+      return true;
+    }
+    if (slot->type != MTR_MEMO_PAGE_X_FIX && slot->type != MTR_MEMO_PAGE_SX_FIX)
+      return true;
+    fil_space_t *space = block->page.get_space();
+    if (space == nullptr || space->purpose != FIL_TYPE_TABLESPACE ||
+        !fsp_is_file_per_table(space->id, space->flags))
+      return true;
+    /* Step 0: hold the space until the dirty pages are on the flush list. */
+    if (std::find(m_spaces->begin(), m_spaces->end(), space) ==
+        m_spaces->end()) {
+      m_spaces->push_back(space);
+      space->wt_commit_refs.fetch_add(1);
+    }
+    const page_no_t page_no = block->page.id.page_no();
+    const bool init_here = block->wt_init_mtr == m_mtr;
+    if (init_here) block->wt_init_mtr = nullptr;
+    if (!fil_wt_needs_image(space, page_no)) return true;
+    if (std::find(m_imaged.begin(), m_imaged.end(), block) != m_imaged.end())
+      return true;
+    m_imaged.push_back(block);
+
+    /* Rule 1: created in this mtr; its first record is INIT_FILE_PAGE2. */
+    if (init_here && !space->wt_freezing.load()) {
+      fil_wt_set_present(space, page_no);
+      return true;
+    }
+    switch (m_mtr->get_log_mode()) {
+      case MTR_LOG_ALL:
+      case MTR_LOG_SHORT_INSERTS:
+        /* Rule 3. */
+        wt_log_image(m_mtr, block);
+        fil_wt_set_present(space, page_no);
+        wt_images.fetch_add(1);
+        if (++wt_img_since_check > WT_K_INT) wt_image_overdrafts.fetch_add(1);
+        return true;
+      case MTR_LOG_NO_REDO:
+        /* Rule 4: a bulk index build owns its pages (v3 §5.3 row 3); a
+        freeze excludes it by MDL. */
+        ut_ad(m_mtr->get_flush_observer() != nullptr ||
+              fil_space_is_redo_skipped(space->id));
+        ut_a(!space->wt_freezing.load());
+        fil_wt_set_present(space, page_no);
+        return true;
+      default:
+        /* Rule 5: refused configurations (v3 §5.4). */
+        ib::fatal(UT_LOCATION_HERE)
+            << "Overlay page " << block->page.id
+            << " dirtied without redo; refusing to continue";
+    }
+    return true;
+  }
+};
+}  // namespace
+#endif /* !UNIV_HOTBACKUP */
+
 void mtr_t::commit() {
   ut_ad(is_active());
   ut_ad(!is_inside_ibuf());
@@ -672,6 +788,14 @@ void mtr_t::commit() {
   if (has_any_log_record() ||
       (has_modifications() && m_impl.m_log_mode == MTR_LOG_NO_REDO)) {
     ut_ad(!srv_read_only_mode || m_impl.m_log_mode == MTR_LOG_NO_REDO);
+
+#ifndef UNIV_HOTBACKUP
+    if (srv_wt_overlay && !recv_recovery_is_on()) {
+      Wt_image_hook hook{this, &m_impl.m_wt_spaces, {}};
+      Iterate<Wt_image_hook> iterator(hook);
+      m_impl.m_memo.for_each_block_in_reverse(iterator);
+    }
+#endif /* !UNIV_HOTBACKUP */
 
     cmd.execute();
   } else {
@@ -863,6 +987,7 @@ void mtr_t::Command::execute() {
     DEBUG_SYNC_C("mtr_redo_before_add_dirty_blocks");
 
     add_dirty_blocks_to_flush_list(handle.start_lsn, handle.end_lsn);
+    wt_release_commit_refs();
 
     buf_flush_list_added->report_added(handle.start_lsn, handle.end_lsn);
 
@@ -872,6 +997,7 @@ void mtr_t::Command::execute() {
     DEBUG_SYNC_C("mtr_noredo_before_add_dirty_blocks");
 
     add_dirty_blocks_to_flush_list(0, 0);
+    wt_release_commit_refs();
   }
 #endif /* !UNIV_HOTBACKUP */
 

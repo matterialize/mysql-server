@@ -21,7 +21,9 @@ Free Software Foundation.
 #include <sys/ioctl.h>
 #endif
 
+#include <chrono>
 #include <map>
+#include <thread>
 #include <mutex>
 #include <string>
 
@@ -33,6 +35,11 @@ Free Software Foundation.
 #include "fts0priv.h"
 #include "fts0types.h"
 #include "fil0wt.h"
+#include "fil0overlay.h"
+#include "log0chkp.h"
+#include "trx0sys.h"
+#include "buf0dblwr.h"
+#include <sys/stat.h>
 #include "fsp0fsp.h"
 #include "ha_innodb.h"
 #include "ha_prototypes.h"
@@ -145,6 +152,15 @@ bool probe_reflink(THD *thd) {
   return ret != 0 && wt_reflink_error(b);
 }
 
+/** fsync a directory. */
+int sync_dir(const char *dir) {
+  const int fd = open(dir, O_RDONLY);
+  if (fd < 0) return -1;
+  const int ret = fsync(fd);
+  close(fd);
+  return ret;
+}
+
 using Id_map = std::vector<std::pair<space_index_t, space_index_t>>;
 
 /** Rewrite the two header pages of a clone: page 0 (new space id, primary
@@ -187,10 +203,23 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
     if (!*overflow && !wt_map_write(map, page, page_size, no)) *overflow = true;
   }
   if (*overflow) {
+    /* An overlay needs its link from its first open (the chain is read
+    through it); the rest of the map follows in overflow pages. */
+    wt_map_t link_only;
+    link_only.self = map.self;
+    link_only.generation = map.generation;
+    link_only.has_link = map.has_link;
+    link_only.link = map.link;
     for (page_no_t no : {0, 1}) {
-      memset((no == 0 ? page0 : page1) + wt_map_offset(page_size, no), 0,
-             wt_map_size(page_size, no));
+      byte *page = no == 0 ? page0 : page1;
+      memset(page + wt_map_offset(page_size, no), 0, wt_map_size(page_size, no));
+      if (map.has_link) ut_a(wt_map_write(link_only, page, page_size, no));
     }
+  }
+  if (map.has_link) {
+    /* Overlay file (fil0overlay.h): a stock server refuses it. */
+    mach_write_to_4(page0 + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS,
+                    fsp_header_get_flags(page0) | FSP_FLAGS_MASK_WT_OVERLAY);
   }
   mach_write_to_4(page0 + FSP_HEADER_OFFSET + FSP_SPACE_ID, space_id);
   wt_page_recalc_checksum(page0, page_size);
@@ -235,6 +264,9 @@ struct Space_clone {
   std::vector<page_no_t> roots;
   std::string path, tmp_path, src_path;
   dd::Object_id dd_space_id{dd::INVALID_OBJECT_ID};
+  /* Overlay mode: the parent link (layer name, source size, F). */
+  bool overlay{};
+  wt_link_t link;
 };
 
 /** Phase 1 (before the quiesce): new identities and the DDL log entries that
@@ -278,6 +310,43 @@ bool prepare_clone(trx_t *trx, dict_table_t *src, const std::string &name,
   return false;
 }
 
+/** Overlay mode, read-only source (addendum A2): hard-link the source's live
+file into #wtlayers as the parent layer, and create the clone as a sparse file
+of the same size holding only pages 0 and 1 (rewritten in phase 3). */
+bool overlay_snapshot(Space_clone *c) {
+  const int src = open(c->src_path.c_str(), O_RDONLY);
+  if (src < 0) return wt_os_error("open", c->src_path);
+  auto src_guard = create_scope_guard([src]() { close(src); });
+  struct stat st;
+  if (fstat(src, &st) != 0) return wt_os_error("stat", c->src_path);
+  const page_size_t page_size(c->src->flags);
+  const ulint len = page_size.physical();
+  ut_a(st.st_size % len == 0);
+
+  const std::string uuid = wt_new_uuid();
+  const std::string layer = wt_layer_path(uuid);
+  if (link(c->src_path.c_str(), layer.c_str()) != 0)
+    return wt_os_error("hard-link the source as layer", layer);
+  if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
+  DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
+
+  const int dst = open(c->tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
+  if (dst < 0) return wt_os_error("create", c->tmp_path);
+  auto dst_guard = create_scope_guard([dst]() { close(dst); });
+  std::vector<byte> pages(2 * len);
+  if (pread(src, pages.data(), 2 * len, 0) != static_cast<ssize_t>(2 * len) ||
+      pwrite(dst, pages.data(), 2 * len, 0) != static_cast<ssize_t>(2 * len) ||
+      ftruncate(dst, st.st_size) != 0)
+    return wt_os_error("write", c->tmp_path);
+
+  snprintf(c->link.uuid, sizeof(c->link.uuid), "%s", uuid.c_str());
+  c->link.parent_space = c->src->space;
+  c->link.parent_size = static_cast<page_no_t>(st.st_size / len);
+  /* The source is flushed: every page in its file has LSN <= F. */
+  c->link.freeze_lsn = log_get_lsn(*log_sys);
+  return false;
+}
+
 /** Phase 2 (quiesced): merge the change buffer and flush the source so its
 file is a complete image, then reflink it under the temporary name. */
 bool snapshot_clone(trx_t *trx, Space_clone *c) {
@@ -294,6 +363,7 @@ bool snapshot_clone(trx_t *trx, Space_clone *c) {
       fsp_sdi_get_root_page_num(space, page_size_t(c->src->flags), &mtr));
   mtr_commit(&mtr);
 
+  if (c->overlay) return overlay_snapshot(c);
   if (reflink(c->src_path.c_str(), c->tmp_path.c_str()) != 0)
     return wt_reflink_error(c->tmp_path);
   return false;
@@ -318,6 +388,8 @@ bool build_map(const Space_clone &c, const wt_map_t *src_map, wt_map_t *map) {
     }
   }
   std::sort(map->index_map.begin(), map->index_map.end());
+  map->has_link = c.overlay;
+  map->link = c.link;
   if (map->ancestors.size() > WT_MAX_ANCESTORS)
     return wt_error("CREATE WORKTREE: ancestor chain too long");
   return false;
@@ -342,6 +414,12 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
   auto close_guard =
       create_scope_guard([&]() { (void)fil_close_tablespace(c->space_id); });
 
+  /* An overlay attaches its chain at the first open, from the link-only map
+  in its header pages; the full map then replaces that one. */
+  if (c->overlay && !fil_space_open(c->space_id)) {
+    my_error(ER_TABLESPACE_MISSING, MYF(0), c->tmp_path.c_str());
+    return true;
+  }
   fil_space_t *space = fil_space_acquire(c->space_id);
   /* The allocator reads pages that still carry the ancestor's id. */
   fil_wt_set(space, map);
@@ -396,7 +474,9 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
 bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
                    dd::Object_id src_dd_space_id, Space_clone *c) {
   fil_space_t *src_space = fil_space_acquire(c->src->space);
-  const uint32_t fsp_flags = src_space->flags;
+  const uint32_t fsp_flags =
+      c->overlay ? src_space->flags | FSP_FLAGS_MASK_WT_OVERLAY
+                 : src_space->flags & ~FSP_FLAGS_MASK_WT_OVERLAY;
   const Encryption_metadata enc = src_space->m_encryption_metadata;
   wt_map_t map;
   const bool too_long = build_map(*c, fil_wt_map(src_space), &map);
@@ -493,6 +573,13 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
   if (!map_ok) {
     my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: map not readable");
     return true;
+  }
+
+  /* The source's live file is now a layer: never written again. */
+  if (c->overlay) {
+    fil_space_t *src_space = fil_space_acquire(c->src->space);
+    src_space->wt_linked = true;
+    fil_space_release(src_space);
   }
 
   return dd_create_implicit_tablespace(dd::get_dd_client(thd), c->space_id,
@@ -611,10 +698,139 @@ void fts_hold(dict_table_t *table, bool hold) {
 
 }  // namespace
 
+namespace {
+/** Overlay preconditions (limits/overlay-v3.md §5.4, §5.2 O5). */
+bool overlay_check_config() {
+  if (srv_thread_concurrency == 0)
+    return wt_error(
+        "CREATE WORKTREE in overlay mode with innodb_thread_concurrency=0 "
+        "(set it > 0: the redo margin that bounds first-dirty images needs "
+        "it)");
+  if (!log_sys->concurrency_margin_is_safe.load())
+    return wt_error(
+        "CREATE WORKTREE in overlay mode with an unsafe redo concurrency "
+        "margin (raise innodb_redo_log_capacity or lower "
+        "innodb_thread_concurrency)");
+  if (dblwr::g_mode != dblwr::Mode::ON &&
+      dblwr::g_mode != dblwr::Mode::TRUEE &&
+      dblwr::g_mode != dblwr::Mode::DETECT_AND_RECOVER)
+    return wt_error(
+        "CREATE WORKTREE in overlay mode without a full doublewrite buffer "
+        "(innodb_doublewrite must be ON or DETECT_AND_RECOVER)");
+  if (srv_checksum_algorithm == SRV_CHECKSUM_ALGORITHM_NONE ||
+      srv_checksum_algorithm == SRV_CHECKSUM_ALGORITHM_STRICT_NONE)
+    return wt_error(
+        "CREATE WORKTREE in overlay mode with innodb_checksum_algorithm=none");
+  if (srv_unix_file_flush_method == SRV_UNIX_NOSYNC ||
+      srv_unix_file_flush_method == SRV_UNIX_O_DIRECT_NO_FSYNC ||
+      srv_unix_file_flush_method == SRV_UNIX_LITTLESYNC)
+    return wt_error(
+        "CREATE WORKTREE in overlay mode with an innodb_flush_method that "
+        "does not fsync data files");
+  if (!mtr_t::s_logging.is_enabled())
+    return wt_error("CREATE WORKTREE in overlay mode with redo disabled");
+  if (UNIV_PAGE_SIZE > UNIV_PAGE_SIZE_DEF)
+    return wt_error("CREATE WORKTREE in overlay mode with 32 or 64 KB pages");
+  return false;
+}
+
+/** Wait until purge has processed every transaction numbered below target,
+so that it never writes a source that is about to be linked live (addendum
+A2). @return true on timeout (error reported) */
+bool overlay_wait_purged(THD *thd, trx_id_t target) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(thd_lock_wait_timeout(thd));
+  for (;;) {
+    if (trx_sys->rseg_history_len.load() == 0) return false;
+    trx_id_t done;
+    rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
+    done = purge_sys->done.trx_no;
+    rw_lock_s_unlock(&purge_sys->latch);
+    if (done >= target) return false;
+    if (std::chrono::steady_clock::now() > deadline || thd_killed(thd)) {
+      my_error(ER_LOCK_WAIT_TIMEOUT, MYF(0));
+      return true;
+    }
+    srv_purge_wakeup();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+/** Is the schema of src read-only? */
+bool schema_read_only(THD *thd, const dd::Table &src) {
+  const dd::Schema *schema = nullptr;
+  return !dd::get_dd_client(thd)->acquire(src.schema_id(), &schema) &&
+         schema != nullptr && schema->read_only();
+}
+}  // namespace
+
+bool innobase_wt_select_mode() {
+  struct stat st;
+  const bool have_layers = stat(WT_LAYER_DIR, &st) == 0;
+  if (srv_read_only_mode) {
+    /* Nothing is created or written; routing works from the files alone. */
+    srv_wt_overlay = false;
+    return false;
+  }
+  if (srv_wt_mode == 1 && have_layers) {
+    ib::error() << "The data directory has worktree layers (" << WT_LAYER_DIR
+                << "/); start with innodb_worktree_mode=AUTO or OVERLAY";
+    return true;
+  }
+  bool overlay = srv_wt_mode == 2 || (srv_wt_mode == 0 && have_layers);
+  if (srv_wt_mode == 0 && !overlay) {
+    /* The datadir's filesystem: copy-on-write file clones? */
+    const char *a = "#wt_probe_startup", *b = "#wt_probe_startup.clone";
+    unlink(a);
+    unlink(b);
+    const int fd = open(a, O_WRONLY | O_CREAT | O_EXCL, 0640);
+    bool cloned = false;
+    if (fd >= 0) {
+      const bool written = write(fd, "x", 1) == 1;
+      close(fd);
+      cloned = written && reflink(a, b) == 0;
+    }
+    unlink(a);
+    unlink(b);
+    overlay = !cloned;
+  }
+  if (overlay) {
+    if (!have_layers && mkdir(WT_LAYER_DIR, 0750) != 0) {
+      ib::error() << "Cannot create " << WT_LAYER_DIR << ": " << strerror(errno);
+      return true;
+    }
+    /* Layers are hard links (v3 §3). */
+    const std::string a = std::string(WT_LAYER_DIR) + "/#probe", b = a + ".link";
+    unlink(a.c_str());
+    unlink(b.c_str());
+    const int fd = open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
+    const bool linked = fd >= 0 && link(a.c_str(), b.c_str()) == 0;
+    if (fd >= 0) close(fd);
+    unlink(a.c_str());
+    unlink(b.c_str());
+    if (!linked) {
+      ib::error() << "Worktree overlay mode needs hard links in the data "
+                     "directory's filesystem";
+      return true;
+    }
+  }
+  srv_wt_overlay = overlay;
+  ib::info() << "CREATE WORKTREE uses "
+             << (overlay ? "overlay files over immutable layers"
+                         : "copy-on-write file clones");
+  return false;
+}
+
 bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
                           dd::Table *dst_dd, const char *dst_db) {
   DBUG_TRACE;
   if (srv_read_only_mode) return wt_error("CREATE WORKTREE in read-only mode");
+  const bool overlay = srv_wt_overlay;
+  if (overlay && overlay_check_config()) return true;
+  if (overlay && !schema_read_only(thd, src_dd))
+    return wt_error(
+        "CREATE WORKTREE in overlay mode from a writable schema (not built "
+        "yet)");
 
   trx_t *trx = check_trx_exists(thd);
   innobase_register_trx(hton, thd, trx);
@@ -660,7 +876,7 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
       return true;
   }
 
-  if (probe_reflink(thd)) return true;
+  if (!overlay && probe_reflink(thd)) return true;
 
   /* FULLTEXT (§10.3): the auxiliary tables are hidden InnoDB tables with their
   own files, named after the parent and FTS index ids; they are cloned under
@@ -746,6 +962,13 @@ so both files carry the key encrypted under the same master key. */
   auto key_guard = create_scope_guard([&]() {
     if (encrypted) mutex_exit(&master_key_id_mutex);
   });
+
+  /* A live link must never be written again: purge must be done with every
+  transaction that may still touch the source (addendum A2). */
+  for (auto &c : clones) c.overlay = overlay;
+  for (auto &a : aux) a.clone.overlay = overlay;
+  if (overlay && overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no()))
+    return true;
 
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
   by MDL; stop purge (instance-wide, reference counted, so keep it short),

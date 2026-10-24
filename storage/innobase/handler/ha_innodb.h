@@ -843,6 +843,10 @@ typedef struct new_ft_info {
 void innobase_register_trx(handlerton *hton, THD *thd, trx_t *trx);
 
 /** CREATE WORKTREE: see clone_table_t in handler.h. */
+/** Choose the worktree mode at startup (innodb_worktree_mode).
+@return true if startup must abort */
+bool innobase_wt_select_mode();
+
 bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
                           dd::Table *dst_dd, const char *dst_db);
 

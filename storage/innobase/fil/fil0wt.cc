@@ -63,18 +63,26 @@ bool is_btree_page(page_type_t type) {
 }
 
 /** Parse a map in its on-disk format from p (avail bytes). */
+/* Link section of a "WTM2" map: uuid (32 hex), parent space id, parent
+size, freeze LSN. */
+constexpr ulint WT_LINK_BYTES = 32 + 4 + 4 + 8;
+
 bool wt_map_parse(const byte *p, ulint avail, wt_map_t *map) {
-  if (avail < WT_HDR_SIZE || mach_read_from_4(p + WT_HDR_MAGIC) != WT_MAP_MAGIC)
-    return false;
+  if (avail < WT_HDR_SIZE) return false;
+  const uint32_t magic = mach_read_from_4(p + WT_HDR_MAGIC);
+  if (magic != WT_MAP_MAGIC && magic != WT_MAP_MAGIC_LINK) return false;
+  const bool has_link = magic == WT_MAP_MAGIC_LINK;
 
   const ulint n_anc = mach_read_from_4(p + WT_HDR_N_ANCESTORS);
   const ulint n_idx = mach_read_from_4(p + WT_HDR_N_INDEXES);
   const ulint n_roots = mach_read_from_4(p + WT_HDR_N_ROOTS);
-  if (n_anc == 0 || n_anc > WT_MAX_ANCESTORS || n_idx > avail ||
+  /* A frozen stock source links its layer but has no ancestors. */
+  if ((n_anc == 0 && !has_link) || n_anc > WT_MAX_ANCESTORS || n_idx > avail ||
       n_roots > avail) {
     return false;
   }
-  const ulint len = n_anc * 4 + n_idx * 16 + n_roots * 4;
+  const ulint len = n_anc * 4 + n_idx * 16 + n_roots * 4 +
+                    (has_link ? WT_LINK_BYTES : 0);
   if (WT_HDR_SIZE + len > avail ||
       mach_read_from_4(p + WT_HDR_CRC) !=
           ut_crc32(p + WT_HDR_SELF, WT_HDR_SIZE - WT_HDR_SELF + len)) {
@@ -95,6 +103,15 @@ bool wt_map_parse(const byte *p, ulint avail, wt_map_t *map) {
   }
   for (ulint i = 0; i < n_roots; ++i, q += 4) {
     map->roots.push_back(mach_read_from_4(q));
+  }
+  map->has_link = has_link;
+  map->link = wt_link_t{};
+  if (has_link) {
+    memcpy(map->link.uuid, q, 32);
+    map->link.uuid[32] = '\0';
+    map->link.parent_space = mach_read_from_4(q + 32);
+    map->link.parent_size = mach_read_from_4(q + 36);
+    map->link.freeze_lsn = mach_read_from_8(q + 40);
   }
   std::sort(map->index_map.begin(), map->index_map.end());
   return true;
@@ -194,8 +211,8 @@ bool wt_map_read(const byte *page, const page_size_t &page_size,
 }
 
 std::vector<byte> wt_map_serialize(const wt_map_t &map) {
-  const ulint len =
-      map.ancestors.size() * 4 + map.index_map.size() * 16 + map.roots.size() * 4;
+  const ulint len = map.ancestors.size() * 4 + map.index_map.size() * 16 +
+                    map.roots.size() * 4 + (map.has_link ? WT_LINK_BYTES : 0);
   std::vector<byte> out(WT_HDR_SIZE + len);
   byte *p = out.data();
   byte *q = p + WT_HDR_SIZE;
@@ -212,7 +229,14 @@ std::vector<byte> wt_map_serialize(const wt_map_t &map) {
     mach_write_to_4(q, page_no);
     q += 4;
   }
-  mach_write_to_4(p + WT_HDR_MAGIC, WT_MAP_MAGIC);
+  if (map.has_link) {
+    memcpy(q, map.link.uuid, 32);
+    mach_write_to_4(q + 32, map.link.parent_space);
+    mach_write_to_4(q + 36, map.link.parent_size);
+    mach_write_to_8(q + 40, map.link.freeze_lsn);
+  }
+  mach_write_to_4(p + WT_HDR_MAGIC,
+                  map.has_link ? WT_MAP_MAGIC_LINK : WT_MAP_MAGIC);
   mach_write_to_4(p + WT_HDR_N_ANCESTORS, map.ancestors.size());
   mach_write_to_4(p + WT_HDR_N_INDEXES, map.index_map.size());
   mach_write_to_4(p + WT_HDR_N_ROOTS, map.roots.size());
@@ -225,7 +249,8 @@ std::vector<byte> wt_map_serialize(const wt_map_t &map) {
 
 bool wt_map_write(const wt_map_t &map, byte *page, const page_size_t &page_size,
                   page_no_t page_no) {
-  if (map.ancestors.empty() || map.ancestors.size() > WT_MAX_ANCESTORS)
+  if ((map.ancestors.empty() && !map.has_link) ||
+      map.ancestors.size() > WT_MAX_ANCESTORS)
     return false;
   const auto bytes = wt_map_serialize(map);
   if (bytes.size() > wt_map_size(page_size, page_no)) return false;

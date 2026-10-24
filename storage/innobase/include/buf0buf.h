@@ -1386,6 +1386,10 @@ class buf_page_t {
   /** Page size. */
   page_size_t size;
 
+  /** Overlay read source (fil0overlay.h): 0 local, k chain layer k - 1, 255
+  zero everywhere. Set by every read of an overlay space. */
+  uint8_t wt_src{0};
+
   /** Count of how many fold this block is currently bufferfixed. */
   buf_fix_count_atomic_t buf_fix_count;
 
@@ -1890,6 +1894,11 @@ struct buf_block_t {
   block belongs to temporary tablespace and block is always accessed by a
   single thread. */
   bool made_dirty_with_no_latch;
+
+  /** The mtr that initialized this page (fsp_init_file_page) if it was in an
+  overlay or freezing space: its first redo record is then INIT_FILE_PAGE2, so
+  the first-dirty hook needs no image (limits/overlay-v3.md §5.2 rule 1). */
+  const void *wt_init_mtr{};
 
 #ifndef UNIV_HOTBACKUP
 #ifdef UNIV_DEBUG

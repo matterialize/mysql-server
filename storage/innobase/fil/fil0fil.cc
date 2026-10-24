@@ -43,6 +43,7 @@ The tablespace memory cache */
 #include "buf0buf.h"
 #include "buf0flu.h"
 #include "fil0wt.h"
+#include "fil0overlay.h"
 #include "clone0api.h"
 #include "dict0boot.h"
 #include "dict0dd.h"
@@ -2538,6 +2539,11 @@ dberr_t Fil_shard::get_file_size(fil_node_t *file, bool read_only_mode) {
     space->flags |= flags & FSP_FLAGS_MASK_ENCRYPTION;
   }
 
+  /* The worktree overlay bit is the file's (fil0overlay.h): the space
+  adopts it from the header page, whatever the DD said. */
+  space->flags = (space->flags & ~FSP_FLAGS_MASK_WT_OVERLAY) |
+                 (flags & FSP_FLAGS_MASK_WT_OVERLAY);
+
   /* Make sure the space_flags are the same as the header page flags. */
   if (space->flags != flags) {
     ib::error(ER_IB_MSG_272, ulong{space->flags}, file->name, ulonglong{flags});
@@ -2956,9 +2962,24 @@ bool Fil_shard::open_file(fil_node_t *file) {
                                               buf, os_offset_t{page_no} * len,
                                               len, nullptr) == DB_SUCCESS;
       };
-      if (read(0, pages)) {
+      const bool have0 = read(0, pages);
+      if (have0) {
         fil_wt_load(space, pages, read(1, pages + len) ? pages + len : nullptr,
                     read);
+      }
+      /* Overlay (bit 15): the parent chain is needed before any page of the
+      space can be read (v3 §6.1). The bit is the file's: a space created
+      from DD flags learns it here, before its first page read. */
+      if (have0 && (fsp_header_get_flags(pages) & FSP_FLAGS_MASK_WT_OVERLAY)) {
+        space->flags |= FSP_FLAGS_MASK_WT_OVERLAY;
+      }
+      if ((space->flags & FSP_FLAGS_MASK_WT_OVERLAY) != 0 &&
+          space->wt_ov == nullptr &&
+          !fil_wt_overlay_attach(space, file->handle, file_size)) {
+        ut::aligned_free(pages);
+        os_file_close(file->handle);
+        file->is_open = false;
+        return false;
       }
       ut::aligned_free(pages);
     } else {
@@ -3134,6 +3155,7 @@ void Fil_shard::space_free_low(fil_space_t *&space) {
 
   ut::delete_(space->wt_map);
   space->wt_map = nullptr;
+  fil_wt_overlay_free(space);
 
   for (auto &file : space->files) {
     ut_d(space->size -= file.size);
@@ -5822,6 +5844,13 @@ dberr_t fil_ibd_open(bool validate, fil_type_t purpose, space_id_t space_id,
     return DB_SUCCESS;
   }
 
+  /* A worktree overlay file: the flag is the file's, never the DD's
+  (fil0overlay.h); without it the space would read its holes as data. */
+  if (!FSP_FLAGS_ARE_NOT_SET(flags) && df.is_open() &&
+      (df.flags() & FSP_FLAGS_MASK_WT_OVERLAY) != 0) {
+    flags |= FSP_FLAGS_MASK_WT_OVERLAY;
+  }
+
   /* We pass UNINITIALIZED flags while we try to open DD tablespace. In that
   case, set the flags now based on what is read from disk.*/
   if (FSP_FLAGS_ARE_NOT_SET(flags) && fsp_is_dd_tablespace(space_id)) {
@@ -7778,6 +7807,18 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
                                    req_type.is_read());
   }
 
+  /* Overlay: a write makes the page local (v3 §2), published at submission. */
+  if (space->wt_ov != nullptr && req_type.is_write() && !req_type.is_dblwr()) {
+    fil_wt_note_write(space, page_id.page_no());
+  }
+  /* A live-linked source is a layer (addendum A2): its pages >= 1 are never
+  written. Fail-stop rather than change what worktrees read. */
+  if (space->wt_linked && req_type.is_write() && page_id.page_no() != 0) {
+    ib::fatal(UT_LOCATION_HERE)
+        << "Write to page " << page_id << " of " << space->name
+        << ", which is linked as a worktree layer";
+  }
+
   mutex_release();
 
   DEBUG_SYNC_C("innodb_fil_do_io_prepared_io_with_no_mutex");
@@ -7827,9 +7868,19 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
     err = os_file_write(req_type, file->name, file->handle, buf, offset, len);
   }
 #else /* UNIV_HOTBACKUP */
+  /* Overlay read routing (v3 §4): the same single request, to the chosen
+  file; completion accounting stays on this space's node (m1). Doublewrite
+  reads are raw-local. */
+  pfs_os_file_t handle = file->handle;
+  uint8_t wt_src = 0;
+  if (space->wt_ov != nullptr && req_type.is_read() && !req_type.is_dblwr()) {
+    wt_src = fil_wt_route_read(space, page_id.page_no(), &handle);
+    if (bpage != nullptr) bpage->wt_src = wt_src;
+  }
+
   /* Queue the aio request */
   err = os_aio(
-      req_type, aio_mode, file->name, file->handle, buf, offset, len,
+      req_type, aio_mode, file->name, handle, buf, offset, len,
       fsp_is_system_temporary(page_id.space()) ? false : srv_read_only_mode,
       file, message);
 
@@ -7851,6 +7902,15 @@ dberr_t Fil_shard::do_io(const IORequest &type, bool sync,
   ut_a(req_type.is_dblwr() || err == DB_SUCCESS);
 
   if (sync) {
+    /* Overlay: zero check, chain fallback and presence, before complete_io
+    (v3 §4 rule 2). */
+    if (space->wt_ov != nullptr && req_type.is_read() && !req_type.is_dblwr() &&
+        err == DB_SUCCESS && byte_offset == 0 && len == page_size.physical()) {
+      wt_src = fil_wt_read_done(space, req_type, file->name, page_id.page_no(),
+                                page_size, static_cast<byte *>(buf), wt_src);
+      if (bpage != nullptr) bpage->wt_src = wt_src;
+    }
+
     /* The i/o operation is already completed when we return from
     os_aio: */
 
@@ -7895,6 +7955,18 @@ void fil_aio_wait(ulint segment) {
   srv_set_io_thread_op_info(segment, "complete io for file");
 
   auto shard = fil_system->shard_by_id(file->space->id);
+
+  /* Overlay: zero check, chain fallback and presence, before complete_io
+  (v3 §4 rule 2). */
+  if (file->space->wt_ov != nullptr && type.is_read() && m2 != nullptr) {
+    auto bpage = static_cast<buf_page_t *>(m2);
+    byte *buf = bpage->size.is_compressed()
+                    ? bpage->zip.data
+                    : reinterpret_cast<buf_block_t *>(bpage)->frame;
+    bpage->wt_src =
+        fil_wt_read_done(file->space, type, file->name, bpage->id.page_no(),
+                         bpage->size, buf, bpage->wt_src);
+  }
 
   shard->mutex_acquire();
 

@@ -126,6 +126,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 #include "fts0priv.h"
 #include "fts0types.h"
 #include "ha_innodb.h"
+#include "fil0overlay.h"
 #include "ha_innopart.h"
 #include "ha_prototypes.h"
 #include "handler0alter.h"  //alter_stats_rebuild()
@@ -518,6 +519,14 @@ static TYPELIB innodb_default_row_format_typelib = {
     array_elements(innodb_default_row_format_names) - 1,
     "innodb_default_row_format_typelib", innodb_default_row_format_names,
     nullptr};
+
+/** Possible values for innodb_worktree_mode (fil0overlay.h). */
+static const char *innodb_worktree_mode_names[] = {"AUTO", "REFLINK", "OVERLAY",
+                                                   NullS};
+
+static TYPELIB innodb_worktree_mode_typelib = {
+    array_elements(innodb_worktree_mode_names) - 1,
+    "innodb_worktree_mode_typelib", innodb_worktree_mode_names, nullptr};
 
 /** Possible values for system variable "innodb_doublewrite".
 @note: If you change order or add new values, please update dblwr::mode_t. */
@@ -5727,6 +5736,12 @@ static int innobase_init_files(dict_init_mode_t dict_init_mode,
       srv_sys_space.check_file_spec(create, MIN_EXPECTED_TABLESPACE_SIZE);
 
   if (err != DB_SUCCESS) {
+    return innodb_init_abort();
+  }
+
+  /* Worktree mode is fixed before the redo margin is computed (overlay mode
+  widens it, limits/overlay-v3.md §5.2). */
+  if (innobase_wt_select_mode()) {
     return innodb_init_abort();
   }
 
@@ -22609,6 +22624,13 @@ static MYSQL_SYSVAR_BOOL(use_fdatasync, srv_use_fdatasync, PLUGIN_VAR_NOCMDARG,
                          nullptr, nullptr, true);
 
 static MYSQL_SYSVAR_ENUM(
+    worktree_mode, srv_wt_mode, PLUGIN_VAR_RQCMDARG | PLUGIN_VAR_READONLY,
+    "How CREATE WORKTREE clones tables: AUTO (copy-on-write file clones where "
+    "the filesystem has them, else sparse overlay files over immutable "
+    "layers), REFLINK, or OVERLAY.",
+    nullptr, nullptr, 0, &innodb_worktree_mode_typelib);
+
+static MYSQL_SYSVAR_ENUM(
     doublewrite, dblwr::g_mode, PLUGIN_VAR_OPCMDARG | PLUGIN_VAR_NOPERSIST,
     "Enable InnoDB doublewrite buffer (enabled by default)."
     " Disable with --skip-innodb-doublewrite.",
@@ -23585,6 +23607,7 @@ static SYS_VAR *innobase_system_variables[] = {
     MYSQL_SYSVAR(data_home_dir),
     MYSQL_SYSVAR(extend_and_initialize),
     MYSQL_SYSVAR(doublewrite),
+    MYSQL_SYSVAR(worktree_mode),
     MYSQL_SYSVAR(doublewrite_dir),
     MYSQL_SYSVAR(doublewrite_batch_size),
     MYSQL_SYSVAR(doublewrite_files),

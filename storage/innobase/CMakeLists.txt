@@ -134,6 +134,7 @@ SET(INNOBASE_SOURCES
   eval/eval0proc.cc
   fil/fil0fil.cc
   fil/fil0wt.cc
+  fil/fil0overlay.cc
   handler/handler0wt.cc
   fsp/fsp0fsp.cc
   fsp/fsp0file.cc

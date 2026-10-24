@@ -30,6 +30,9 @@ Free Software Foundation.
 /** "WTM1" */
 constexpr uint32_t WT_MAP_MAGIC = 0x57544D31;
 
+/** "WTM2": a map followed by an overlay link section. */
+constexpr uint32_t WT_MAP_MAGIC_LINK = 0x57544D32;
+
 /** Longest ancestor chain a worktree may have. */
 constexpr size_t WT_MAX_ANCESTORS = 16;
 
@@ -46,6 +49,22 @@ pages, crc32 of the rest, self, generation, then the overflow page numbers.
 The map bytes (same format as above) fill the data area of those pages, which
 the file's own allocator has marked used. Page 0 and page 1 point to separate
 copies. */
+/** The overlay link (limits/overlay-v3.md §3, addendum A3): an overlay's
+immediate parent layer. Stored as a section of the map ("WTM2"), so it is
+inline or in overflow pages like the map, and copied in page 1. */
+struct wt_link_t {
+  /** Parent layer name (#wtlayers/<uuid>.ibl), 32 hex digits; the link's
+  generation identity (every freeze or live link mints a new one). */
+  char uuid[33]{};
+  /** Space id the parent's own pages are stamped with. */
+  space_id_t parent_space{};
+  /** Size of the parent in pages when the link was made. */
+  page_no_t parent_size{};
+  /** F: the parent's pages have LSN <= F; local pages written after the
+  creation have LSN > F (v3 I6). */
+  lsn_t freeze_lsn{};
+};
+
 struct wt_map_t {
   /** The tablespace this map belongs to (lets startup tell a worktree's own
   copy from an ancestor's, and identify a file whose page 0 is lost). */
@@ -58,6 +77,9 @@ struct wt_map_t {
   std::vector<std::pair<space_index_t, space_index_t>> index_map;
   /** Root pages: their segment headers carry the space id too. */
   std::vector<page_no_t> roots;
+  /** Overlay mode: the parent link ("WTM2"; ancestors may then be empty). */
+  bool has_link{};
+  wt_link_t link;
 
   /** @return true if pages stamped with space_id belong to this tablespace */
   bool is_ancestor(space_id_t space_id) const;

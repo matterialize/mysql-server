@@ -4092,7 +4092,7 @@ bool dd_create_implicit_tablespace(dd::cache::Dictionary_client *dd_client,
                                    const char *filename, bool discarded,
                                    dd::Object_id &dd_space_id) {
   fil_space_t *space = fil_space_get(space_id);
-  uint32_t flags = space->flags;
+  uint32_t flags = space->flags & ~(1U << FSP_FLAGS_POS_UNUSED);
 
   std::string tsn(space_name);
   dict_name::convert_to_space(tsn);
@@ -7244,7 +7244,8 @@ bool dd_tablespace_update_cache(THD *thd) {
 
       /* Exclude Encryption flag as (un)encryption operation might be
       rolling forward in background thread. */
-      ut_ad(!((space->flags ^ flags) & ~(FSP_FLAGS_MASK_ENCRYPTION)));
+      ut_ad(!((space->flags ^ flags) &
+              ~(FSP_FLAGS_MASK_ENCRYPTION | (1U << FSP_FLAGS_POS_UNUSED))));
 
       fil_space_update_name(space, space_name);
 
