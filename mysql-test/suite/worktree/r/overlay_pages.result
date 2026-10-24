@@ -1,0 +1,194 @@
+# Overlay page-write crash safety (limits/overlay-v3.md §6.1-§6.4, §11.1,
+# §11.5, §11.21, v2 tests 2-5, 10, 11, 13): every row of the §6.4 table
+# not already in worktree.overlay_crash, plus a missing layer, a corrupt
+# layer page, and a crash during recovery itself.
+call mtr.add_suppression("Database page corruption on disk or a failed file read");
+call mtr.add_suppression("Trying to recover it from the doublewrite file");
+call mtr.add_suppression("Recovered page .* from the doublewrite buffer");
+call mtr.add_suppression("is corrupted.*Dumping|page dump");
+call mtr.add_suppression("Page .* checksum .* mismatch|checksum mismatch");
+call mtr.add_suppression("Unable to read page .* into the buffer pool after 100 attempts");
+call mtr.add_suppression("Assertion failure: buf0buf.cc:[0-9]+:ib::fatal triggered");
+call mtr.add_suppression("Attempting backtrace");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+SELECT n, CONCAT('row', n) FROM s;
+CREATE TABLE src.s (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO src.s WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20)
+SELECT n, 'pre' FROM s;
+CREATE WORKTREE w1 FROM src;
+#
+# 1. kill -9 after a first-dirty image is built, before its redo is
+#    written (§6.4 row 1, §11.1): nothing of the statement survives.
+SET SESSION debug = '+d,wt_crash_image_before_log';
+UPDATE w1.t SET v = 'lost' WHERE id <= 100;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT COUNT(*), SUM(v = 'lost') FROM w1.t;
+COUNT(*)	SUM(v = 'lost')
+20000	0
+#
+# 2. Image redo durable, no flush (row 2), and pages created in an mtr,
+#    never flushed (row 10): recovery rebuilds them over holes (C2).
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE w1.t SET v = 'kept' WHERE id <= 100;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO w1.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 10000)
+SELECT 20000 + n, CONCAT('new', n) FROM s;
+include/assert.inc [the first UPDATE of inherited pages logged images]
+# Kill the server
+# restart
+SELECT COUNT(*), SUM(v = 'kept'), SUM(v LIKE 'new%') FROM w1.t;
+COUNT(*)	SUM(v = 'kept')	SUM(v LIKE 'new%')
+30000	100	10000
+CHECK TABLE w1.t;
+Table	Op	Msg_type	Msg_text
+w1.t	check	status	OK
+#
+# 3. The first flush landed nothing (row 4, §11 "0 bytes"): the page is
+#    still a hole; its doublewrite copy or its image restores it.
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE w1.t SET v = 'drop' WHERE id BETWEEN 5000 AND 9000;
+SET GLOBAL debug = '+d,wt_drop_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_drop_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# restart
+SELECT COUNT(*), SUM(v = 'drop') FROM w1.t;
+COUNT(*)	SUM(v = 'drop')
+30000	4001
+CHECK TABLE w1.t;
+Table	Op	Msg_type	Msg_text
+w1.t	check	status	OK
+#
+# 4. After a checkpoint, the second flush is torn non-zero (row 6, v2
+#    test 3): restored from its doublewrite copy (B).
+UPDATE w1.t SET v = 's1' WHERE id BETWEEN 10000 AND 12000;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+UPDATE w1.t SET v = 's2' WHERE id BETWEEN 10000 AND 12000;
+SET GLOBAL debug = '+d,wt_tear_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_tear_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# restart
+SELECT COUNT(*), SUM(v = 's2') FROM w1.t;
+COUNT(*)	SUM(v = 's2')
+30000	2001
+CHECK TABLE w1.t;
+Table	Op	Msg_type	Msg_text
+w1.t	check	status	OK
+#
+# 5. A stale pre-freeze doublewrite copy over a local hole (row 8, v2
+#    test 4): src.s page 4 (its clustered root; page 3 is the SDI) is
+#    flushed, then frozen; after a kill its copy (LSN <= F) is filtered
+#    and the page stays a hole.
+UPDATE src.s SET v = 'flushed';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+CREATE WORKTREE w5 FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+pre-freeze copy of src/s page 4 in the doublewrite files: yes
+# restart
+src/s page 4 after recovery: still a hole
+SELECT COUNT(*), SUM(v = 'flushed') FROM src.s;
+COUNT(*)	SUM(v = 'flushed')
+20	20
+SELECT COUNT(*), SUM(v = 'flushed') FROM w5.s;
+COUNT(*)	SUM(v = 'flushed')
+20	20
+#
+# 6. A damaged doublewrite slot with a higher LSN beside a valid one
+#    (§11.5, O8): the valid copy is restored.
+# (no checkpoint past the write: it was in flight at the crash)
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE w5.s SET v = 'o8';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+w5/s page 4 torn; a damaged higher-LSN copy planted
+# restart
+SELECT COUNT(*), SUM(v = 'o8') FROM w5.s;
+COUNT(*)	SUM(v = 'o8')
+20	20
+CHECK TABLE w5.s;
+Table	Op	Msg_type	Msg_text
+w5.s	check	status	OK
+#
+# 7. Torn page 0 with a post-freeze doublewrite copy (§11.21, O6): the
+#    page-1 witness gives the id, the copy is restored, the overlay keeps
+#    bit 15 and its link.
+# (no checkpoint past the write: it was in flight at the crash)
+SET GLOBAL innodb_checkpoint_disabled = ON;
+CREATE WORKTREE w7 FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO w7.s WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT 100 + n, 'grow' FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+# Kill the server
+# restart
+w7/s after page 0 was torn: overlay bit 1, has a link yes
+SELECT COUNT(*), SUM(v = 'grow') FROM w7.s;
+COUNT(*)	SUM(v = 'grow')
+3020	3000
+CHECK TABLE w7.s;
+Table	Op	Msg_type	Msg_text
+w7.s	check	status	OK
+#
+# 8. A layer missing while redo needs it (v2 test 10): startup stops
+#    naming it, never discards the redo; with the layer back, it recovers.
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE w1.t SET v = 'redo' WHERE id <= 50;
+# Kill the server
+startup without the layer: failed yes, names the layer yes
+# restart
+SELECT COUNT(*), SUM(v = 'redo') FROM w1.t;
+COUNT(*)	SUM(v = 'redo')
+30000	50
+#
+# 9. A corrupt layer page (v2 test 11) is a hard error, never zeros
+#    and never a silent zero-fill.
+CREATE WORKTREE w9 FROM src;
+# (no buffer pool load: the page must be read on demand)
+# restart: --innodb-buffer-pool-load-at-startup=0
+SELECT COUNT(*), SUM(id) FROM w9.t FORCE INDEX (PRIMARY);
+Got one of the listed errors
+# the read stopped the server
+# restart
+SELECT COUNT(*) FROM w9.t;
+COUNT(*)
+20000
+#
+# 10. kill -9 during recovery, after attaching an overlay but before its
+#     fsync (§6.1 step 2, v2 test 13: the mysqld-then-OS crash, as far as
+#     it can be produced without a power cut): the next start recovers.
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE w1.t SET v = 'twice' WHERE id <= 50;
+# Kill the server
+recovery killed before the attach fsync: yes
+# restart
+SELECT COUNT(*), SUM(v = 'twice') FROM w1.t;
+COUNT(*)	SUM(v = 'twice')
+30000	50
+CHECK TABLE w1.t, w5.s, w7.s, w9.t, src.t, src.s;
+Table	Op	Msg_type	Msg_text
+w1.t	check	status	OK
+w5.s	check	status	OK
+w7.s	check	status	OK
+w9.t	check	status	OK
+src.t	check	status	OK
+src.s	check	status	OK
+DROP DATABASE w9;
+DROP DATABASE w7;
+DROP DATABASE w5;
+DROP DATABASE w1;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+Variable_name	Value
+Innodb_worktree_layers	0

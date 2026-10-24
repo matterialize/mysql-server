@@ -54,6 +54,7 @@ wt_presence_t wt_overlay_t::get(page_no_t page_no) {
 void wt_overlay_t::set(page_no_t page_no, wt_presence_t state) {
   const std::lock_guard<std::mutex> guard(presence_mutex);
   if (page_no < presence.size()) presence[page_no] = state;
+  if (page_no >= 2 && state == WT_PRESENT) fresh.store(false);
 }
 
 std::string wt_new_uuid() {

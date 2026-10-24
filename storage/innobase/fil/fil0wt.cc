@@ -136,8 +136,9 @@ bool wt_stub_parse(const byte *p, ulint avail, space_id_t *self,
   const bool has_link = magic == WT_STUB_MAGIC_LINK;
   const ulint n = mach_read_from_4(p + WT_STUB_N_PAGES);
   const ulint extra = has_link ? WT_LINK_BYTES : 0;
-  if ((n == 0 && !has_link) || n > avail ||
-      WT_STUB_SIZE + n * 4 + extra > avail ||
+  /* No pages: the map is page 1's inline map (a flattened file keeps it with
+  no link). */
+  if (n > avail || WT_STUB_SIZE + n * 4 + extra > avail ||
       mach_read_from_4(p + WT_STUB_CRC) !=
           ut_crc32(p + WT_STUB_SELF,
                    WT_STUB_SIZE - WT_STUB_SELF + n * 4 + extra)) {
@@ -233,7 +234,7 @@ bool wt_map_read(const byte *page, const page_size_t &page_size,
                     map->self == self && map->generation == generation;
     ut::aligned_free(buf);
     if (ok) {
-      map->has_link = true;
+      map->has_link = has_link;
       map->link = link;
     }
     return ok;
@@ -258,9 +259,9 @@ bool wt_map_read(const byte *page, const page_size_t &page_size,
   ok = ok && wt_map_parse(bytes.data(), len, map) && map->self == self &&
        map->generation == generation;
   /* A stub's link is the current one (a frozen file keeps its old map pages
-  in its layer, with the link they had then). */
-  if (ok && has_link) {
-    map->has_link = true;
+  in its layer, with the link they had then; a flattened one has none). */
+  if (ok) {
+    map->has_link = has_link;
     map->link = link;
   }
   return ok;
@@ -354,7 +355,6 @@ bool wt_stub_write(const wt_map_t &map, ulint map_len,
   const ulint extra = map.has_link ? WT_LINK_BYTES : 0;
   if (WT_STUB_SIZE + pages.size() * 4 + extra > wt_map_size(page_size, page_no))
     return false;
-  ut_a(!pages.empty() || map.has_link);
   byte *p = page + wt_map_offset(page_size, page_no);
   memset(p, 0, wt_map_size(page_size, page_no));
   mach_write_to_4(p, map.has_link ? WT_STUB_MAGIC_LINK : WT_STUB_MAGIC);

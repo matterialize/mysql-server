@@ -1,0 +1,143 @@
+--echo # Flatten and MATERIALIZE (limits/overlay-v3.md §8, §11.9, §11.17, v2 test
+--echo # 9): kill -9 at every flatten step with dirty inherited pages, races
+--echo # with CREATE WORKTREE and GC, the generation backstop, and the result:
+--echo # a standalone file that passes innochecksum and still reads its LOBs and
+--echo # FULLTEXT index (ancestor ids live on in its records).
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), b MEDIUMTEXT, KEY (v), FULLTEXT KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 4000)
+  SELECT n, CONCAT('row', n, IF(n % 100 = 0, ' narwhal', '')), IF(n % 200 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE WORKTREE wt FROM src;
+
+--echo #
+--echo # 1. kill -9 at each flatten step (v3 §8: 0 begin, 1 adopting, 2 adopted
+--echo #    pages durable, 3 checked, 4 link cleared, 5 durable), each time with
+--echo #    inherited pages first dirtied and left unflushed. The worktree keeps
+--echo #    its content; it is standalone only once step 4 is durable.
+let $points = wt_crash_flatten_begin wt_crash_flatten_adopt wt_crash_flatten_after_flush wt_crash_flatten_after_check wt_crash_flatten_after_clear wt_crash_flatten_after_final_flush;
+let $i = 0;
+while ($points)
+{
+  let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
+  let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
+  inc $i;
+  if (`SELECT NOT EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'wt/t' AND FLAG & 32768)`)
+  {
+    # The previous point left wt standalone: start over from a new one.
+    DROP DATABASE wt;
+    CREATE WORKTREE wt FROM src;
+  }
+  SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+  eval UPDATE wt.t SET v = CONCAT('f$i ', id) WHERE id % 37 = 0;
+  --source include/expect_crash.inc
+  eval SET SESSION debug = '+d,$point';
+  --error CR_SERVER_LOST
+  ALTER WORKTREE wt MATERIALIZE;
+  --source include/start_mysqld.inc
+  let WT_POINT = $point;
+  perl;
+    require $ENV{WT_PL}; my $f = "$ENV{WT_DD}/wt/t.ibd";
+    printf("%-34s wt overlay bit %d, has a link %s; unreferenced layers %d\n", $ENV{WT_POINT},
+           overlay_bit($f), defined(link_of($f)) ? "yes" : "no", stray());
+  EOF
+  eval SELECT COUNT(*), SUM(v LIKE 'f$i %'), SUM(LENGTH(b)) FROM wt.t;
+  CHECK TABLE wt.t;
+}
+
+--echo #
+--echo # 2. The generation backstop (v3 §8 step 4): a freeze that raced the
+--echo #    flatten makes it give up, leaving the overlay intact.
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+UPDATE wt.t SET v = 'gen' WHERE id = 1;
+SET SESSION debug = '+d,wt_flatten_bump_gen';
+--error ER_NOT_SUPPORTED_YET,ER_UNKNOWN_ERROR,ER_INTERNAL_ERROR
+ALTER WORKTREE wt MATERIALIZE;
+SET SESSION debug = '-d,wt_flatten_bump_gen';
+SELECT v FROM wt.t WHERE id = 1;
+CHECK TABLE wt.t;
+
+--echo #
+--echo # 3. CREATE WORKTREE from an overlay paused mid-flatten (v3 §11.17): it
+--echo #    waits for the flatten (schema MDL) or times out, never loses its parent:
+--echo #    the reuse-path clone of a flattened source keeps the layer alive.
+connect (con1, localhost, root,,);
+SET DEBUG_SYNC = 'wt_flatten_after_check SIGNAL flat WAIT_FOR go';
+send ALTER WORKTREE wt MATERIALIZE;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR flat';
+SET SESSION lock_wait_timeout = 1;
+--error ER_LOCK_WAIT_TIMEOUT
+CREATE WORKTREE wt2 FROM wt;
+SET SESSION lock_wait_timeout = DEFAULT;
+--echo # A reuse-path clone of src (unchanged since its freeze) while wt is
+--echo # paused: src is not the table being flattened, so it proceeds.
+CREATE WORKTREE wt3 FROM src;
+--echo # GC runs (a DROP) while the flatten is paused: nothing in use goes.
+CREATE DATABASE junk;
+DROP DATABASE junk;
+connect (con2, localhost, root,,);
+send CREATE WORKTREE wt2 FROM wt;
+connection default;
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection con2;
+reap;
+disconnect con1;
+disconnect con2;
+connection default;
+SET DEBUG_SYNC = 'RESET';
+perl;
+  require $ENV{WT_PL};
+  printf("wt overlay bit %d; wt2 overlay bit %d, chain depth %d; wt3 chain depth %d; unreferenced layers %d\n",
+         overlay_bit("$ENV{WT_DD}/wt/t.ibd"), overlay_bit("$ENV{WT_DD}/wt2/t.ibd"), depth("$ENV{WT_DD}/wt2/t.ibd"),
+         depth("$ENV{WT_DD}/wt3/t.ibd"), stray());
+EOF
+--source include/restart_mysqld.inc
+SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt2.t;
+SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt3.t;
+CHECK TABLE wt.t, wt2.t, wt3.t;
+
+--echo #
+--echo # 4. The materialized file: no overlay bit, no link, every page valid
+--echo #    (innochecksum), and its records' ancestor ids still resolve: LOBs
+--echo #    and the FULLTEXT index read back, before and after a restart.
+--echo #    (wt2's CREATE froze wt again: materialize it once more.)
+ALTER WORKTREE wt MATERIALIZE;
+SELECT id, LENGTH(b), LEFT(b, 10) FROM wt.t WHERE id IN (200, 4000) ORDER BY id;
+SELECT COUNT(*) FROM wt.t WHERE MATCH (v) AGAINST ('narwhal');
+UPDATE wt.t SET b = REPEAT('new', 5000) WHERE id = 400;
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/shutdown_mysqld.inc
+perl;
+  require $ENV{WT_PL}; my $f = "$ENV{WT_DD}/wt/t.ibd";
+  printf("wt/t.ibd: overlay bit %d, has a link %s\n", overlay_bit($f), defined(link_of($f)) ? "yes" : "no");
+EOF
+--exec $INNOCHECKSUM $datadir/wt/t.ibd
+--echo innochecksum: ok
+--source include/start_mysqld.inc
+SELECT id, LENGTH(b), LEFT(b, 10) FROM wt.t WHERE id IN (200, 400, 4000) ORDER BY id;
+SELECT COUNT(*) FROM wt.t WHERE MATCH (v) AGAINST ('narwhal');
+CHECK TABLE wt.t;
+
+DROP DATABASE wt3;
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_overlays';

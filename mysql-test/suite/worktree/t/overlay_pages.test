@@ -1,0 +1,286 @@
+--echo # Overlay page-write crash safety (limits/overlay-v3.md §6.1-§6.4, §11.1,
+--echo # §11.5, §11.21, v2 tests 2-5, 10, 11, 13): every row of the §6.4 table
+--echo # not already in worktree.overlay_crash, plus a missing layer, a corrupt
+--echo # layer page, and a crash during recovery itself.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
+let WT_MYSQLD = $MYSQLD_CMD;
+let WT_TMP = $MYSQLTEST_VARDIR/tmp;
+call mtr.add_suppression("Database page corruption on disk or a failed file read");
+call mtr.add_suppression("Trying to recover it from the doublewrite file");
+call mtr.add_suppression("Recovered page .* from the doublewrite buffer");
+call mtr.add_suppression("is corrupted.*Dumping|page dump");
+call mtr.add_suppression("Page .* checksum .* mismatch|checksum mismatch");
+# Section 9: a corrupt layer page stops the server.
+call mtr.add_suppression("Unable to read page .* into the buffer pool after 100 attempts");
+call mtr.add_suppression("Assertion failure: buf0buf.cc:[0-9]+:ib::fatal triggered");
+call mtr.add_suppression("Attempting backtrace");
+
+--write_file $MYSQLTEST_VARDIR/tmp/wt_pages.pl
+use strict;
+use IO::Handle;
+require $ENV{WT_PL};
+# Doublewrite slots holding (space, page): [file, offset, lsn].
+sub dblwr_copies {
+  my ($space, $page) = @_; my @c;
+  for my $f (glob("$ENV{WT_DD}/#ib_*.dblwr")) {
+    open(my $h, '<:raw', $f) or die; my $off = 0; my $p;
+    while (sysread($h, $p, 16384) == 16384) {
+      if ($p =~ /[^\0]/ && unpack('N', substr($p, 34, 4)) == $space && unpack('N', substr($p, 4, 4)) == $page) {
+        my ($hi, $lo) = unpack('NN', substr($p, 16, 8)); push(@c, [$f, $off, $hi * 4294967296 + $lo]);
+      }
+      $off += 16384;
+    }
+  }
+  return @c;
+}
+# Durable before mysqld reads it (it may bypass the page cache, F_NOCACHE).
+sub patch { my ($f, $off, $bytes) = @_; open(my $h, '+<:raw', $f) or die "$f: $!"; sysseek($h, $off, 0); syswrite($h, $bytes) == length($bytes) or die; $h->sync or die "fsync $f: $!"; close($h); }
+sub tear { my ($f, $n) = @_; patch($f, $n * 16384 + 4096, "\0" x 12288); }
+# Start mysqld once with extra options; true if it failed. Its log in $log.
+sub start_fails { my ($opts, $log) = @_; my $r = system("$ENV{WT_MYSQLD} --log-error=$log $opts > /dev/null 2>&1"); return $r != 0; }
+1;
+EOF
+let WT_PAGES = $MYSQLTEST_VARDIR/tmp/wt_pages.pl;
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+  SELECT n, CONCAT('row', n) FROM s;
+CREATE TABLE src.s (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO src.s WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20)
+  SELECT n, 'pre' FROM s;
+CREATE WORKTREE w1 FROM src;
+
+--echo #
+--echo # 1. kill -9 after a first-dirty image is built, before its redo is
+--echo #    written (§6.4 row 1, §11.1): nothing of the statement survives.
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_image_before_log';
+--error CR_SERVER_LOST
+UPDATE w1.t SET v = 'lost' WHERE id <= 100;
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'lost') FROM w1.t;
+
+--echo #
+--echo # 2. Image redo durable, no flush (row 2), and pages created in an mtr,
+--echo #    never flushed (row 10): recovery rebuilds them over holes (C2).
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+let $images0 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_images', Value, 1);
+UPDATE w1.t SET v = 'kept' WHERE id <= 100;
+let $images1 = query_get_value(SHOW GLOBAL STATUS LIKE 'Innodb_worktree_images', Value, 1);
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO w1.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 10000)
+  SELECT 20000 + n, CONCAT('new', n) FROM s;
+--let $assert_text = the first UPDATE of inherited pages logged images
+--let $assert_cond = $images1 > $images0
+--source include/assert.inc
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'kept'), SUM(v LIKE 'new%') FROM w1.t;
+CHECK TABLE w1.t;
+
+--echo #
+--echo # 3. The first flush landed nothing (row 4, §11 "0 bytes"): the page is
+--echo #    still a hole; its doublewrite copy or its image restores it.
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE w1.t SET v = 'drop' WHERE id BETWEEN 5000 AND 9000;
+SET GLOBAL debug = '+d,wt_drop_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_drop_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'drop') FROM w1.t;
+CHECK TABLE w1.t;
+
+--echo #
+--echo # 4. After a checkpoint, the second flush is torn non-zero (row 6, v2
+--echo #    test 3): restored from its doublewrite copy (B).
+UPDATE w1.t SET v = 's1' WHERE id BETWEEN 10000 AND 12000;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+UPDATE w1.t SET v = 's2' WHERE id BETWEEN 10000 AND 12000;
+SET GLOBAL debug = '+d,wt_tear_overlay_writes';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL debug = '-d,wt_tear_overlay_writes';
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 's2') FROM w1.t;
+CHECK TABLE w1.t;
+
+--echo #
+--echo # 5. A stale pre-freeze doublewrite copy over a local hole (row 8, v2
+--echo #    test 4): src.s page 4 (its clustered root; page 3 is the SDI) is
+--echo #    flushed, then frozen; after a kill its copy (LSN <= F) is filtered
+--echo #    and the page stays a hole.
+UPDATE src.s SET v = 'flushed';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'src/s'`;
+CREATE WORKTREE w5 FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  printf("pre-freeze copy of src/s page 4 in the doublewrite files: %s\n", scalar(dblwr_copies($ENV{WT_S}, 4)) ? "yes" : "no");
+EOF
+--source include/start_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  printf("src/s page 4 after recovery: %s\n", page_is_zero("$ENV{WT_DD}/src/s.ibd", 4) ? "still a hole" : "RESTORED");
+EOF
+SELECT COUNT(*), SUM(v = 'flushed') FROM src.s;
+SELECT COUNT(*), SUM(v = 'flushed') FROM w5.s;
+
+--echo #
+--echo # 6. A damaged doublewrite slot with a higher LSN beside a valid one
+--echo #    (§11.5, O8): the valid copy is restored.
+--echo # (no checkpoint past the write: it was in flight at the crash)
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE w5.s SET v = 'o8';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'w5/s'`;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  my @c = sort { $b->[2] <=> $a->[2] } dblwr_copies($ENV{WT_S}, 4);
+  die "no doublewrite copy of w5/s page 4" unless @c;
+  my ($f, $off, $lsn) = @{$c[0]};
+  open(my $h, '<:raw', $f) or die; sysseek($h, $off, 0); my $p; sysread($h, $p, 16384); close($h);
+  # A copy that claims a higher LSN but fails its checksum, in a free slot.
+  my $lsn2 = $lsn + 1000; substr($p, 16, 8) = pack('NN', int($lsn2 / 4294967296), $lsn2 % 4294967296);
+  substr($p, 8000, 64) = "\xff" x 64;
+  my $placed = 0;
+  for my $g (glob("$ENV{WT_DD}/#ib_*.dblwr")) {
+    open(my $d, '<:raw', $g) or die; my $o = 0; my $q;
+    while (!$placed && sysread($d, $q, 16384) == 16384) { if ($q !~ /[^\0]/) { patch($g, $o, $p); $placed = 1; } $o += 16384; }
+    last if $placed;
+  }
+  die "no free doublewrite slot" unless $placed;
+  tear("$ENV{WT_DD}/w5/s.ibd", 4);
+  print "w5/s page 4 torn; a damaged higher-LSN copy planted\n";
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'o8') FROM w5.s;
+CHECK TABLE w5.s;
+
+--echo #
+--echo # 7. Torn page 0 with a post-freeze doublewrite copy (§11.21, O6): the
+--echo #    page-1 witness gives the id, the copy is restored, the overlay keeps
+--echo #    bit 15 and its link.
+--echo # (no checkpoint past the write: it was in flight at the crash)
+SET GLOBAL innodb_checkpoint_disabled = ON;
+CREATE WORKTREE w7 FROM src;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO w7.s WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+  SELECT 100 + n, 'grow' FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  tear("$ENV{WT_DD}/w7/s.ibd", 0);
+EOF
+--source include/start_mysqld.inc
+perl;
+  require $ENV{WT_PAGES}; my $f = "$ENV{WT_DD}/w7/s.ibd";
+  printf("w7/s after page 0 was torn: overlay bit %d, has a link %s\n", overlay_bit($f), defined(link_of($f)) ? "yes" : "no");
+EOF
+SELECT COUNT(*), SUM(v = 'grow') FROM w7.s;
+CHECK TABLE w7.s;
+
+--echo #
+--echo # 8. A layer missing while redo needs it (v2 test 10): startup stops
+--echo #    naming it, never discards the redo; with the layer back, it recovers.
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE w1.t SET v = 'redo' WHERE id <= 50;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  my $u = link_of("$ENV{WT_DD}/w1/t.ibd"); my $l = "$ENV{WT_DD}/#wtlayers/$u.ibl";
+  rename($l, "$ENV{WT_TMP}/layer.aside") or die "$l: $!";
+  my $log = "$ENV{WT_TMP}/missing_layer.err";
+  my $failed = start_fails("", $log);
+  my $named = count_in_log($log, qr/\Q$u\E/);
+  printf("startup without the layer: failed %s, names the layer %s\n", $failed ? "yes" : "NO", $named ? "yes" : "no");
+  rename("$ENV{WT_TMP}/layer.aside", $l) or die; unlink($log);
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'redo') FROM w1.t;
+
+--echo #
+--echo # 9. A corrupt layer page (v2 test 11) is a hard error, never zeros
+--echo #    and never a silent zero-fill.
+CREATE WORKTREE w9 FROM src;
+--source include/shutdown_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  my $u = link_of("$ENV{WT_DD}/w9/t.ibd"); my $l = "$ENV{WT_DD}/#wtlayers/$u.ibl";
+  chmod(0644, $l) or die; my $p = page_n($l, 4);
+  open(my $o, '>:raw', "$ENV{WT_TMP}/layer_page4") or die; print $o $p; close($o);
+  patch($l, 4 * 16384 + 8000, "\xa5" x 64);
+EOF
+--echo # (no buffer pool load: the page must be read on demand)
+--let $restart_parameters = restart: --innodb-buffer-pool-load-at-startup=0
+--source include/start_mysqld.inc
+--let $restart_parameters = restart
+--source include/expect_crash.inc
+--error CR_SERVER_LOST,ER_TABLE_CORRUPT,ER_GET_ERRMSG,ER_INTERNAL_ERROR,ER_NOT_KEYFILE,ER_GET_ERRNO
+SELECT COUNT(*), SUM(id) FROM w9.t FORCE INDEX (PRIMARY);
+let $corrupt_errno = $mysql_errno;
+perl;
+  require $ENV{WT_PAGES};
+  my $u = link_of("$ENV{WT_DD}/w9/t.ibd"); my $l = "$ENV{WT_DD}/#wtlayers/$u.ibl";
+  open(my $i, '<:raw', "$ENV{WT_TMP}/layer_page4") or die; local $/; my $p = <$i>;
+  patch($l, 4 * 16384, $p); chmod(0444, $l); unlink("$ENV{WT_TMP}/layer_page4");
+EOF
+if ($corrupt_errno == 2013)
+{
+  --echo # the read stopped the server
+  --source include/start_mysqld.inc
+}
+if ($corrupt_errno != 2013)
+{
+  --echo # the read failed
+  --remove_file $MYSQLTEST_VARDIR/tmp/mysqld.1.expect
+  --source include/restart_mysqld.inc
+}
+SELECT COUNT(*) FROM w9.t;
+
+--echo #
+--echo # 10. kill -9 during recovery, after attaching an overlay but before its
+--echo #     fsync (§6.1 step 2, v2 test 13: the mysqld-then-OS crash, as far as
+--echo #     it can be produced without a power cut): the next start recovers.
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE w1.t SET v = 'twice' WHERE id <= 50;
+--source include/kill_mysqld.inc
+perl;
+  require $ENV{WT_PAGES};
+  my $log = "$ENV{WT_TMP}/attach_crash.err";
+  printf("recovery killed before the attach fsync: %s\n", start_fails("--debug=d,wt_crash_attach_before_fsync", $log) ? "yes" : "NO");
+  unlink($log);
+EOF
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'twice') FROM w1.t;
+CHECK TABLE w1.t, w5.s, w7.s, w9.t, src.t, src.s;
+
+DROP DATABASE w9;
+DROP DATABASE w7;
+DROP DATABASE w5;
+DROP DATABASE w1;
+DROP DATABASE src;
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_pages.pl
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';

@@ -93,7 +93,7 @@ Table	Checksum
 wt2.t	2578678929
 UPDATE wt2.t SET v = CONCAT(v, '+') WHERE id BETWEEN 4000 AND 4999;
 ALTER WORKTREE wt2 MATERIALIZE;
-wt2: overlay bit 0, map present no
+wt2: overlay bit 0, map present yes
 SELECT COUNT(*), SUM(v = 'wt2'), SUM(v LIKE '%+') FROM wt2.t;
 COUNT(*)	SUM(v = 'wt2')	SUM(v LIKE '%+')
 4500	90	900

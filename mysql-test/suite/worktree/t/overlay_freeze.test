@@ -1,0 +1,201 @@
+--echo # Freeze crash safety (limits/overlay-v3.md §7.1, §7.2, §11.6, §11.22,
+--echo # v2 tests 6-8): kill -9 at every freeze step, a kill during an abort,
+--echo # every abort cause, a page dirtied after the F4 check, the reuse rule,
+--echo # and a source's page 0 changing after its freeze.
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+let WT_PL = $MYSQL_TEST_DIR/suite/worktree/include/wt_overlay.pl;
+let WT_LOG = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+call mtr.add_suppression("Worktree freeze of .* aborted");
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+  SELECT n, CONCAT('row', n) FROM s;
+
+--echo #
+--echo # 1. kill -9 after each freeze step of a writable source (v3 §7.2), each
+--echo #    with redo for the source since the last checkpoint (v2 test 4b).
+--echo #    Before the rename the source is unchanged; after it, it is an
+--echo #    overlay over one more layer. Startup GC leaves no unreachable layer
+--echo #    and no temp file, and the worktree never half-exists.
+let $points = wt_crash_freeze_after_flush wt_crash_freeze_after_link wt_crash_freeze_after_tmp wt_crash_freeze_in_gate wt_crash_freeze_in_abort wt_crash_freeze_after_rename wt_crash_freeze_after_open wt_crash_before_commit;
+let $i = 0;
+while ($points)
+{
+  let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
+  let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
+  inc $i;
+  eval UPDATE src.t SET v = 'p$i' WHERE id <= 50;
+  let $flags = +d,$point;
+  if ($point == wt_crash_freeze_in_abort)
+  {
+    let $flags = +d,wt_freeze_force_abort,wt_crash_freeze_in_abort;
+  }
+  --source include/expect_crash.inc
+  eval SET SESSION debug = '$flags';
+  --error CR_SERVER_LOST
+  CREATE WORKTREE wt FROM src;
+  --source include/start_mysqld.inc
+  let WT_POINT = $point;
+  perl;
+    require $ENV{WT_PL}; my $f = "$ENV{WT_DD}/src/t.ibd";
+    printf("%-28s src overlay bit %d, chain depth %d; unreferenced layers %d, temp files %d, wt exists %s\n",
+           $ENV{WT_POINT}, overlay_bit($f), depth($f), stray(), wttmp(), -e "$ENV{WT_DD}/wt" ? "yes" : "no");
+  EOF
+  eval SELECT COUNT(*), SUM(v = 'p$i') FROM src.t;
+}
+CHECK TABLE src.t;
+
+--echo #
+--echo # 2. kill -9 right after a read-only golden's file is linked live as a
+--echo #    layer (v3 §7.2 F2, addendum A2): GC unlinks the name; golden keeps
+--echo #    one name and stays stock-format.
+CREATE DATABASE gold;
+CREATE TABLE gold.t (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO gold.t SELECT id, v FROM src.t WHERE id <= 1000;
+ALTER SCHEMA gold READ ONLY = 1;
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_crash_after_layer_link';
+--error CR_SERVER_LOST
+CREATE WORKTREE wg FROM gold;
+--source include/start_mysqld.inc
+perl;
+  require $ENV{WT_PL}; my $g = "$ENV{WT_DD}/gold/t.ibd";
+  printf("gold: overlay bit %d, names of its inode %d; unreferenced layers %d, wg exists %s\n",
+         overlay_bit($g), nlink($g), stray(), -e "$ENV{WT_DD}/wg" ? "yes" : "no");
+EOF
+SELECT COUNT(*) FROM gold.t;
+
+--echo #
+--echo # 3. Every abort cause (v3 §7.1 F4, §11.22), injected between F1 and F4
+--echo #    on the first attempt: a page dirtied, a page written, the file
+--echo #    extended, an mtr between the image hook and the log. Each aborts
+--echo #    cleanly (no layer left) and the retry clones the right content.
+let $causes = wt_freeze_inject_dirty wt_freeze_inject_write wt_freeze_inject_extend wt_freeze_inject_commit_ref;
+let $i = 0;
+while ($causes)
+{
+  let $cause = `SELECT SUBSTRING_INDEX('$causes', ' ', 1)`;
+  let $causes = `SELECT TRIM(SUBSTR('$causes', LENGTH('$cause') + 1))`;
+  inc $i;
+  eval UPDATE src.t SET v = 'c$i' WHERE id <= 50;
+  let WT_CAUSE = $cause;
+  perl;
+    require $ENV{WT_PL};
+    open(my $o, '>', "$ENV{MYSQLTEST_VARDIR}/tmp/aborts") or die;
+    print $o count_in_log($ENV{WT_LOG}, qr/Worktree freeze of src\/t aborted .*attempt 1/);
+  EOF
+  eval SET SESSION debug = '+d,$cause';
+  eval CREATE WORKTREE wa$i FROM src;
+  eval SET SESSION debug = '-d,$cause';
+  perl;
+    require $ENV{WT_PL};
+    open(my $i, '<', "$ENV{MYSQLTEST_VARDIR}/tmp/aborts") or die; my $before = <$i>;
+    my $after = count_in_log($ENV{WT_LOG}, qr/Worktree freeze of src\/t aborted .*attempt 1/);
+    printf("%-28s aborted once: %s; unreferenced layers %d, temp files %d\n", $ENV{WT_CAUSE},
+           $after - $before == 1 ? "yes" : "NO", stray(), wttmp());
+  EOF
+  eval SELECT COUNT(*), SUM(v = 'c$i') FROM wa$i.t;
+}
+--remove_file $MYSQLTEST_VARDIR/tmp/aborts
+CHECK TABLE wa1.t, wa2.t, wa3.t, wa4.t;
+
+--echo #
+--echo # 4. A page dirtied after the F4 check, before F6 (v3 §6.4 row 11): it is
+--echo #    imaged, so recovery rebuilds it over the hole (C2), not C3.
+UPDATE src.t SET v = 'late' WHERE id <= 50;
+--source include/expect_crash.inc
+SET SESSION debug = '+d,wt_freeze_inject_dirty_late,wt_crash_freeze_after_open';
+--error CR_SERVER_LOST
+CREATE WORKTREE wl FROM src;
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'late') FROM src.t;
+CHECK TABLE src.t;
+
+--echo #
+--echo # 5. The reuse rule (v2 test 8): an overlay source unchanged since its
+--echo #    freeze is cloned without another freeze, 30 times over, its file
+--echo #    byte-identical; one write to it and the next clone freezes again.
+UPDATE src.t SET v = 'reuse' WHERE id <= 50;
+--echo # (purge first, by a slow shutdown: removing old index entries is a
+--echo # write to the source)
+SET GLOBAL innodb_fast_shutdown = 0;
+--source include/restart_mysqld.inc
+CREATE WORKTREE r0 FROM src;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+perl;
+  require $ENV{WT_PL};
+  open(my $h, '<:raw', "$ENV{WT_DD}/src/t.ibd") or die; local $/; my $d = <$h>;
+  open(my $o, '>:raw', "$ENV{MYSQLTEST_VARDIR}/tmp/src_t.copy") or die; print $o $d;
+  open(my $n, '>', "$ENV{MYSQLTEST_VARDIR}/tmp/layers") or die; print $n layers();
+EOF
+--disable_query_log
+let $i = 1;
+while ($i <= 30)
+{
+  eval CREATE WORKTREE r$i FROM src;
+  inc $i;
+}
+--enable_query_log
+perl;
+  require $ENV{WT_PL};
+  open(my $h, '<:raw', "$ENV{WT_DD}/src/t.ibd") or die; local $/; my $d = <$h>;
+  open(my $c, '<:raw', "$ENV{MYSQLTEST_VARDIR}/tmp/src_t.copy") or die; my $e = <$c>;
+  open(my $n, '<', "$ENV{MYSQLTEST_VARDIR}/tmp/layers") or die; my $before = <$n>;
+  printf("30 more clones: new layers %d, source file byte-identical %s\n", layers() - $before, $d eq $e ? "yes" : "NO");
+EOF
+UPDATE src.t SET v = 'reuse2' WHERE id = 1;
+CREATE WORKTREE r31 FROM src;
+perl;
+  require $ENV{WT_PL};
+  open(my $n, '<', "$ENV{MYSQLTEST_VARDIR}/tmp/layers") or die; my $before = <$n>;
+  printf("after one write, the next clone froze again: new layers %d\n", layers() - $before);
+EOF
+--remove_file $MYSQLTEST_VARDIR/tmp/src_t.copy
+--remove_file $MYSQLTEST_VARDIR/tmp/layers
+SELECT v FROM r30.t WHERE id = 1;
+SELECT v FROM r31.t WHERE id = 1;
+--disable_query_log
+let $i = 0;
+while ($i <= 31)
+{
+  eval DROP DATABASE r$i;
+  inc $i;
+}
+--enable_query_log
+
+--echo #
+--echo # 6. C2 regression (v2 test 7): after its freeze the source allocates
+--echo #    extents (page 0 changes) and is flushed; across a restart it keeps
+--echo #    bit 15 and its link.
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+  SELECT 10000 + n, REPEAT('x', 90) FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+--source include/restart_mysqld.inc
+perl;
+  require $ENV{WT_PL}; my $f = "$ENV{WT_DD}/src/t.ibd";
+  printf("src after growing: overlay bit %d, has a link %s\n", overlay_bit($f), defined(link_of($f)) ? "yes" : "no");
+EOF
+SELECT COUNT(*), SUM(v = 'reuse2') FROM src.t;
+CHECK TABLE src.t;
+
+DROP DATABASE wa1;
+DROP DATABASE wa2;
+DROP DATABASE wa3;
+DROP DATABASE wa4;
+ALTER SCHEMA gold READ ONLY = 0;
+DROP DATABASE gold;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_overlays';

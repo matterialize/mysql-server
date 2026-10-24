@@ -39,6 +39,7 @@ Free Software Foundation.
 #include "fts0types.h"
 #include "fil0wt.h"
 #include "fil0overlay.h"
+#include "log0buf.h"
 #include "log0chkp.h"
 #include "trx0sys.h"
 #include "buf0dblwr.h"
@@ -372,7 +373,8 @@ and nothing dirty can be linked through its own parent without a freeze. */
 bool overlay_reusable(fil_space_t *space) {
   wt_overlay_t *ov = space->wt_ov;
   if (ov == nullptr || space->size != ov->link.parent_size) return false;
-  {
+  /* Frozen and unwritten since needs no hole scan (APFS reports none). */
+  if (!ov->fresh.load()) {
     const std::lock_guard<std::mutex> guard(ov->presence_mutex);
     for (size_t p = 2; p < ov->presence.size(); ++p) {
       if (ov->presence[p] != WT_ABSENT) return false;
@@ -400,6 +402,7 @@ static void wt_debug_dirty(fil_space_t *space, page_no_t n) {
   byte *field = b->frame + FIL_PAGE_TYPE;
   mlog_write_ulint(field, mach_read_from_2(field), MLOG_2BYTES, &mtr);
   mtr.commit();
+  log_buffer_flush_to_disk(); /* durable: recovery must replay it */
 }
 #endif /* UNIV_DEBUG */
 
@@ -685,10 +688,39 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
       mtr.commit();
       return wt_error("CREATE WORKTREE: flatten raced a freeze (backstop)");
     }
-    const std::vector<byte> zeros(page_size.physical());
-    for (auto [block, no] : {std::pair{b0, page_no_t{0}}, std::pair{b1, page_no_t{1}}}) {
-      mlog_write_string(block->frame + wt_map_offset(page_size, no),
-                        zeros.data(), wt_map_size(page_size, no), &mtr);
+    /* The map loses its link but keeps the ancestors: records still carry
+    their ids (LOB references). A file that was never a worktree has none. */
+    const ulint len = page_size.physical();
+    std::vector<byte> p0(b0->frame, b0->frame + len), p1(b1->frame, b1->frame + len);
+    for (auto [p, no] : {std::pair{p0.data(), page_no_t{0}}, std::pair{p1.data(), page_no_t{1}}})
+      memset(p + wt_map_offset(page_size, no), 0, wt_map_size(page_size, no));
+    wt_map_t map;
+    if (const wt_map_t *cur = fil_wt_map(space); cur != nullptr) map = *cur;
+    map.has_link = false;
+    map.link = wt_link_t{};
+    if (!map.ancestors.empty()) {
+      ulint stub_len = 0;
+      std::vector<page_no_t> stub0, stub1;
+      bool ok = wt_map_write(map, p0.data(), page_size, 0);
+      if (ok) {
+        (void)wt_map_write(map, p1.data(), page_size, 1);
+      } else if (wt_overflow_pages_of(b0->frame, page_size, 0, &stub_len, &stub0)) {
+        ok = wt_stub_write(map, stub_len, stub0, p0.data(), page_size, 0) &&
+             (!wt_overflow_pages_of(b1->frame, page_size, 1, &stub_len, &stub1) ||
+              wt_stub_write(map, stub_len, stub1, p1.data(), page_size, 1));
+      } else {
+        ok = wt_map_write(map, p1.data(), page_size, 1) &&
+             wt_stub_write(map, 0, {}, p0.data(), page_size, 0);
+      }
+      if (!ok) {
+        mtr.commit();
+        return wt_error("ALTER WORKTREE MATERIALIZE: the map does not fit");
+      }
+    }
+    for (auto [block, p, no] : {std::tuple{b0, p0.data(), page_no_t{0}},
+                                std::tuple{b1, p1.data(), page_no_t{1}}}) {
+      const ulint off = wt_map_offset(page_size, no);
+      mlog_write_string(block->frame + off, p + off, wt_map_size(page_size, no), &mtr);
     }
     mlog_write_ulint(b0->frame + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS,
                      fsp_header_get_flags(b0->frame) & ~FSP_FLAGS_MASK_WT_OVERLAY,
@@ -712,9 +744,14 @@ std::vector<std::string> fts_aux_names(
 /** Every InnoDB table behind a DD table: the table or its leaf partitions,
 and FTS auxiliary tables. Opened tables are appended to opened. */
 bool wt_tables_of(THD *thd, const dd::Table &dd_table,
-                  std::vector<dict_table_t *> *opened) {
+                  std::vector<dict_table_t *> *opened,
+                  std::vector<MDL_ticket *> *mdls) {
   const auto open_id = [&](dd::Object_id id) {
-    dict_table_t *t = dd_table_open_on_id(id, thd, nullptr, false, true);
+    /* Its own MDL (FTS aux and partitions have none from the statement),
+    released by the caller after closing. */
+    MDL_ticket *mdl = nullptr;
+    dict_table_t *t = dd_table_open_on_id(id, thd, &mdl, false, true);
+    if (mdl != nullptr) mdls->push_back(mdl);
     if (t != nullptr) opened->push_back(t);
     return t;
   };
@@ -733,8 +770,10 @@ bool wt_tables_of(THD *thd, const dd::Table &dd_table,
       if (index->type & DICT_FTS) ids.push_back(index->id);
     }
     for (const auto &name : fts_aux_names(t, t->name.m_name, t->id, ids)) {
-      dict_table_t *aux = dd_table_open_on_name(thd, nullptr, name.c_str(),
+      MDL_ticket *mdl = nullptr;
+      dict_table_t *aux = dd_table_open_on_name(thd, &mdl, name.c_str(),
                                                 false, DICT_ERR_IGNORE_NONE);
+      if (mdl != nullptr) mdls->push_back(mdl);
       if (aux != nullptr) opened->push_back(aux);
     }
   }
@@ -1541,10 +1580,12 @@ bool innobase_worktree_refresh(handlerton *, THD *thd, const dd::Table &table) {
   if (!srv_wt_overlay) return false;
   trx_t *trx = check_trx_exists(thd);
   std::vector<dict_table_t *> opened;
+  std::vector<MDL_ticket *> mdls;
   auto close = create_scope_guard([&]() {
     for (auto *t : opened) dd_table_close(t, thd, nullptr, false);
+    for (auto *m : mdls) dd_mdl_release(thd, &m);
   });
-  if (wt_tables_of(thd, table, &opened)) return true;
+  if (wt_tables_of(thd, table, &opened, &mdls)) return true;
   /* Refresh (addendum A2): every table whose live file is a layer is frozen
   before the schema becomes writable. */
   for (dict_table_t *t : opened) {
@@ -1577,10 +1618,12 @@ bool innobase_worktree_materialize(handlerton *, THD *thd,
                                    const dd::Table &table) {
   trx_t *trx = check_trx_exists(thd);
   std::vector<dict_table_t *> opened;
+  std::vector<MDL_ticket *> mdls;
   auto close = create_scope_guard([&]() {
     for (auto *t : opened) dd_table_close(t, thd, nullptr, false);
+    for (auto *m : mdls) dd_mdl_release(thd, &m);
   });
-  if (wt_tables_of(thd, table, &opened)) return true;
+  if (wt_tables_of(thd, table, &opened, &mdls)) return true;
   for (dict_table_t *t : opened) {
     if (overlay_flatten(thd, trx, t)) return true;
   }

@@ -1,0 +1,194 @@
+# Flatten and MATERIALIZE (limits/overlay-v3.md §8, §11.9, §11.17, v2 test
+# 9): kill -9 at every flatten step with dirty inherited pages, races
+# with CREATE WORKTREE and GC, the generation backstop, and the result:
+# a standalone file that passes innochecksum and still reads its LOBs and
+# FULLTEXT index (ancestor ids live on in its records).
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), b MEDIUMTEXT, KEY (v), FULLTEXT KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 4000)
+SELECT n, CONCAT('row', n, IF(n % 100 = 0, ' narwhal', '')), IF(n % 200 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE WORKTREE wt FROM src;
+#
+# 1. kill -9 at each flatten step (v3 §8: 0 begin, 1 adopting, 2 adopted
+#    pages durable, 3 checked, 4 link cleared, 5 durable), each time with
+#    inherited pages first dirtied and left unflushed. The worktree keeps
+#    its content; it is standalone only once step 4 is durable.
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f1 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_begin';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_begin             wt overlay bit 1, has a link yes; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f1 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f1 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f2 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_adopt';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_adopt             wt overlay bit 1, has a link yes; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f2 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f2 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f3 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_after_flush';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_after_flush       wt overlay bit 1, has a link yes; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f3 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f3 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f4 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_after_check';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_after_check       wt overlay bit 1, has a link yes; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f4 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f4 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f5 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_after_clear';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_after_clear       wt overlay bit 1, has a link yes; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f5 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f5 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+UPDATE wt.t SET v = CONCAT('f6 ', id) WHERE id % 37 = 0;
+SET SESSION debug = '+d,wt_crash_flatten_after_final_flush';
+ALTER WORKTREE wt MATERIALIZE;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_flatten_after_final_flush wt overlay bit 0, has a link no; unreferenced layers 0
+SELECT COUNT(*), SUM(v LIKE 'f6 %'), SUM(LENGTH(b)) FROM wt.t;
+COUNT(*)	SUM(v LIKE 'f6 %')	SUM(LENGTH(b))
+4000	108	408000
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+#
+# 2. The generation backstop (v3 §8 step 4): a freeze that raced the
+#    flatten makes it give up, leaving the overlay intact.
+DROP DATABASE wt;
+CREATE WORKTREE wt FROM src;
+UPDATE wt.t SET v = 'gen' WHERE id = 1;
+SET SESSION debug = '+d,wt_flatten_bump_gen';
+ALTER WORKTREE wt MATERIALIZE;
+Got one of the listed errors
+SET SESSION debug = '-d,wt_flatten_bump_gen';
+SELECT v FROM wt.t WHERE id = 1;
+v
+gen
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+#
+# 3. CREATE WORKTREE from an overlay paused mid-flatten (v3 §11.17): it
+#    waits for the flatten (schema MDL) or times out, never loses its parent:
+#    the reuse-path clone of a flattened source keeps the layer alive.
+SET DEBUG_SYNC = 'wt_flatten_after_check SIGNAL flat WAIT_FOR go';
+ALTER WORKTREE wt MATERIALIZE;
+SET DEBUG_SYNC = 'now WAIT_FOR flat';
+SET SESSION lock_wait_timeout = 1;
+CREATE WORKTREE wt2 FROM wt;
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+SET SESSION lock_wait_timeout = DEFAULT;
+# A reuse-path clone of src (unchanged since its freeze) while wt is
+# paused: src is not the table being flattened, so it proceeds.
+CREATE WORKTREE wt3 FROM src;
+# GC runs (a DROP) while the flatten is paused: nothing in use goes.
+CREATE DATABASE junk;
+DROP DATABASE junk;
+CREATE WORKTREE wt2 FROM wt;
+SET DEBUG_SYNC = 'now SIGNAL go';
+SET DEBUG_SYNC = 'RESET';
+wt overlay bit 1; wt2 overlay bit 1, chain depth 1; wt3 chain depth 7; unreferenced layers 0
+# restart
+SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt2.t;
+COUNT(*)	SUM(v = 'gen')	SUM(LENGTH(b))
+4000	1	408000
+SELECT COUNT(*), SUM(v = 'gen'), SUM(LENGTH(b)) FROM wt3.t;
+COUNT(*)	SUM(v = 'gen')	SUM(LENGTH(b))
+4000	0	408000
+CHECK TABLE wt.t, wt2.t, wt3.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+wt2.t	check	status	OK
+wt3.t	check	status	OK
+#
+# 4. The materialized file: no overlay bit, no link, every page valid
+#    (innochecksum), and its records' ancestor ids still resolve: LOBs
+#    and the FULLTEXT index read back, before and after a restart.
+#    (wt2's CREATE froze wt again: materialize it once more.)
+ALTER WORKTREE wt MATERIALIZE;
+SELECT id, LENGTH(b), LEFT(b, 10) FROM wt.t WHERE id IN (200, 4000) ORDER BY id;
+id	LENGTH(b)	LEFT(b, 10)
+200	18000	lob200lob2
+4000	21000	lob4000lob
+SELECT COUNT(*) FROM wt.t WHERE MATCH (v) AGAINST ('narwhal');
+COUNT(*)
+40
+UPDATE wt.t SET b = REPEAT('new', 5000) WHERE id = 400;
+SET GLOBAL innodb_fast_shutdown = 0;
+wt/t.ibd: overlay bit 0, has a link no
+innochecksum: ok
+# restart
+SELECT id, LENGTH(b), LEFT(b, 10) FROM wt.t WHERE id IN (200, 400, 4000) ORDER BY id;
+id	LENGTH(b)	LEFT(b, 10)
+200	18000	lob200lob2
+400	15000	newnewnewn
+4000	21000	lob4000lob
+SELECT COUNT(*) FROM wt.t WHERE MATCH (v) AGAINST ('narwhal');
+COUNT(*)
+40
+CHECK TABLE wt.t;
+Table	Op	Msg_type	Msg_text
+wt.t	check	status	OK
+DROP DATABASE wt3;
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+Variable_name	Value
+Innodb_worktree_layers	0
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_overlays';
+Variable_name	Value
+Innodb_worktree_overlays	0

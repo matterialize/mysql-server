@@ -1,0 +1,214 @@
+# Freeze crash safety (limits/overlay-v3.md §7.1, §7.2, §11.6, §11.22,
+# v2 tests 6-8): kill -9 at every freeze step, a kill during an abort,
+# every abort cause, a page dirtied after the F4 check, the reuse rule,
+# and a source's page 0 changing after its freeze.
+call mtr.add_suppression("Worktree freeze of .* aborted");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(100), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 5000)
+SELECT n, CONCAT('row', n) FROM s;
+#
+# 1. kill -9 after each freeze step of a writable source (v3 §7.2), each
+#    with redo for the source since the last checkpoint (v2 test 4b).
+#    Before the rename the source is unchanged; after it, it is an
+#    overlay over one more layer. Startup GC leaves no unreachable layer
+#    and no temp file, and the worktree never half-exists.
+UPDATE src.t SET v = 'p1' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_after_flush';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_after_flush  src overlay bit 0, chain depth 0; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p1') FROM src.t;
+COUNT(*)	SUM(v = 'p1')
+5000	50
+UPDATE src.t SET v = 'p2' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_after_link';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_after_link   src overlay bit 0, chain depth 0; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p2') FROM src.t;
+COUNT(*)	SUM(v = 'p2')
+5000	50
+UPDATE src.t SET v = 'p3' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_after_tmp';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_after_tmp    src overlay bit 0, chain depth 0; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p3') FROM src.t;
+COUNT(*)	SUM(v = 'p3')
+5000	50
+UPDATE src.t SET v = 'p4' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_in_gate';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_in_gate      src overlay bit 0, chain depth 0; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p4') FROM src.t;
+COUNT(*)	SUM(v = 'p4')
+5000	50
+UPDATE src.t SET v = 'p5' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_force_abort,wt_crash_freeze_in_abort';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_in_abort     src overlay bit 0, chain depth 0; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p5') FROM src.t;
+COUNT(*)	SUM(v = 'p5')
+5000	50
+UPDATE src.t SET v = 'p6' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_after_rename';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_after_rename src overlay bit 1, chain depth 1; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p6') FROM src.t;
+COUNT(*)	SUM(v = 'p6')
+5000	50
+UPDATE src.t SET v = 'p7' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_freeze_after_open';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_freeze_after_open   src overlay bit 1, chain depth 2; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p7') FROM src.t;
+COUNT(*)	SUM(v = 'p7')
+5000	50
+UPDATE src.t SET v = 'p8' WHERE id <= 50;
+SET SESSION debug = '+d,wt_crash_before_commit';
+CREATE WORKTREE wt FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+wt_crash_before_commit       src overlay bit 1, chain depth 3; unreferenced layers 0, temp files 0, wt exists no
+SELECT COUNT(*), SUM(v = 'p8') FROM src.t;
+COUNT(*)	SUM(v = 'p8')
+5000	50
+CHECK TABLE src.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+#
+# 2. kill -9 right after a read-only golden's file is linked live as a
+#    layer (v3 §7.2 F2, addendum A2): GC unlinks the name; golden keeps
+#    one name and stays stock-format.
+CREATE DATABASE gold;
+CREATE TABLE gold.t (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO gold.t SELECT id, v FROM src.t WHERE id <= 1000;
+ALTER SCHEMA gold READ ONLY = 1;
+SET SESSION debug = '+d,wt_crash_after_layer_link';
+CREATE WORKTREE wg FROM gold;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+gold: overlay bit 0, names of its inode 1; unreferenced layers 0, wg exists no
+SELECT COUNT(*) FROM gold.t;
+COUNT(*)
+1000
+#
+# 3. Every abort cause (v3 §7.1 F4, §11.22), injected between F1 and F4
+#    on the first attempt: a page dirtied, a page written, the file
+#    extended, an mtr between the image hook and the log. Each aborts
+#    cleanly (no layer left) and the retry clones the right content.
+UPDATE src.t SET v = 'c1' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_inject_dirty';
+CREATE WORKTREE wa1 FROM src;
+SET SESSION debug = '-d,wt_freeze_inject_dirty';
+wt_freeze_inject_dirty       aborted once: yes; unreferenced layers 0, temp files 0
+SELECT COUNT(*), SUM(v = 'c1') FROM wa1.t;
+COUNT(*)	SUM(v = 'c1')
+5000	50
+UPDATE src.t SET v = 'c2' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_inject_write';
+CREATE WORKTREE wa2 FROM src;
+SET SESSION debug = '-d,wt_freeze_inject_write';
+wt_freeze_inject_write       aborted once: yes; unreferenced layers 0, temp files 0
+SELECT COUNT(*), SUM(v = 'c2') FROM wa2.t;
+COUNT(*)	SUM(v = 'c2')
+5000	50
+UPDATE src.t SET v = 'c3' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_inject_extend';
+CREATE WORKTREE wa3 FROM src;
+SET SESSION debug = '-d,wt_freeze_inject_extend';
+wt_freeze_inject_extend      aborted once: yes; unreferenced layers 0, temp files 0
+SELECT COUNT(*), SUM(v = 'c3') FROM wa3.t;
+COUNT(*)	SUM(v = 'c3')
+5000	50
+UPDATE src.t SET v = 'c4' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_inject_commit_ref';
+CREATE WORKTREE wa4 FROM src;
+SET SESSION debug = '-d,wt_freeze_inject_commit_ref';
+wt_freeze_inject_commit_ref  aborted once: yes; unreferenced layers 0, temp files 0
+SELECT COUNT(*), SUM(v = 'c4') FROM wa4.t;
+COUNT(*)	SUM(v = 'c4')
+5000	50
+CHECK TABLE wa1.t, wa2.t, wa3.t, wa4.t;
+Table	Op	Msg_type	Msg_text
+wa1.t	check	status	OK
+wa2.t	check	status	OK
+wa3.t	check	status	OK
+wa4.t	check	status	OK
+#
+# 4. A page dirtied after the F4 check, before F6 (v3 §6.4 row 11): it is
+#    imaged, so recovery rebuilds it over the hole (C2), not C3.
+UPDATE src.t SET v = 'late' WHERE id <= 50;
+SET SESSION debug = '+d,wt_freeze_inject_dirty_late,wt_crash_freeze_after_open';
+CREATE WORKTREE wl FROM src;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT COUNT(*), SUM(v = 'late') FROM src.t;
+COUNT(*)	SUM(v = 'late')
+5000	50
+CHECK TABLE src.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+#
+# 5. The reuse rule (v2 test 8): an overlay source unchanged since its
+#    freeze is cloned without another freeze, 30 times over, its file
+#    byte-identical; one write to it and the next clone freezes again.
+UPDATE src.t SET v = 'reuse' WHERE id <= 50;
+# (purge first, by a slow shutdown: removing old index entries is a
+# write to the source)
+SET GLOBAL innodb_fast_shutdown = 0;
+# restart
+CREATE WORKTREE r0 FROM src;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+30 more clones: new layers 0, source file byte-identical yes
+UPDATE src.t SET v = 'reuse2' WHERE id = 1;
+CREATE WORKTREE r31 FROM src;
+after one write, the next clone froze again: new layers 1
+SELECT v FROM r30.t WHERE id = 1;
+v
+reuse
+SELECT v FROM r31.t WHERE id = 1;
+v
+reuse2
+#
+# 6. C2 regression (v2 test 7): after its freeze the source allocates
+#    extents (page 0 changes) and is flushed; across a restart it keeps
+#    bit 15 and its link.
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+SELECT 10000 + n, REPEAT('x', 90) FROM s;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+# restart
+src after growing: overlay bit 1, has a link yes
+SELECT COUNT(*), SUM(v = 'reuse2') FROM src.t;
+COUNT(*)	SUM(v = 'reuse2')
+25000	1
+CHECK TABLE src.t;
+Table	Op	Msg_type	Msg_text
+src.t	check	status	OK
+DROP DATABASE wa1;
+DROP DATABASE wa2;
+DROP DATABASE wa3;
+DROP DATABASE wa4;
+ALTER SCHEMA gold READ ONLY = 0;
+DROP DATABASE gold;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+Variable_name	Value
+Innodb_worktree_layers	0
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_overlays';
+Variable_name	Value
+Innodb_worktree_overlays	0

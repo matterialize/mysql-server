@@ -12020,6 +12020,8 @@ bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link) {
     success = success &&
               fil_wt_overlay_attach(space, link, handle,
                                     os_file_get_size(handle));
+    /* A freeze's new file holds pages 0 and 1 only. */
+    if (success) space->wt_ov->fresh.store(true);
     if (opened_here) os_file_close(handle);
   }
   ++space->wt_gen;
@@ -12033,8 +12035,14 @@ void fil_wt_detach(space_id_t space_id) {
   fil_space_t *space = shard->get_space_by_id(space_id);
   space->flags &= ~FSP_FLAGS_MASK_WT_OVERLAY;
   fil_wt_overlay_free(space);
-  ut::delete_(space->wt_map);
-  space->wt_map = nullptr;
+  /* A flattened worktree still translates its ancestors' ids. */
+  if (space->wt_map != nullptr && !space->wt_map->ancestors.empty()) {
+    space->wt_map->has_link = false;
+    space->wt_map->link = wt_link_t{};
+  } else {
+    ut::delete_(space->wt_map);
+    space->wt_map = nullptr;
+  }
   space->wt_map_loaded = true;
   shard->mutex_release();
 }

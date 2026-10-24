@@ -99,6 +99,9 @@ struct wt_overlay_t {
   std::mutex presence_mutex;
   /** One entry per page in [0, link.parent_size). */
   std::vector<uint8_t> presence;
+  /** True from a freeze until a page >= 2 becomes local: the file then holds
+  pages 0 and 1 only, whether or not the filesystem reports its holes. */
+  std::atomic<bool> fresh{false};
 
   wt_presence_t get(page_no_t page_no);
   void set(page_no_t page_no, wt_presence_t state);
