@@ -5852,8 +5852,7 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
     read_page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);
     read_space_id = mach_read_from_4(frame + FIL_PAGE_SPACE_ID);
 
-    if (read_space_id != space_id && read_page_no == page_no &&
-        !bpage->size.is_compressed()) {
+    if (read_space_id != space_id && read_page_no == page_no) {
       /* Recognise an untouched worktree page before the mismatch retries;
       it is translated only after its on-disk checksum is validated. */
       wt_map = fil_wt_map(bpage->get_space());
@@ -5981,7 +5980,15 @@ bool buf_page_io_complete(buf_page_t *bpage, bool evict, IORequest *type,
     /* In RAM only: the page is not dirtied, so it keeps sharing its disk
     block with the ancestor until it is really modified. */
     if (wt_map != nullptr) {
-      wt_translate_page(*wt_map, space_id, frame);
+      if (bpage->size.is_compressed()) {
+        wt_translate_page(*wt_map, space_id, bpage->size,
+                          uncompressed
+                              ? reinterpret_cast<buf_block_t *>(bpage)->frame
+                              : nullptr,
+                          bpage->zip.data);
+      } else {
+        wt_translate_page(*wt_map, space_id, bpage->size, frame, nullptr);
+      }
     }
 
     if (recv_recovery_is_on()) {

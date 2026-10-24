@@ -2,10 +2,6 @@
 # leave nothing behind.
 CREATE DATABASE src;
 CREATE TABLE src.ok (id INT PRIMARY KEY);
-CREATE TABLE src.z (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8;
-CREATE WORKTREE wt FROM src;
-ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of ROW_FORMAT=COMPRESSED tables'
-DROP TABLE src.z;
 CREATE TABLE src.m (id INT PRIMARY KEY) ENGINE=MyISAM;
 CREATE WORKTREE wt FROM src;
 ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of a schema with non-InnoDB tables'

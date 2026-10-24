@@ -833,9 +833,13 @@ dberr_t Datafile::find_space_id() {
       pick the ancestor and restore the ancestor's page 0 over ours. The map
       copy in page 1 names the file's own id (fork-design.md §10.1 item 4). */
       space_id_t wt_self;
-      std::vector<space_id_t> wt_ancestors;
-      if (j == 1 && noncompressed_ok &&
-          wt_page1_self(page, univ_page_size, &wt_self, &wt_ancestors)) {
+      if (j == 1 && (noncompressed_ok || compressed_ok) &&
+          wt_page1_self(page,
+                        noncompressed_ok
+                            ? univ_page_size
+                            : page_size_t(page_size, univ_page_size.logical(),
+                                          true),
+                        &wt_self)) {
         ib::info() << "Datafile '" << m_filepath << "' is a worktree; its "
                    << "own space id " << wt_self << " is taken from page 1";
         ut::aligned_free(page);

@@ -20,6 +20,7 @@ Free Software Foundation.
 #ifndef fil0wt_h
 #define fil0wt_h
 
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -36,7 +37,15 @@ constexpr size_t WT_MAX_ANCESTORS = 16;
 and, as a redundant copy, of page 1 (§12.1 H5). On disk (big-endian): magic,
 n_ancestors, n_indexes, n_roots, crc32 of the rest, self space id,
 generation, then ancestor space ids (4 bytes each), (old index id, new index
-id) pairs (8 + 8 bytes), and B-tree root page numbers incl. the SDI root (4). */
+id) pairs (8 + 8 bytes), and B-tree root page numbers incl. the SDI root (4).
+
+When the map does not fit in a header page's tail (small compressed pages,
+long chains), the tail holds an overflow stub instead (fork-design.md §10.1
+item 5): magic "WTO1", the byte length of the map, the number of overflow
+pages, crc32 of the rest, self, generation, then the overflow page numbers.
+The map bytes (same format as above) fill the data area of those pages, which
+the file's own allocator has marked used. Page 0 and page 1 point to separate
+copies. */
 struct wt_map_t {
   /** The tablespace this map belongs to (lets startup tell a worktree's own
   copy from an ancestor's, and identify a file whose page 0 is lost). */
@@ -57,33 +66,66 @@ struct wt_map_t {
   space_index_t map_index(space_index_t old_id) const;
 };
 
-/** Parse the ancestor map in page 0.
-@param[in]  page0  page 0 as read from disk
+/** Reads page page_no of the tablespace's file as stored (decrypted). */
+using wt_page_reader = std::function<bool(page_no_t page_no, byte *page)>;
+
+/** Parse the ancestor map in header page page_no (0 or 1), inline or through
+its overflow pages.
+@param[in]  page  the header page as read from disk
 @param[in]  page_size  tablespace page size
+@param[in]  page_no  0 or 1
+@param[in]  read  reads overflow pages (may be empty: then only an inline map
+                  is accepted)
 @param[out] map  the map
-@return true if page 0 carries a valid map */
-bool wt_map_read(const byte *page0, const page_size_t &page_size,
-                 wt_map_t *map);
+@return true if the page carries a valid map */
+bool wt_map_read(const byte *page, const page_size_t &page_size,
+                 page_no_t page_no, const wt_page_reader &read, wt_map_t *map);
 
-/** Write the ancestor map into page 0 (the caller recomputes the checksum).
+/** Write the ancestor map inline into header page page_no (the caller
+recomputes the checksum).
 @return false if the map does not fit */
-[[nodiscard]] bool wt_map_write(const wt_map_t &map, byte *page0,
-                                const page_size_t &page_size);
+[[nodiscard]] bool wt_map_write(const wt_map_t &map, byte *page,
+                                const page_size_t &page_size,
+                                page_no_t page_no);
 
-/** Load a tablespace's ancestor map from page 0. Called once, when the first
-file of the tablespace is opened, before any page of it is read.
+/** Offset and size of the map area of header page page_no (0 or 1). */
+ulint wt_map_offset(const page_size_t &page_size, page_no_t page_no);
+ulint wt_map_size(const page_size_t &page_size, page_no_t page_no);
+
+/** The map in its on-disk format, for overflow pages. */
+std::vector<byte> wt_map_serialize(const wt_map_t &map);
+
+/** Map bytes held by one overflow page. */
+ulint wt_overflow_capacity(const page_size_t &page_size);
+
+/** Write an overflow stub into header page page_no.
+@return false if the stub does not fit */
+[[nodiscard]] bool wt_stub_write(const wt_map_t &map, ulint map_len,
+                                 const std::vector<page_no_t> &pages, byte *page,
+                                 const page_size_t &page_size,
+                                 page_no_t page_no);
+
+/** Load a tablespace's ancestor map from its header pages. Called once, when
+the first file of the tablespace is opened, before any page of it is read.
 @param[in,out]  space  tablespace
-@param[in]  page0  page 0 as read from disk */
-void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1);
+@param[in]  page0  page 0 as read from disk
+@param[in]  page1  page 1 as read from disk (decrypted), or nullptr
+@param[in]  read  reads overflow pages */
+void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1,
+                 const wt_page_reader &read);
 
-/** Read the map copy in page 1 of a file whose page 0 may be lost.
+/** Install a map known in memory (a clone being written, before its header
+pages point to their overflow pages). */
+void fil_wt_set(fil_space_t *space, const wt_map_t &map);
+
+/** The file's own space id from the map copy in page 1 of a file whose page
+0 may be lost (inline map or overflow stub).
 @param[in]  page1  page 1 as read from disk (checksum already validated)
 @param[in]  page_size  page size
 @param[out] self  the file's own space id
-@param[out] ancestors  ancestor space ids (never a valid id for this file)
 @return true if page 1 carries a valid map copy */
 bool wt_page1_self(const byte *page1, const page_size_t &page_size,
-                   space_id_t *self, std::vector<space_id_t> *ancestors);
+                   space_id_t *self);
 
 /** @return the ancestor map of a tablespace, or nullptr if it is not a
 worktree. Valid while the caller holds a reference to the space. */
@@ -108,11 +150,16 @@ bool wt_ancestors_allow(space_id_t space_id, const std::string &path);
 
 /** Translate a page read from an ancestor into this tablespace's identity, in
 RAM only: header space id, index id, root segment headers, then checksum. The
-caller has already validated the checksum of the bytes read from disk.
+caller has already validated the checksum of the bytes read from disk. A
+compressed page keeps its FIL and page headers uncompressed at the same offsets
+in both copies, so both are patched alike.
 @param[in]  map  ancestor map of the tablespace
 @param[in]  space_id  this tablespace
-@param[in,out]  frame  uncompressed page frame */
-void wt_translate_page(const wt_map_t &map, space_id_t space_id, byte *frame);
+@param[in]  page_size  tablespace page size
+@param[in,out]  frame  uncompressed page frame, or nullptr
+@param[in,out]  zip  compressed page, or nullptr */
+void wt_translate_page(const wt_map_t &map, space_id_t space_id,
+                       const page_size_t &page_size, byte *frame, byte *zip);
 
 /** Recompute the page checksum in RAM, the way a flush would. */
 void wt_page_recalc_checksum(byte *frame, const page_size_t &page_size);

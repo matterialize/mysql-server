@@ -1085,4 +1085,11 @@ page_no_t fseg_alloc_page_no(fil_space_t *space, const page_size_t &page_size,
 bool fsp_extend_by_default_size(space_id_t space_id, bool make_old,
                                 size_t &space_size);
 
+/** Allocate one page of a tablespace outside any segment, for the overflow
+pages of a worktree's ancestor map (fil0wt.h). The caller holds the space
+X-latch in mtr.
+@return the X-latched, initialized page, or nullptr if the space is full */
+buf_block_t *fsp_alloc_wt_page(space_id_t space, const page_size_t &page_size,
+                               mtr_t *mtr);
+
 #endif

@@ -24,6 +24,8 @@ Free Software Foundation.
 
 #include "buf0checksum.h"
 #include "dict0dict.h"
+#include "fsp0fsp.h"
+#include "os0enc.h"
 #include "fsp0types.h"
 #include "mach0data.h"
 #include "page0types.h"
@@ -41,46 +43,38 @@ constexpr ulint WT_HDR_SELF = 20;
 constexpr ulint WT_HDR_GENERATION = 24;
 constexpr ulint WT_HDR_SIZE = 32;
 
-/** Map area: the last quarter of the page. On page 0, InnoDB never uses it
-(the XDES array, encryption info and SDI root pointer end well before it); on
-page 1 (the change buffer bitmap) the bitmap ends at about half the page. */
-ulint wt_map_size(const page_size_t &page_size) {
-  return page_size.physical() / 4;
-}
+/* Overflow stub: magic, map length, n_pages, crc, then (CRC-covered) self,
+generation and the page numbers. */
+constexpr uint32_t WT_STUB_MAGIC = 0x57544F31; /* "WTO1" */
+constexpr ulint WT_STUB_LEN = 4;
+constexpr ulint WT_STUB_N_PAGES = 8;
+constexpr ulint WT_STUB_CRC = 12;
+constexpr ulint WT_STUB_SELF = 16;
+constexpr ulint WT_STUB_GENERATION = 20;
+constexpr ulint WT_STUB_SIZE = 28;
 
-ulint wt_map_offset(const page_size_t &page_size) {
-  return page_size.physical() - FIL_PAGE_DATA_END - wt_map_size(page_size);
-}
+/** IBUF_BITS_PER_PAGE (ibuf0ibuf.cc) */
+constexpr ulint WT_IBUF_BITS_PER_PAGE = 4;
 
 bool is_btree_page(page_type_t type) {
   return type == FIL_PAGE_INDEX || type == FIL_PAGE_RTREE ||
          type == FIL_PAGE_SDI;
 }
-}  // namespace
 
-bool wt_map_t::is_ancestor(space_id_t space_id) const {
-  return std::find(ancestors.begin(), ancestors.end(), space_id) !=
-         ancestors.end();
-}
-
-space_index_t wt_map_t::map_index(space_index_t old_id) const {
-  auto it = std::lower_bound(
-      index_map.begin(), index_map.end(), old_id,
-      [](const auto &e, space_index_t id) { return e.first < id; });
-  return it != index_map.end() && it->first == old_id ? it->second : 0;
-}
-
-bool wt_map_read(const byte *page0, const page_size_t &page_size,
-                 wt_map_t *map) {
-  const byte *p = page0 + wt_map_offset(page_size);
-  if (mach_read_from_4(p + WT_HDR_MAGIC) != WT_MAP_MAGIC) return false;
+/** Parse a map in its on-disk format from p (avail bytes). */
+bool wt_map_parse(const byte *p, ulint avail, wt_map_t *map) {
+  if (avail < WT_HDR_SIZE || mach_read_from_4(p + WT_HDR_MAGIC) != WT_MAP_MAGIC)
+    return false;
 
   const ulint n_anc = mach_read_from_4(p + WT_HDR_N_ANCESTORS);
   const ulint n_idx = mach_read_from_4(p + WT_HDR_N_INDEXES);
   const ulint n_roots = mach_read_from_4(p + WT_HDR_N_ROOTS);
+  if (n_anc == 0 || n_anc > WT_MAX_ANCESTORS || n_idx > avail ||
+      n_roots > avail) {
+    return false;
+  }
   const ulint len = n_anc * 4 + n_idx * 16 + n_roots * 4;
-  if (n_anc == 0 || n_anc > WT_MAX_ANCESTORS ||
-      WT_HDR_SIZE + len > wt_map_size(page_size) ||
+  if (WT_HDR_SIZE + len > avail ||
       mach_read_from_4(p + WT_HDR_CRC) !=
           ut_crc32(p + WT_HDR_SELF, WT_HDR_SIZE - WT_HDR_SELF + len)) {
     return false;
@@ -105,17 +99,102 @@ bool wt_map_read(const byte *page0, const page_size_t &page_size,
   return true;
 }
 
-bool wt_map_write(const wt_map_t &map, byte *page0,
-                  const page_size_t &page_size) {
-  const ulint len =
-      map.ancestors.size() * 4 + map.index_map.size() * 16 + map.roots.size() * 4;
-  if (map.ancestors.empty() || map.ancestors.size() > WT_MAX_ANCESTORS ||
-      WT_HDR_SIZE + len > wt_map_size(page_size)) {
+/** Parse an overflow stub; pages may be nullptr. */
+bool wt_stub_parse(const byte *p, ulint avail, space_id_t *self,
+                   uint64_t *generation, ulint *map_len,
+                   std::vector<page_no_t> *pages) {
+  if (avail < WT_STUB_SIZE || mach_read_from_4(p) != WT_STUB_MAGIC) return false;
+  const ulint n = mach_read_from_4(p + WT_STUB_N_PAGES);
+  if (n == 0 || WT_STUB_SIZE + n * 4 > avail ||
+      mach_read_from_4(p + WT_STUB_CRC) !=
+          ut_crc32(p + WT_STUB_SELF, WT_STUB_SIZE - WT_STUB_SELF + n * 4)) {
     return false;
   }
+  *self = mach_read_from_4(p + WT_STUB_SELF);
+  *generation = mach_read_from_8(p + WT_STUB_GENERATION);
+  *map_len = mach_read_from_4(p + WT_STUB_LEN);
+  if (pages != nullptr) {
+    pages->clear();
+    for (ulint i = 0; i < n; ++i) {
+      pages->push_back(mach_read_from_4(p + WT_STUB_SIZE + i * 4));
+    }
+  }
+  return true;
+}
+}  // namespace
 
-  byte *p = page0 + wt_map_offset(page_size);
-  memset(p, 0, wt_map_size(page_size));
+/** Map area of header page page_no. Uncompressed: the last quarter of the page
+(on page 0 the XDES array, encryption info and SDI root pointer end well
+before it; on page 1 the change buffer bitmap ends at about half the page).
+Compressed pages are as small as 1 KB, where that rule would overlap header
+data, so the area starts right after it. */
+ulint wt_map_offset(const page_size_t &page_size, page_no_t page_no) {
+  if (!page_size.is_compressed()) {
+    return page_size.physical() - FIL_PAGE_DATA_END - page_size.physical() / 4;
+  }
+  const ulint end =
+      page_no == 0
+          ? fsp_header_get_encryption_progress_offset(page_size) +
+                Encryption::OPERATION_INFO_SIZE + Encryption::PROGRESS_INFO_SIZE
+          : FIL_PAGE_DATA + UT_BITS_IN_BYTES(page_size.physical() *
+                                             WT_IBUF_BITS_PER_PAGE);
+  return ut_calc_align(end, 8);
+}
+
+ulint wt_map_size(const page_size_t &page_size, page_no_t page_no) {
+  return page_size.physical() - FIL_PAGE_DATA_END -
+         wt_map_offset(page_size, page_no);
+}
+
+bool wt_map_t::is_ancestor(space_id_t space_id) const {
+  return std::find(ancestors.begin(), ancestors.end(), space_id) !=
+         ancestors.end();
+}
+
+space_index_t wt_map_t::map_index(space_index_t old_id) const {
+  auto it = std::lower_bound(
+      index_map.begin(), index_map.end(), old_id,
+      [](const auto &e, space_index_t id) { return e.first < id; });
+  return it != index_map.end() && it->first == old_id ? it->second : 0;
+}
+
+bool wt_map_read(const byte *page, const page_size_t &page_size,
+                 page_no_t page_no, const wt_page_reader &read, wt_map_t *map) {
+  const byte *p = page + wt_map_offset(page_size, page_no);
+  const ulint avail = wt_map_size(page_size, page_no);
+  if (wt_map_parse(p, avail, map)) return true;
+
+  space_id_t self;
+  uint64_t generation;
+  ulint len;
+  std::vector<page_no_t> pages;
+  if (!read || !wt_stub_parse(p, avail, &self, &generation, &len, &pages))
+    return false;
+  const ulint cap = wt_overflow_capacity(page_size);
+  if (len > pages.size() * cap) return false;
+
+  std::vector<byte> bytes;
+  auto buf = static_cast<byte *>(
+      ut::aligned_alloc(page_size.physical(), page_size.physical()));
+  bool ok = true;
+  for (page_no_t no : pages) {
+    if (!read(no, buf) || mach_read_from_4(buf + FIL_PAGE_OFFSET) != no ||
+        mach_read_from_4(buf + FIL_PAGE_SPACE_ID) != self) {
+      ok = false;
+      break;
+    }
+    bytes.insert(bytes.end(), buf + FIL_PAGE_DATA, buf + FIL_PAGE_DATA + cap);
+  }
+  ut::aligned_free(buf);
+  return ok && wt_map_parse(bytes.data(), len, map) && map->self == self &&
+         map->generation == generation;
+}
+
+std::vector<byte> wt_map_serialize(const wt_map_t &map) {
+  const ulint len =
+      map.ancestors.size() * 4 + map.index_map.size() * 16 + map.roots.size() * 4;
+  std::vector<byte> out(WT_HDR_SIZE + len);
+  byte *p = out.data();
   byte *q = p + WT_HDR_SIZE;
   for (auto id : map.ancestors) {
     mach_write_to_4(q, id);
@@ -138,25 +217,64 @@ bool wt_map_write(const wt_map_t &map, byte *page0,
   mach_write_to_8(p + WT_HDR_GENERATION, map.generation);
   mach_write_to_4(p + WT_HDR_CRC,
                   ut_crc32(p + WT_HDR_SELF, WT_HDR_SIZE - WT_HDR_SELF + len));
+  return out;
+}
+
+bool wt_map_write(const wt_map_t &map, byte *page, const page_size_t &page_size,
+                  page_no_t page_no) {
+  if (map.ancestors.empty() || map.ancestors.size() > WT_MAX_ANCESTORS)
+    return false;
+  const auto bytes = wt_map_serialize(map);
+  if (bytes.size() > wt_map_size(page_size, page_no)) return false;
+  byte *p = page + wt_map_offset(page_size, page_no);
+  memset(p, 0, wt_map_size(page_size, page_no));
+  memcpy(p, bytes.data(), bytes.size());
   return true;
 }
 
-void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1) {
+ulint wt_overflow_capacity(const page_size_t &page_size) {
+  return page_size.physical() - FIL_PAGE_DATA - FIL_PAGE_DATA_END;
+}
+
+bool wt_stub_write(const wt_map_t &map, ulint map_len,
+                   const std::vector<page_no_t> &pages, byte *page,
+                   const page_size_t &page_size, page_no_t page_no) {
+  if (WT_STUB_SIZE + pages.size() * 4 > wt_map_size(page_size, page_no))
+    return false;
+  byte *p = page + wt_map_offset(page_size, page_no);
+  memset(p, 0, wt_map_size(page_size, page_no));
+  mach_write_to_4(p, WT_STUB_MAGIC);
+  mach_write_to_4(p + WT_STUB_LEN, map_len);
+  mach_write_to_4(p + WT_STUB_N_PAGES, pages.size());
+  mach_write_to_4(p + WT_STUB_SELF, map.self);
+  mach_write_to_8(p + WT_STUB_GENERATION, map.generation);
+  for (ulint i = 0; i < pages.size(); ++i) {
+    mach_write_to_4(p + WT_STUB_SIZE + i * 4, pages[i]);
+  }
+  mach_write_to_4(p + WT_STUB_CRC,
+                  ut_crc32(p + WT_STUB_SELF,
+                           WT_STUB_SIZE - WT_STUB_SELF + pages.size() * 4));
+  return true;
+}
+
+void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1,
+                 const wt_page_reader &read) {
   if (space->wt_map_loaded) return;
   space->wt_map_loaded = true;
 
   const page_size_t page_size(space->flags);
-  if (page_size.is_compressed()) return;
 
   /* Two copies (page 0, page 1); use the newest valid one that is ours. A
   copy whose self id is not this space belongs to an ancestor's file. */
   auto map = ut::new_withkey<wt_map_t>(UT_NEW_THIS_FILE_PSI_KEY);
   wt_map_t copy;
-  const bool ok0 = wt_map_read(page0, page_size, map) && map->self == space->id;
-  const bool ok1 = page1 != nullptr && wt_map_read(page1, page_size, &copy) &&
+  const bool ok0 = wt_map_read(page0, page_size, 0, read, map) &&
+                   map->self == space->id;
+  const bool ok1 = page1 != nullptr &&
+                   wt_map_read(page1, page_size, 1, read, &copy) &&
                    copy.self == space->id;
   if (ok1 && (!ok0 || copy.generation > map->generation)) {
-    if (!ok0 && mach_read_from_4(page0 + wt_map_offset(page_size)) != 0) {
+    if (!ok0 && mach_read_from_4(page0 + wt_map_offset(page_size, 0)) != 0) {
       ib::warn() << "Worktree map in page 0 of tablespace " << space->name
                  << " is damaged; using the copy in page 1.";
     }
@@ -168,13 +286,24 @@ void fil_wt_load(fil_space_t *space, const byte *page0, const byte *page1) {
   space->wt_map = map;
 }
 
+void fil_wt_set(fil_space_t *space, const wt_map_t &map) {
+  ut::delete_(space->wt_map);
+  space->wt_map = ut::new_withkey<wt_map_t>(UT_NEW_THIS_FILE_PSI_KEY, map);
+  space->wt_map_loaded = true;
+}
+
 bool wt_page1_self(const byte *page1, const page_size_t &page_size,
-                   space_id_t *self, std::vector<space_id_t> *ancestors) {
+                   space_id_t *self) {
+  const byte *p = page1 + wt_map_offset(page_size, 1);
+  const ulint avail = wt_map_size(page_size, 1);
   wt_map_t map;
-  if (!wt_map_read(page1, page_size, &map)) return false;
-  *self = map.self;
-  *ancestors = map.ancestors;
-  return true;
+  if (wt_map_parse(p, avail, &map)) {
+    *self = map.self;
+    return true;
+  }
+  uint64_t generation;
+  ulint len;
+  return wt_stub_parse(p, avail, self, &generation, &len, nullptr);
 }
 
 const wt_map_t *fil_wt_map(const fil_space_t *space) {
@@ -191,7 +320,16 @@ bool fil_wt_is_same_or_ancestor(space_id_t space_id, space_id_t ancestor) {
 }
 
 void wt_page_recalc_checksum(byte *frame, const page_size_t &page_size) {
-  ut_a(!page_size.is_compressed());
+  if (page_size.is_compressed()) {
+    /* As buf_flush_update_zip_checksum(), without touching FIL_PAGE_LSN. */
+    BlockReporter reporter(false, nullptr, univ_page_size, false);
+    mach_write_to_4(frame + FIL_PAGE_SPACE_OR_CHKSUM,
+                    reporter.calc_zip_checksum(
+                        frame, page_size.physical(),
+                        static_cast<srv_checksum_algorithm_t>(
+                            srv_checksum_algorithm)));
+    return;
+  }
   uint32_t checksum = BUF_NO_CHECKSUM_MAGIC;
 
   switch ((srv_checksum_algorithm_t)srv_checksum_algorithm) {
@@ -215,29 +353,41 @@ void wt_page_recalc_checksum(byte *frame, const page_size_t &page_size) {
                   checksum);
 }
 
-void wt_translate_page(const wt_map_t &map, space_id_t space_id, byte *frame) {
+namespace {
+/** Patch the identity fields of one copy of a page (header bytes only). */
+void wt_patch_header(const wt_map_t &map, space_id_t space_id, byte *frame) {
   mach_write_to_4(frame + FIL_PAGE_SPACE_ID, space_id);
 
-  if (is_btree_page(fil_page_get_type(frame))) {
-    byte *id_ptr = frame + PAGE_HEADER + PAGE_INDEX_ID;
-    const space_index_t new_id = map.map_index(mach_read_from_8(id_ptr));
-    /* Unmapped: the SDI index (its id is a constant) or a free page of a
-    dropped index, which nothing references. */
-    if (new_id != 0) mach_write_to_8(id_ptr, new_id);
+  if (!is_btree_page(fil_page_get_type(frame))) return;
+  byte *id_ptr = frame + PAGE_HEADER + PAGE_INDEX_ID;
+  const space_index_t new_id = map.map_index(mach_read_from_8(id_ptr));
+  /* Unmapped: the SDI index (its id is a constant) or a free page of a
+  dropped index, which nothing references. */
+  if (new_id != 0) mach_write_to_8(id_ptr, new_id);
 
-    const page_no_t page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);
-    if (std::find(map.roots.begin(), map.roots.end(), page_no) !=
-        map.roots.end()) {
-      for (ulint seg : {PAGE_BTR_SEG_LEAF, PAGE_BTR_SEG_TOP}) {
-        byte *hdr = frame + PAGE_HEADER + seg + FSEG_HDR_SPACE;
-        if (map.is_ancestor(mach_read_from_4(hdr))) {
-          mach_write_to_4(hdr, space_id);
-        }
+  const page_no_t page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);
+  if (std::find(map.roots.begin(), map.roots.end(), page_no) !=
+      map.roots.end()) {
+    for (ulint seg : {PAGE_BTR_SEG_LEAF, PAGE_BTR_SEG_TOP}) {
+      byte *hdr = frame + PAGE_HEADER + seg + FSEG_HDR_SPACE;
+      if (map.is_ancestor(mach_read_from_4(hdr))) {
+        mach_write_to_4(hdr, space_id);
       }
     }
   }
+}
+}  // namespace
 
-  wt_page_recalc_checksum(frame, univ_page_size);
+void wt_translate_page(const wt_map_t &map, space_id_t space_id,
+                       const page_size_t &page_size, byte *frame, byte *zip) {
+  if (frame != nullptr) wt_patch_header(map, space_id, frame);
+  if (zip != nullptr) {
+    wt_patch_header(map, space_id, zip);
+    wt_page_recalc_checksum(zip, page_size);
+  } else {
+    /* The frame of a compressed page is never written; only zip is. */
+    wt_page_recalc_checksum(frame, univ_page_size);
+  }
 }
 
 namespace {

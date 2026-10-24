@@ -1806,6 +1806,14 @@ returned block is not allocated nor initialized otherwise */
                           init_mtr));
 }
 
+buf_block_t *fsp_alloc_wt_page(space_id_t space, const page_size_t &page_size,
+                               mtr_t *mtr) {
+  const page_no_t page_no = fsp_alloc_page_no(space, page_size, 0, mtr);
+  if (page_no == FIL_NULL) return nullptr;
+  return fsp_page_create(page_id_t(space, page_no), page_size, RW_X_LATCH, mtr,
+                         mtr);
+}
+
 /** Frees a single page of a space.
 The page is marked as free and clean.
 @param[in]      page_id         Page id

@@ -38,6 +38,8 @@ Free Software Foundation.
 #include "ha_prototypes.h"
 #include "ibuf0ibuf.h"
 #include "log0ddl.h"
+#include "mtr0log.h"
+#include "os0file.h"
 #include "my_dbug.h"
 #include "mysqld_error.h"
 #include "scope_guard.h"
@@ -58,6 +60,9 @@ Free Software Foundation.
 
 /** FTS common auxiliary table suffixes (fts0fts.cc). */
 extern const char *fts_common_tables[];
+
+/** Serializes master key rotation (ha_innodb.cc). */
+extern ib_mutex_t master_key_id_mutex;
 
 namespace {
 
@@ -94,6 +99,40 @@ int reflink(const char *src, const char *dst) {
 #endif
 }
 
+/** Report a failed reflink; a filesystem without file clones gets an error
+that says so. */
+bool wt_reflink_error(const std::string &path) {
+  if (errno == EOPNOTSUPP || errno == ENOTSUP || errno == EXDEV ||
+      errno == EINVAL || errno == ENOTTY) {
+    const std::string what =
+        "CREATE WORKTREE on a filesystem without copy-on-write file clones "
+        "(reflink) at '" +
+        path.substr(0, path.rfind('/')) +
+        "'; it needs APFS, XFS with reflink=1, or btrfs";
+    my_error(ER_NOT_SUPPORTED_YET, MYF(0), what.c_str());
+    return true;
+  }
+  return wt_os_error("reflink (APFS clonefile / FICLONE) to", path);
+}
+
+/** Check that dir's filesystem can clone files before anything is quiesced
+or written, so an unsupported filesystem fails cleanly. */
+bool probe_reflink(const std::string &dir) {
+  const std::string a = dir + "/#wt_probe", b = a + ".clone";
+  unlink(a.c_str());
+  unlink(b.c_str());
+  const int fd = open(a.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
+  if (fd < 0) return wt_os_error("create", a);
+  const bool written = write(fd, "x", 1) == 1;
+  close(fd);
+  const int ret = written ? reflink(a.c_str(), b.c_str()) : -1;
+  const int err = errno;
+  unlink(a.c_str());
+  unlink(b.c_str());
+  errno = err;
+  return ret != 0 && wt_reflink_error(b);
+}
+
 /** fsync a file or directory. Plain fsync, not F_FULLFSYNC: the same
 durability InnoDB itself uses for data and redo files on macOS. */
 int sync_path(const char *path, int flags) {
@@ -108,57 +147,57 @@ using Id_map = std::vector<std::pair<space_index_t, space_index_t>>;
 
 /** Rewrite the two header pages of a clone: page 0 (new space id, primary
 ancestor map) and page 1 (the change buffer bitmap: re-stamped, redundant map
-copy, §12.1 H5). Both are fsynced before the file may get its .ibd name. */
+copy, §12.1 H5). Both are fsynced before the file may get its .ibd name. Page 1
+of an encrypted space is encrypted with the tablespace key, which the clone
+shares; page 0 never is.
+@param[out] overflow  set if the map does not fit in the header pages: they
+then carry the new space id and no map, and write_overflow() completes them */
 bool rewrite_header_pages(const std::string &path, space_id_t space_id,
                           space_id_t src_space_id, const page_size_t &page_size,
-                          const Id_map &ids, const std::vector<page_no_t> &roots) {
+                          const Encryption_metadata &enc, const wt_map_t &map,
+                          bool *overflow) {
   int fd = open(path.c_str(), O_RDWR);
   if (fd < 0) return wt_os_error("open", path);
   auto guard = create_scope_guard([fd]() { close(fd); });
+  pfs_os_file_t file;
+#ifdef UNIV_PFS_IO
+  file.m_psi = nullptr;
+#endif
+  file.m_file = fd;
 
   const ulint len = page_size.physical();
   auto pages = static_cast<byte *>(ut::aligned_alloc(2 * len, len));
   auto free_guard = create_scope_guard([pages]() { ut::aligned_free(pages); });
   byte *page0 = pages;
   byte *page1 = pages + len;
-  if (pread(fd, pages, 2 * len, 0) != static_cast<ssize_t>(2 * len))
+  IORequest read1(IORequest::READ);
+  if (enc.can_encrypt()) read1.get_encryption_info().set(enc);
+  if (pread(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
+      os_file_read(read1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
     return wt_os_error("read header pages of", path);
   ut_a(fsp_header_get_space_id(page0) == src_space_id);
   ut_a(fil_page_get_type(page1) == FIL_PAGE_IBUF_BITMAP);
 
-  /* A worktree of a worktree inherits its source's ancestors; their index ids
-  map straight to ours. */
-  wt_map_t src_map;
-  const bool src_is_wt = wt_map_read(page0, page_size, &src_map) ||
-                         wt_map_read(page1, page_size, &src_map);
-
-  wt_map_t map;
-  map.self = space_id;
-  map.generation = 1;
-  map.ancestors.push_back(src_space_id);
-  map.index_map = ids;
-  map.roots = roots;
-  if (src_is_wt) {
-    for (auto anc : src_map.ancestors) map.ancestors.push_back(anc);
-    for (auto &e : src_map.index_map) {
-      for (auto &id : ids) {
-        if (id.first == e.second) map.index_map.emplace_back(e.first, id.second);
-      }
-    }
-  }
-  std::sort(map.index_map.begin(), map.index_map.end());
-
-  for (byte *page : {page0, page1}) {
+  *overflow = false;
+  for (page_no_t no : {0, 1}) {
+    byte *page = no == 0 ? page0 : page1;
     mach_write_to_4(page + FIL_PAGE_SPACE_ID, space_id);
-    if (!wt_map_write(map, page, page_size)) {
-      return wt_error("CREATE WORKTREE: ancestor chain or index count too large");
+    if (!*overflow && !wt_map_write(map, page, page_size, no)) *overflow = true;
+  }
+  if (*overflow) {
+    for (page_no_t no : {0, 1}) {
+      memset((no == 0 ? page0 : page1) + wt_map_offset(page_size, no), 0,
+             wt_map_size(page_size, no));
     }
   }
   mach_write_to_4(page0 + FSP_HEADER_OFFSET + FSP_SPACE_ID, space_id);
   wt_page_recalc_checksum(page0, page_size);
   wt_page_recalc_checksum(page1, page_size);
 
-  if (pwrite(fd, pages, 2 * len, 0) != static_cast<ssize_t>(2 * len))
+  IORequest write1(IORequest::WRITE);
+  if (enc.can_encrypt()) write1.get_encryption_info().set(enc);
+  if (pwrite(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
+      os_file_write(write1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
     return wt_os_error("write header pages of", path);
   if (fsync(fd) != 0) return wt_os_error("fsync", path);
   return false;
@@ -169,10 +208,6 @@ bool check_clonable(dict_table_t *src) {
   if (!dict_table_is_file_per_table(src))
     return wt_error(
         "CREATE WORKTREE of tables in shared or general tablespaces");
-  if (DICT_TF_GET_ZIP_SSIZE(src->flags) != 0)
-    return wt_error("CREATE WORKTREE of ROW_FORMAT=COMPRESSED tables");
-  if (dd_is_table_in_encrypted_tablespace(src))
-    return wt_error("CREATE WORKTREE of encrypted tables");
   if (DICT_TF_HAS_DATA_DIR(src->flags))
     return wt_error("CREATE WORKTREE of tables with DATA DIRECTORY");
   if (src->ibd_file_missing || dict_table_is_discarded(src) ||
@@ -258,22 +293,118 @@ bool snapshot_clone(trx_t *trx, Space_clone *c) {
   mtr_commit(&mtr);
 
   if (reflink(c->src_path.c_str(), c->tmp_path.c_str()) != 0)
-    return wt_os_error("reflink (APFS clonefile / FICLONE) to", c->tmp_path);
+    return wt_reflink_error(c->tmp_path);
   return false;
 }
 
 /** Phase 3 (source released): stamp the clone, publish it as an .ibd,
 register it, and create its DD tablespace. */
+/** The clone's ancestor map: its source, then the source's own ancestors,
+whose index ids map straight to ours. */
+bool build_map(const Space_clone &c, const wt_map_t *src_map, wt_map_t *map) {
+  map->self = c.space_id;
+  map->generation = 1;
+  map->ancestors.push_back(c.src->space);
+  map->index_map = c.ids;
+  map->roots = c.roots;
+  if (src_map != nullptr) {
+    for (auto anc : src_map->ancestors) map->ancestors.push_back(anc);
+    for (auto &e : src_map->index_map) {
+      for (auto &id : c.ids) {
+        if (id.first == e.second) map->index_map.emplace_back(e.first, id.second);
+      }
+    }
+  }
+  std::sort(map->index_map.begin(), map->index_map.end());
+  if (map->ancestors.size() > WT_MAX_ANCESTORS)
+    return wt_error("CREATE WORKTREE: ancestor chain too long");
+  return false;
+}
+
+/** Complete a clone whose map does not fit in its header pages (§10.1 item
+5): allocate overflow pages with the file's own allocator, so nothing is ever
+allocated over them, write two copies of the map there, and point page 0 and
+page 1 at one copy each. This runs on the temporary file name and without
+redo, then flushes, so recovery never sees it half done: a crash leaves only a
+temporary file, which the DDL log deletes. */
+bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
+                    const wt_map_t &map) {
+  const page_size_t page_size(fsp_flags);
+  const std::string space_name = c->name + "#wtclone";
+  if (fil_ibd_open(true, FIL_TYPE_TABLESPACE, c->space_id, fsp_flags,
+                   space_name.c_str(), c->tmp_path.c_str(), true, false) !=
+      DB_SUCCESS) {
+    my_error(ER_TABLESPACE_MISSING, MYF(0), c->tmp_path.c_str());
+    return true;
+  }
+  auto close_guard =
+      create_scope_guard([&]() { fil_close_tablespace(c->space_id); });
+
+  fil_space_t *space = fil_space_acquire(c->space_id);
+  /* The allocator reads pages that still carry the ancestor's id. */
+  fil_wt_set(space, map);
+  const auto bytes = wt_map_serialize(map);
+  const ulint cap = wt_overflow_capacity(page_size);
+  const ulint n = (bytes.size() + cap - 1) / cap;
+  bool ok = true;
+
+  ut_d(fil_space_inc_redo_skipped_count(c->space_id));
+  mtr_t mtr;
+  mtr.start();
+  mtr.set_log_mode(MTR_LOG_NO_REDO);
+  mtr_x_lock_space(space, &mtr);
+  std::vector<page_no_t> copies[2];
+  for (auto &copy : copies) {
+    for (ulint i = 0; ok && i < n; ++i) {
+      buf_block_t *block = fsp_alloc_wt_page(c->space_id, page_size, &mtr);
+      if (block == nullptr) {
+        ok = false;
+        break;
+      }
+      mlog_write_string(block->frame + FIL_PAGE_DATA, bytes.data() + i * cap,
+                        std::min(cap, bytes.size() - i * cap), &mtr);
+      copy.push_back(block->page.id.page_no());
+    }
+  }
+  std::vector<byte> tmp(page_size.physical());
+  for (page_no_t no : {0, 1}) {
+    if (!ok) break;
+    buf_block_t *block = buf_page_get(page_id_t(c->space_id, no), page_size,
+                                      RW_X_LATCH, UT_LOCATION_HERE, &mtr);
+    memcpy(tmp.data(), block->frame, tmp.size());
+    ok = wt_stub_write(map, bytes.size(), copies[no], tmp.data(), page_size, no);
+    if (ok) {
+      const ulint off = wt_map_offset(page_size, no);
+      mlog_write_string(block->frame + off, tmp.data() + off,
+                        wt_map_size(page_size, no), &mtr);
+    }
+  }
+  mtr.commit();
+  ut_d(fil_space_dec_redo_skipped_count(c->space_id));
+  fil_space_release(space);
+  if (!ok) return wt_error("CREATE WORKTREE: index count too large for the page size");
+
+  buf_LRU_flush_or_remove_pages(c->space_id, BUF_REMOVE_FLUSH_WRITE, trx);
+  fil_flush(c->space_id);
+  return false;
+}
+
 bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
                    dd::Object_id src_dd_space_id, Space_clone *c) {
   fil_space_t *src_space = fil_space_acquire(c->src->space);
   const uint32_t fsp_flags = src_space->flags;
+  const Encryption_metadata enc = src_space->m_encryption_metadata;
+  wt_map_t map;
+  const bool too_long = build_map(*c, fil_wt_map(src_space), &map);
   fil_space_release(src_space);
+  if (too_long) return true;
   const page_size_t page_size(fsp_flags);
 
+  bool overflow;
   if (rewrite_header_pages(c->tmp_path, c->space_id, c->src->space, page_size,
-                           c->ids, c->roots))
+                           enc, map, &overflow))
     return true;
+  if (overflow && write_overflow(trx, c, fsp_flags, map)) return true;
   DBUG_EXECUTE_IF("wt_crash_after_page0", DBUG_SUICIDE(););
   DBUG_EXECUTE_IF("wt_fail_after_page0", {
     my_error(ER_UNKNOWN_ERROR, MYF(0));
@@ -348,6 +479,17 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
       my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: SDI cleanup");
       return true;
     }
+  }
+
+  /* The SDI reads above opened the file and loaded its map: it must be ours. */
+  fil_space_t *space = fil_space_acquire(c->space_id);
+  const wt_map_t *loaded = fil_wt_map(space);
+  const bool map_ok = loaded != nullptr && loaded->self == c->space_id &&
+                      loaded->index_map == map.index_map;
+  fil_space_release(space);
+  if (!map_ok) {
+    my_error(ER_INTERNAL_ERROR, MYF(0), "CREATE WORKTREE: map not readable");
+    return true;
   }
 
   return dd_create_implicit_tablespace(dd::get_dd_client(thd), c->space_id,
@@ -515,6 +657,9 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
       return true;
   }
 
+  if (probe_reflink(clones[0].path.substr(0, clones[0].path.rfind('/'))))
+    return true;
+
   /* FULLTEXT (§10.3): the auxiliary tables are hidden InnoDB tables with their
   own files, named after the parent and FTS index ids; they are cloned under
   the names derived from the clone's new ids. */
@@ -589,6 +734,16 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
     if (has_fts) fts_hold(fts_src, false);
   });
   DBUG_EXECUTE_IF("wt_crash_after_ddl_log", DBUG_SUICIDE(););
+
+  /* Encrypted (§10.4): the clone shares the source's tablespace key, copied
+with page 0. Keep the master key from rotating until the clone is registered,
+so both files carry the key encrypted under the same master key. */
+  bool encrypted = false;
+  for (auto &c : clones) encrypted |= dd_is_table_in_encrypted_tablespace(c.src);
+  if (encrypted) mutex_enter(&master_key_id_mutex);
+  auto key_guard = create_scope_guard([&]() {
+    if (encrypted) mutex_exit(&master_key_id_mutex);
+  });
 
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
   by MDL; stop purge (instance-wide, reference counted, so keep it short),

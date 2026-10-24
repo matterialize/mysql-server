@@ -1,0 +1,187 @@
+# ROW_FORMAT=COMPRESSED (fork-design.md §10.4): clones keep sharing every
+# data page. Pages are translated after their checksum is validated, in
+# both copies (compressed and uncompressed frame). At KEY_BLOCK_SIZE=1
+# page 0 has room for about one index, so larger maps go to overflow
+# pages taken from the file's own allocator.
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+# One table per KEY_BLOCK_SIZE, several indexes and BLOBs each.
+CREATE TABLE src.z1 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), d INT, blb BLOB,
+KEY ka (a), KEY kb (b), KEY kc (c, d)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+INSERT INTO src.z1 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13), n * 3, IF(n % 100 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE TABLE src.z2 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), d INT, blb BLOB,
+KEY ka (a), KEY kb (b), KEY kc (c, d)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=2;
+INSERT INTO src.z2 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13), n * 3, IF(n % 100 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE TABLE src.z4 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), d INT, blb BLOB,
+KEY ka (a), KEY kb (b), KEY kc (c, d)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=4;
+INSERT INTO src.z4 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13), n * 3, IF(n % 100 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE TABLE src.z8 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), d INT, blb BLOB,
+KEY ka (a), KEY kb (b), KEY kc (c, d)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8;
+INSERT INTO src.z8 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13), n * 3, IF(n % 100 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+CREATE TABLE src.z16 (id INT PRIMARY KEY, a INT, b VARCHAR(40), c VARCHAR(40), d INT, blb BLOB,
+KEY ka (a), KEY kb (b), KEY kc (c, d)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=16;
+INSERT INTO src.z16 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
+SELECT n, n % 97, CONCAT('b', n), CONCAT('c', n % 13), n * 3, IF(n % 100 = 0, REPEAT(CONCAT('lob', n), 3000), NULL) FROM s;
+# A 1 KB table with only a primary key: its map fits in page 0.
+CREATE TABLE src.z1_small (id INT PRIMARY KEY, v VARCHAR(20)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+INSERT INTO src.z1_small WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000) SELECT n, CONCAT('v', n) FROM s;
+CHECKSUM TABLE src.z1, src.z2, src.z4, src.z8, src.z16, src.z1_small;
+Table	Checksum
+src.z1	574550257
+src.z2	574550257
+src.z4	574550257
+src.z8	574550257
+src.z16	574550257
+src.z1_small	3657261927
+CREATE WORKTREE wt FROM src;
+CHECKSUM TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
+Table	Checksum
+wt.z1	574550257
+wt.z2	574550257
+wt.z4	574550257
+wt.z8	574550257
+wt.z16	574550257
+wt.z1_small	3657261927
+CHECK TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
+Table	Op	Msg_type	Msg_text
+wt.z1	check	status	OK
+wt.z2	check	status	OK
+wt.z4	check	status	OK
+wt.z8	check	status	OK
+wt.z16	check	status	OK
+wt.z1_small	check	status	OK
+SELECT COUNT(*), SUM(a), SUM(LENGTH(blb)) FROM wt.z1 FORCE INDEX (kc) WHERE c > 'c1';
+COUNT(*)	SUM(a)	SUM(LENGTH(blb))
+2539	121766	501000
+# On disk, right after the clone: no data page was rewritten. Only page 0,
+# page 1, the SDI and the allocator pages it touched, and overflow pages
+# differ from the source.
+SET GLOBAL innodb_fast_shutdown = 0;
+z1: 5120 pages, data pages rewritten: 0, map in page 0: overflow
+z2: 1024 pages, data pages rewritten: 0, map in page 0: inline
+z4: 768 pages, data pages rewritten: 0, map in page 0: inline
+z8: 640 pages, data pages rewritten: 0, map in page 0: inline
+z16: 576 pages, data pages rewritten: 0, map in page 0: inline
+z1_small: 5120 pages, data pages rewritten: 0, map in page 0: inline
+# restart
+# After a restart the map (inline or from overflow pages) is read before
+# any page: untouched pages of every index still read correctly.
+SET SESSION cte_max_recursion_depth = 100000;
+CHECKSUM TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
+Table	Checksum
+wt.z1	574550257
+wt.z2	574550257
+wt.z4	574550257
+wt.z8	574550257
+wt.z16	574550257
+wt.z1_small	3657261927
+CHECK TABLE wt.z1, wt.z2, wt.z4, wt.z8, wt.z16, wt.z1_small;
+Table	Op	Msg_type	Msg_text
+wt.z1	check	status	OK
+wt.z2	check	status	OK
+wt.z4	check	status	OK
+wt.z8	check	status	OK
+wt.z16	check	status	OK
+wt.z1_small	check	status	OK
+SELECT COUNT(*) FROM wt.z1 FORCE INDEX (kb) WHERE b LIKE 'b2%';
+COUNT(*)
+1111
+# The worktree grows by many extents and the source changes too; neither
+# allocation reaches the overflow pages or the other side.
+INSERT INTO wt.z1 WITH RECURSIVE s(n) AS (SELECT 100001 UNION ALL SELECT n + 1 FROM s WHERE n < 120000)
+SELECT n, n % 97, CONCAT('wb', n), CONCAT('wc', n % 13), n, REPEAT('w', 500) FROM s;
+UPDATE wt.z8 SET b = CONCAT('wt-', b) WHERE id % 3 = 0;
+DELETE FROM wt.z2 WHERE id % 2 = 0;
+UPDATE src.z1 SET b = CONCAT('src-', b) WHERE id <= 500;
+INSERT INTO src.z16 VALUES (5000, 1, 'src-only', 'c', 1, NULL);
+SET GLOBAL innodb_fast_shutdown = 0;
+# restart
+CHECK TABLE src.z1, src.z2, src.z8, src.z16, wt.z1, wt.z2, wt.z8, wt.z16;
+Table	Op	Msg_type	Msg_text
+src.z1	check	status	OK
+src.z2	check	status	OK
+src.z8	check	status	OK
+src.z16	check	status	OK
+wt.z1	check	status	OK
+wt.z2	check	status	OK
+wt.z8	check	status	OK
+wt.z16	check	status	OK
+SELECT COUNT(*), SUM(b LIKE 'src-%') FROM src.z1;
+COUNT(*)	SUM(b LIKE 'src-%')
+3000	500
+SELECT COUNT(*), SUM(b LIKE 'src-%'), SUM(b LIKE 'wb%') FROM wt.z1;
+COUNT(*)	SUM(b LIKE 'src-%')	SUM(b LIKE 'wb%')
+23000	0	20000
+SELECT COUNT(*) FROM src.z2;
+COUNT(*)
+3000
+SELECT COUNT(*) FROM wt.z2;
+COUNT(*)
+1500
+SELECT SUM(b LIKE 'wt-%') FROM src.z8;
+SUM(b LIKE 'wt-%')
+0
+SELECT SUM(b LIKE 'wt-%') FROM wt.z8;
+SUM(b LIKE 'wt-%')
+1000
+SELECT COUNT(*) FROM wt.z16 WHERE b = 'src-only';
+COUNT(*)
+0
+# Every page on disk, shared or not, still has a valid checksum.
+# restart
+# A worktree of the worktree: a longer chain, still overflow at 1 KB.
+CREATE WORKTREE wt2 FROM wt;
+CHECKSUM TABLE wt.z1, wt.z1_small, wt.z4;
+Table	Checksum
+wt.z1	662530299
+wt.z1_small	3657261927
+wt.z4	574550257
+CHECKSUM TABLE wt2.z1, wt2.z1_small, wt2.z4;
+Table	Checksum
+wt2.z1	662530299
+wt2.z1_small	3657261927
+wt2.z4	574550257
+wt2.z1: map in page 0: overflow
+wt2.z1_small: map in page 0: inline
+# restart
+CHECK TABLE wt2.z1, wt2.z2, wt2.z4, wt2.z8, wt2.z16, wt2.z1_small;
+Table	Op	Msg_type	Msg_text
+wt2.z1	check	status	OK
+wt2.z2	check	status	OK
+wt2.z4	check	status	OK
+wt2.z8	check	status	OK
+wt2.z16	check	status	OK
+wt2.z1_small	check	status	OK
+SELECT COUNT(*), SUM(b LIKE 'wb%') FROM wt2.z1 FORCE INDEX (kb);
+COUNT(*)	SUM(b LIKE 'wb%')
+23000	20000
+# DDL on the worktree rebuilds its own files only.
+OPTIMIZE TABLE wt.z8;
+Table	Op	Msg_type	Msg_text
+wt.z8	optimize	note	Table does not support optimize, doing recreate + analyze instead
+wt.z8	optimize	status	OK
+ALTER TABLE wt.z4 ADD COLUMN e INT, ALGORITHM=COPY;
+ALTER TABLE wt.z16 KEY_BLOCK_SIZE=4;
+CHECKSUM TABLE src.z8, src.z4, src.z16;
+Table	Checksum
+src.z8	574550257
+src.z4	574550257
+src.z16	1365056232
+CHECK TABLE src.z8, src.z4, src.z16, wt.z8, wt.z4, wt.z16, wt2.z8, wt2.z4, wt2.z16;
+Table	Op	Msg_type	Msg_text
+src.z8	check	status	OK
+src.z4	check	status	OK
+src.z16	check	status	OK
+wt.z8	check	status	OK
+wt.z4	check	status	OK
+wt.z16	check	status	OK
+wt2.z8	check	status	OK
+wt2.z4	check	status	OK
+wt2.z16	check	status	OK
+DROP DATABASE wt2;
+DROP DATABASE wt;
+DROP DATABASE src;

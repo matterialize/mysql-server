@@ -2939,17 +2939,24 @@ bool Fil_shard::open_file(fil_node_t *file) {
   if (success && !space->wt_map_loaded) {
     if (space->purpose == FIL_TYPE_TABLESPACE && file == &space->files.front() &&
         fsp_is_file_per_table(space->id, space->flags)) {
-      /* Worktree map: must be known before any page of the space is read. */
+      /* Worktree map: must be known before any page of the space is read.
+      Pages other than page 0 of an encrypted space are decrypted on read. */
       const page_size_t page_size(space->flags);
       const ulint len = page_size.physical();
+      const os_offset_t file_size = os_file_get_size(file->handle);
       auto pages = static_cast<byte *>(ut::aligned_alloc(2 * len, len));
-      IORequest request(IORequest::READ);
-      if (os_file_read(request, file->name, file->handle, pages, 0, len) ==
-          DB_SUCCESS) {
-        const bool have1 = os_file_get_size(file->handle) >= 2 * len &&
-                           os_file_read(request, file->name, file->handle,
-                                        pages + len, len, len) == DB_SUCCESS;
-        fil_wt_load(space, pages, have1 ? pages + len : nullptr);
+      const auto read = [&](page_no_t page_no, byte *buf) {
+        IORequest request(IORequest::READ);
+        if (page_no != 0 && space->m_encryption_metadata.can_encrypt()) {
+          request.get_encryption_info().set(space->m_encryption_metadata);
+        }
+        return os_offset_t{page_no + 1} * len <= file_size &&
+               os_file_read(request, file->name, file->handle, buf,
+                            os_offset_t{page_no} * len, len) == DB_SUCCESS;
+      };
+      if (read(0, pages)) {
+        fil_wt_load(space, pages, read(1, pages + len) ? pages + len : nullptr,
+                    read);
       }
       ut::aligned_free(pages);
     } else {

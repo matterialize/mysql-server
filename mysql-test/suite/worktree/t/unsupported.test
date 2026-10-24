@@ -6,11 +6,6 @@ CREATE DATABASE src;
 CREATE TABLE src.ok (id INT PRIMARY KEY);
 let $datadir= `SELECT @@datadir`;
 
-CREATE TABLE src.z (id INT PRIMARY KEY) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8;
---error ER_NOT_SUPPORTED_YET
-CREATE WORKTREE wt FROM src;
-DROP TABLE src.z;
-
 # COMPRESSION= tables cannot be created on APFS (no punch hole), so that
 # refusal is not reachable here.
 
