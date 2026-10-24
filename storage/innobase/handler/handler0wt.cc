@@ -103,9 +103,12 @@ int reflink(const char *src, const char *dst) {
 /** Report a failed reflink; a filesystem without file clones gets an error
 that says so. */
 bool wt_reflink_error(const std::string &path) {
-  /* ENOTSUP and EOPNOTSUPP are the same value on Linux, not on macOS. */
-  if (errno == EOPNOTSUPP || errno == ENOTSUP || errno == EXDEV ||
-      errno == EINVAL || errno == ENOTTY) {
+  /* A list: ENOTSUP and EOPNOTSUPP are the same value on Linux, not macOS. */
+  const int err = errno;
+  bool unsupported = false;
+  for (int code : {EOPNOTSUPP, ENOTSUP, EXDEV, EINVAL, ENOTTY})
+    unsupported |= err == code;
+  if (unsupported) {
     const std::string what =
         "CREATE WORKTREE on a filesystem without copy-on-write file clones "
         "(reflink) at '" +
