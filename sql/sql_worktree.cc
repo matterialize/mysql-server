@@ -632,6 +632,16 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
       my_error(ER_ERROR_ON_WRITE, MYF(0), dir, errno, strerror(errno));
       return true;
     }
+    /* Overlay mode: the layer names linked for read-only sources, once for
+    all tables (the data directory is the working directory). */
+    if (const int layers_fd = open("#wtlayers", O_RDONLY); layers_fd >= 0) {
+      const bool layers_synced = fsync(layers_fd) == 0;
+      close(layers_fd);
+      if (!layers_synced) {
+        my_error(ER_ERROR_ON_WRITE, MYF(0), "#wtlayers", errno, strerror(errno));
+        return true;
+      }
+    }
 
     DBUG_EXECUTE_IF("wt_crash_before_commit", DBUG_SUICIDE(););
     return false;

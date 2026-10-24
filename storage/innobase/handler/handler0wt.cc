@@ -56,6 +56,7 @@ Free Software Foundation.
 #include "scope_guard.h"
 #include "sql/dd/dd.h"
 #include "sql/debug_sync.h"
+#include "sql/sql_class.h"
 #include "sql/dd/dictionary.h"
 #include "sql/dd/impl/sdi.h"
 #include "sql/dd/types/column.h"
@@ -204,7 +205,10 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
   for (page_no_t no : {0, 1}) {
     byte *page = no == 0 ? page0 : page1;
     mach_write_to_4(page + FIL_PAGE_SPACE_ID, space_id);
-    if (!*overflow && !wt_map_write(map, page, page_size, no)) *overflow = true;
+    /* (Page 1's copy only where page 1 has a map area.) */
+    if (!*overflow && wt_map_size(page_size, no) > 0 &&
+        !wt_map_write(map, page, page_size, no))
+      *overflow = true;
   }
   if (*overflow) {
     /* An overlay needs its link from its first open (the chain is read
@@ -216,6 +220,7 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
     link_only.link = map.link;
     for (page_no_t no : {0, 1}) {
       byte *page = no == 0 ? page0 : page1;
+      if (wt_map_size(page_size, no) == 0) continue;
       memset(page + wt_map_offset(page_size, no), 0, wt_map_size(page_size, no));
       if (map.has_link) ut_a(wt_map_write(link_only, page, page_size, no));
     }
@@ -488,15 +493,18 @@ bool overlay_freeze(THD *thd, trx_t *trx, Space_clone *c, bool force = false) {
     /* An old overflow map stays where it is (now in U), read through it. */
     ulint stub_len = 0;
     std::vector<page_no_t> stub0, stub1;
-    const bool inline0 = wt_map_write(map, page0, page_size, 0);
-    bool ok = inline0 && wt_map_write(map, page1, page_size, 1);
+    /* Page 1 carries a copy (the witness) only where it has a map area. */
+    const bool p1 = wt_map_size(page_size, 1) > 0;
+    bool ok = wt_map_write(map, page0, page_size, 0) &&
+              (!p1 || wt_map_write(map, page1, page_size, 1));
     if (!ok) {
       ok = wt_overflow_pages_of(old0.data(), page_size, 0, &stub_len, &stub0) &&
-           wt_overflow_pages_of(old1.data(), page_size, 1, &stub_len, &stub1) &&
            wt_stub_write(map, stub_len, stub0, page0, page_size, 0) &&
-           wt_stub_write(map, stub_len, stub1, page1, page_size, 1);
+           (!p1 ||
+            (wt_overflow_pages_of(old1.data(), page_size, 1, &stub_len, &stub1) &&
+             wt_stub_write(map, stub_len, stub1, page1, page_size, 1)));
     }
-    if (!ok) {
+    if (!ok && p1) {
       /* The map was inline: keep it inline in page 1 (larger), with a stub
       in page 0 that carries the link. */
       ok = wt_map_write(map, page1, page_size, 1) &&
@@ -739,7 +747,8 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
     for (auto [block, p, no] : {std::tuple{b0, p0.data(), page_no_t{0}},
                                 std::tuple{b1, p1.data(), page_no_t{1}}}) {
       const ulint off = wt_map_offset(page_size, no);
-      mlog_write_string(block->frame + off, p + off, wt_map_size(page_size, no), &mtr);
+      if (wt_map_size(page_size, no) > 0)
+        mlog_write_string(block->frame + off, p + off, wt_map_size(page_size, no), &mtr);
     }
     mlog_write_ulint(b0->frame + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS,
                      fsp_header_get_flags(b0->frame) & ~FSP_FLAGS_MASK_WT_OVERLAY,
@@ -819,7 +828,7 @@ bool overlay_snapshot(Space_clone *c, bool live) {
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
     wt_layer_names.fetch_add(1);
-    if (sync_dir(WT_LAYER_DIR) != 0) return wt_os_error("fsync", WT_LAYER_DIR);
+    /* Made durable once for all tables before the commit (sql_worktree). */
     DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
   }
 
@@ -950,8 +959,10 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
   mtr.set_log_mode(MTR_LOG_NO_REDO);
   mtr_x_lock_space(space, &mtr);
   std::vector<page_no_t> copies[2];
-  for (auto &copy : copies) {
-    for (ulint i = 0; ok && i < n; ++i) {
+  for (page_no_t no : {0, 1}) {
+    auto &copy = copies[no];
+    /* (No copy for a page 1 without a map area.) */
+    for (ulint i = 0; ok && wt_map_size(page_size, no) > 0 && i < n; ++i) {
       buf_block_t *block = fsp_alloc_wt_page(c->space_id, page_size, &mtr);
       if (block == nullptr) {
         ok = false;
@@ -965,6 +976,7 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
   std::vector<byte> tmp(page_size.physical());
   for (page_no_t no : {0, 1}) {
     if (!ok) break;
+    if (wt_map_size(page_size, no) == 0) continue;
     buf_block_t *block = buf_page_get(page_id_t(c->space_id, no), page_size,
                                       RW_X_LATCH, UT_LOCATION_HERE, &mtr);
     memcpy(tmp.data(), block->frame, tmp.size());
@@ -1518,9 +1530,16 @@ so both files carry the key encrypted under the same master key. */
     a.clone.overlay = overlay;
     a.clone.src_read_only = src_read_only;
   }
-  if (src_read_only &&
-      overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no()))
-    return true;
+  if (src_read_only) {
+    /* Once per statement: a read-only schema gets no new writes, so the
+    first table's target covers every table (a wait per table cost a purge
+    cycle each). */
+    static thread_local std::pair<const THD *, query_id_t> waited{nullptr, 0};
+    if (waited.first != thd || waited.second != thd->query_id) {
+      if (overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no())) return true;
+      waited = {thd, thd->query_id};
+    }
+  }
 
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
   by MDL; stop purge (instance-wide, reference counted, so keep it short),
@@ -1657,6 +1676,11 @@ bool innobase_worktree_refresh(handlerton *, THD *thd, const dd::Table &table) {
 
 bool innobase_worktree_materialize(handlerton *, THD *thd,
                                    const dd::Table &table) {
+  /* v3 §5.4: read-only and force-recovery starts never flatten. */
+  if (srv_read_only_mode || srv_force_recovery > 0)
+    return wt_error(
+        "ALTER WORKTREE ... MATERIALIZE with innodb_read_only or "
+        "innodb_force_recovery");
   trx_t *trx = check_trx_exists(thd);
   std::vector<dict_table_t *> opened;
   std::vector<MDL_ticket *> mdls;
@@ -1739,7 +1763,7 @@ void innobase_wt_gc(bool startup) {
       if (sd == nullptr) continue;
       while (dirent *f = readdir(sd)) {
         const std::string name = f->d_name, path = dir + "/" + name;
-        if (startup && has_suffix(name, ".wttmp")) {
+        if (startup && srv_force_recovery == 0 && has_suffix(name, ".wttmp")) {
           ib::info() << "Removing " << path << " (an interrupted freeze)";
           unlink(path.c_str());
           continue;
@@ -1810,6 +1834,11 @@ void innobase_wt_gc(bool startup) {
   for (const auto &[uuid, ino] : layers) {
     if (reached.count(uuid) != 0) {
       live.insert(ino);
+      ++kept;
+      continue;
+    }
+    /* v3 §5.4: a force-recovery start deletes nothing. */
+    if (srv_force_recovery > 0) {
       ++kept;
       continue;
     }

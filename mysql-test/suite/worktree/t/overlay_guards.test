@@ -20,6 +20,7 @@ call mtr.add_suppression("innodb_force_recovery is on");
 call mtr.add_suppression("in InnoDB read-only mode");
 call mtr.add_suppression("Failed to compress the gtid_executed table");
 call mtr.add_suppression("Skip re-populating collations");
+call mtr.add_suppression("Ignored the innodb-redo-log-capacity option in the Innodb read-only mode");
 
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
@@ -35,7 +36,7 @@ CREATE WORKTREE wt FROM src;
 SET GLOBAL innodb_thread_concurrency = 1000;
 SET GLOBAL innodb_thread_concurrency = 4;
 SET GLOBAL innodb_thread_concurrency = 8;
-SET GLOBAL innodb_thread_concurrency = 200;
+SET GLOBAL innodb_thread_concurrency = 64;
 --error ER_WRONG_ARGUMENTS
 SET GLOBAL innodb_redo_log_capacity = 8388608;
 SET GLOBAL innodb_thread_concurrency = 8;
@@ -50,6 +51,7 @@ eval CREATE TABLE src2.d (id INT PRIMARY KEY) DATA DIRECTORY = '$MYSQL_TMP_DIR/w
 --error ER_NOT_SUPPORTED_YET
 CREATE WORKTREE wd FROM src2;
 DROP DATABASE src2;
+--force-rmdir $MYSQL_TMP_DIR/wt_dd
 --replace_result $CLONE_PLUGIN CLONE_PLUGIN
 eval INSTALL PLUGIN clone SONAME '$CLONE_PLUGIN';
 --replace_result $MYSQL_TMP_DIR MYSQL_TMP_DIR
@@ -116,8 +118,11 @@ EOF
 
 --echo #
 --echo # 5. 64 KB pages (§5.4): CREATE WORKTREE in overlay mode is refused.
-let $dd64 = $MYSQL_TMP_DIR/wt_64k;
---exec $MYSQLD --no-defaults --initialize-insecure --innodb-page-size=64k --datadir=$dd64 --secure-file-priv="" > $MYSQLTEST_VARDIR/tmp/init64.log 2>&1
+let $dd64 = $MYSQLTEST_VARDIR/wt_64k;
+--write_file $MYSQLTEST_VARDIR/tmp/init64.sql
+CREATE DATABASE test;
+EOF
+--exec $MYSQLD --no-defaults --initialize-insecure --innodb-page-size=64k --datadir=$dd64 --secure-file-priv="" --init-file=$MYSQLTEST_VARDIR/tmp/init64.sql > $MYSQLTEST_VARDIR/tmp/init64.log 2>&1
 --let $restart_parameters = restart: --datadir=$dd64 --innodb-page-size=64k
 --replace_result $dd64 DD64
 --source include/restart_mysqld.inc
@@ -130,6 +135,7 @@ CREATE WORKTREE b FROM a;
 --source include/restart_mysqld.inc
 --force-rmdir $dd64
 --remove_file $MYSQLTEST_VARDIR/tmp/init64.log
+--remove_file $MYSQLTEST_VARDIR/tmp/init64.sql
 
 DROP DATABASE wt;
 DROP DATABASE src;

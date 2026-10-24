@@ -1,0 +1,109 @@
+# Overlay concurrency (limits/overlay-v3.md §11.18 O3, §11.20 O5): reads
+# of a source in flight across its freeze, with the freeze gate's windows
+# widened by debug sleeps (between complete_io and page completion, after
+# space_flush lets go, inside space_extend); and 64 threads first-dirtying
+# an overlay's pages under forced checkpoints with no image overdraft.
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(40), pad CHAR(200), KEY (v));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 40000)
+SELECT n, 'row', REPEAT('p', 200) FROM s;
+CREATE WORKTREE w0 FROM src;
+#
+# 1. O3: twelve freezes, each of a worktree whose pages are being read in
+#    (a full scan with read-ahead) from its layer at the same time.
+SET GLOBAL innodb_random_read_ahead = ON;
+SET GLOBAL innodb_read_ahead_threshold = 0;
+SET GLOBAL debug = '+d,wt_slow_io_complete,wt_slow_space_flush,wt_slow_extend';
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+COUNT(*)	SUM(LENGTH(pad))
+40000	8000000
+SET GLOBAL debug = '-d,wt_slow_io_complete,wt_slow_space_flush,wt_slow_extend';
+SET GLOBAL innodb_random_read_ahead = DEFAULT;
+SET GLOBAL innodb_read_ahead_threshold = DEFAULT;
+SELECT COUNT(*), SUM(v = 'r') FROM w12.t;
+COUNT(*)	SUM(v = 'r')
+40000	12
+SELECT COUNT(*), SUM(v = 'r') FROM w6.t;
+COUNT(*)	SUM(v = 'r')
+40000	7
+# restart
+SELECT COUNT(*), SUM(v = 'r') FROM w12.t;
+COUNT(*)	SUM(v = 'r')
+40000	12
+CHECK TABLE w0.t, w6.t, w11.t, w12.t;
+Table	Op	Msg_type	Msg_text
+w0.t	check	status	OK
+w6.t	check	status	OK
+w11.t	check	status	OK
+w12.t	check	status	OK
+#
+# 2. O5: 64 threads first-dirty and split pages of a fresh overlay while
+#    another session forces checkpoints; no hang, no image overdraft.
+SET GLOBAL innodb_thread_concurrency = 64;
+CREATE WORKTREE big FROM src;
+CREATE PROCEDURE src.spam()
+BEGIN
+DECLARE i INT DEFAULT 0;
+WHILE i < 300 DO
+SET GLOBAL innodb_log_checkpoint_now = ON;
+DO SLEEP(0.01);
+SET i = i + 1;
+END WHILE;
+END|
+CREATE PROCEDURE src.work(n INT)
+BEGIN
+DECLARE i INT DEFAULT 0;
+DECLARE k INT;
+WHILE i < n DO
+-- (a key first: RAND() in the WHERE clause would scan and lock it all)
+SET k = 1 + FLOOR(RAND() * 40000);
+UPDATE big.t SET v = 'slap' WHERE id = k;
+SET k = 40000 + FLOOR(RAND() * 2000000);
+INSERT IGNORE INTO big.t VALUES (k, 'ins', REPEAT('i', 200));
+SET i = i + 1;
+END WHILE;
+END|
+CALL src.spam();
+# 64 clients at once, 200 updates and 200 inserts each
+clients that failed: 0
+SELECT COUNT(*) > 40000, SUM(v = 'slap') > 0 FROM big.t;
+COUNT(*) > 40000	SUM(v = 'slap') > 0
+1	1
+include/assert.inc [images were logged]
+include/assert.inc [no image overdraft (more than K_INT images between checks)]
+# Kill the server
+# restart
+SELECT COUNT(*) > 40000, SUM(v = 'slap') > 0 FROM big.t;
+COUNT(*) > 40000	SUM(v = 'slap') > 0
+1	1
+CHECK TABLE big.t;
+Table	Op	Msg_type	Msg_text
+big.t	check	status	OK
+SET GLOBAL innodb_thread_concurrency = 8;
+DROP DATABASE big;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+Variable_name	Value
+Innodb_worktree_layers	0

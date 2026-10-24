@@ -59,7 +59,6 @@ constexpr ulint WT_STUB_GENERATION = 20;
 constexpr ulint WT_STUB_SIZE = 28;
 
 /** IBUF_BITS_PER_PAGE (ibuf0ibuf.cc) */
-constexpr ulint WT_IBUF_BITS_PER_PAGE = 4;
 
 bool is_btree_page(page_type_t type) {
   return type == FIL_PAGE_INDEX || type == FIL_PAGE_RTREE ||
@@ -183,12 +182,13 @@ ulint wt_map_offset(const page_size_t &page_size, page_no_t page_no) {
   if (!page_size.is_compressed()) {
     return page_size.physical() - FIL_PAGE_DATA_END - page_size.physical() / 4;
   }
-  const ulint end =
-      page_no == 0
-          ? fsp_header_get_encryption_progress_offset(page_size) +
-                Encryption::OPERATION_INFO_SIZE + Encryption::PROGRESS_INFO_SIZE
-          : FIL_PAGE_DATA + UT_BITS_IN_BYTES(page_size.physical() *
-                                             WT_IBUF_BITS_PER_PAGE);
+  /* Compressed page 1 has no map area: the change buffer writes past the
+  bitmap's physical extent there at run time (a map stored there was found
+  overwritten), so nothing of ours may live in it. */
+  if (page_no != 0) return page_size.physical() - FIL_PAGE_DATA_END;
+  const ulint end = fsp_header_get_encryption_progress_offset(page_size) +
+                    Encryption::OPERATION_INFO_SIZE +
+                    Encryption::PROGRESS_INFO_SIZE;
   return ut_calc_align(end, 8);
 }
 

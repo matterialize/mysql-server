@@ -224,3 +224,58 @@ SELECT pad FROM wt.big WHERE id = 5;
 CHECK TABLE wt.big;
 
 DROP DATABASE wt;
+
+--echo #
+--echo # G. A 1 KB compressed worktree's page 0 lost after a crash. Compressed
+--echo #    page 1 has no map area (the change buffer writes past the bitmap's
+--echo #    physical extent there, as stock does), so the file is identified by
+--echo #    InnoDB's page vote. Whatever the vote makes of it (it may restore
+--echo #    the worktree's own page 0, or stop with the file unidentified), it
+--echo #    never restores the source's page 0 into the worktree.
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wz/zc.ibd");
+let WZ_IBD = $datadir/wz/zc.ibd;
+let ZSRC_IBD = $datadir/src/zc.ibd;
+CREATE DATABASE src;
+CREATE TABLE src.zc (id INT PRIMARY KEY, v VARCHAR(40), KEY (v)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.zc WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000) SELECT n, CONCAT('z', n) FROM s;
+CREATE WORKTREE wz FROM src;
+INSERT INTO wz.zc WITH RECURSIVE s(n) AS (SELECT 10001 UNION ALL SELECT n + 1 FROM s WHERE n < 16000) SELECT n, 'grown' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wz.zc SET v = 'after-checkpoint' WHERE id = 5;
+--source include/kill_mysqld.inc
+--copy_file $WZ_IBD $MYSQLTEST_VARDIR/tmp/wz_zc.ibd.saved
+perl;
+  my $f = $ENV{WZ_IBD}; open(my $fh, '+<:raw', $f) or die "$f: $!";
+  sysseek($fh, 0, 0); syswrite($fh, "\0" x 1024); close($fh);
+EOF
+let G_LOG = $MYSQLTEST_VARDIR/log/page0_compressed.err;
+--exec_in_background $MYSQLD_CMD --log-error=$G_LOG --log-error-verbosity=3
+let MYSQLD_SOCK = $MASTER_MYSOCK;
+perl;
+  # Wait for startup to finish either way; stop the server if it came up.
+  my ($log, $up) = ($ENV{G_LOG}, 0);
+  for (1 .. 600) {
+    my $t = -e $log ? do { local (@ARGV, $/) = $log; <> } : '';
+    if ($t =~ /ready for connections/) { $up = 1; last; }
+    last if $t =~ /Aborting|Shutdown complete/;
+    select(undef, undef, undef, 0.2);
+  }
+  system("$ENV{MYSQLADMIN} -uroot -S $ENV{MYSQLD_SOCK} shutdown >/dev/null 2>&1") if $up;
+  for (1 .. 300) { my $t = do { local (@ARGV, $/) = $log; <> }; last if $t =~ /MySQL Server - end/;
+    select(undef, undef, undef, 0.2); }
+  sleep(2);
+  sub space_id1k { my $f = shift; open(my $fh, '<:raw', $f) or die; my $p; sysread($fh, $p, 1024); return unpack('N', substr($p, 34, 4)); }
+  print "source page 0 written into the compressed worktree: ", (space_id1k($ENV{WZ_IBD}) == space_id1k($ENV{ZSRC_IBD}) ? "YES" : "no"), "\n";
+  my $saved = "$ENV{MYSQLTEST_VARDIR}/tmp/wz_zc.ibd.saved";
+  if (!$up) { require File::Copy; File::Copy::copy($saved, $ENV{WZ_IBD}) or die "restore: $!"; }
+  unlink($saved) or die "$saved: $!";
+EOF
+--remove_file $G_LOG
+--source include/start_mysqld.inc
+SELECT COUNT(*), SUM(v = 'grown') FROM wz.zc;
+CHECK TABLE wz.zc, src.zc;
+DROP DATABASE wz;
+DROP DATABASE src;

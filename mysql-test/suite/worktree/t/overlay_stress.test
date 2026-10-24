@@ -71,9 +71,13 @@ END|
 CREATE PROCEDURE src.work(n INT)
 BEGIN
   DECLARE i INT DEFAULT 0;
+  DECLARE k INT;
   WHILE i < n DO
-    UPDATE big.t SET v = 'slap' WHERE id = 1 + FLOOR(RAND() * 40000);
-    INSERT IGNORE INTO big.t VALUES (40000 + FLOOR(RAND() * 2000000), 'ins', REPEAT('i', 200));
+    -- (a key first: RAND() in the WHERE clause would scan and lock it all)
+    SET k = 1 + FLOOR(RAND() * 40000);
+    UPDATE big.t SET v = 'slap' WHERE id = k;
+    SET k = 40000 + FLOOR(RAND() * 2000000);
+    INSERT IGNORE INTO big.t VALUES (k, 'ins', REPEAT('i', 200));
     SET i = i + 1;
   END WHILE;
 END|

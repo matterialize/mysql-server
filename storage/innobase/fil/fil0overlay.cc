@@ -118,10 +118,11 @@ wt_layer_t *layer_open(const std::string &uuid, const page_size_t &page_size,
   };
   if (read(0, buf) &&
       (fsp_header_get_flags(buf) & FSP_FLAGS_MASK_WT_OVERLAY) != 0) {
-    const bool ok = (wt_map_read(buf, page_size, 0, read, &map) ||
-                     (read(1, buf + len) &&
-                      wt_map_read(buf + len, page_size, 1, read, &map))) &&
-                    map.has_link;
+    /* The link only, as at open: an overflow map's pages may be holes in
+    this layer (they live further up its chain), the stub carries the link. */
+    const bool ok = wt_link_peek(buf, page_size, 0, &map.link) ||
+                    (read(1, buf + len) &&
+                     wt_link_peek(buf + len, page_size, 1, &map.link));
     if (!ok) {
       ib::error() << "Worktree layer " << path << " has no valid link";
       ut::aligned_free(buf);

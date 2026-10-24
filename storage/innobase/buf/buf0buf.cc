@@ -5751,7 +5751,6 @@ static bool sync_read_page_verify_pageid(buf_page_t *bpage, IORequest *type,
   const bool is_compressed = bpage->size.is_compressed();
   const page_no_t page_no = bpage->id.page_no();
   const space_id_t space_id = bpage->id.space();
-  buf_frame_t *frame = buf_block_get_frame(block);
   bool is_wrong_page_id = true;
 
   /* Overlay or freezing: the local re-read would bypass routing and the
@@ -5762,6 +5761,8 @@ static bool sync_read_page_verify_pageid(buf_page_t *bpage, IORequest *type,
     /* We don't attempt to read the page from disk to verify page id. */
     return is_wrong_page_id;
   }
+  /* (After the check: a compressed-only page has no frame.) */
+  buf_frame_t *frame = buf_block_get_frame(block);
 
   /* Let us do a sync read and check once. */
   page_no_t read_page_no = mach_read_from_4(frame + FIL_PAGE_OFFSET);

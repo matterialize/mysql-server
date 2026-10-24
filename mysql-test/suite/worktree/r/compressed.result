@@ -174,6 +174,33 @@ wt2.z1_small	check	status	OK
 SELECT COUNT(*), SUM(b LIKE 'wb%') FROM wt2.z1 FORCE INDEX (kb);
 COUNT(*)	SUM(b LIKE 'wb%')
 23000	20000
+# The worktree written and cloned again, three times: in overlay mode
+# each clone freezes it again, and its overflow map pages stay in older
+# layers (read through the stub's link, never from a layer's own holes).
+UPDATE wt.z1 SET b = 'round1' WHERE id = 7;
+CREATE WORKTREE wr1 FROM wt;
+UPDATE wt.z1 SET b = 'round2' WHERE id = 7;
+CREATE WORKTREE wr2 FROM wt;
+UPDATE wt.z1 SET b = 'round3' WHERE id = 7;
+CREATE WORKTREE wr3 FROM wt;
+# restart
+SELECT b FROM wr1.z1 WHERE id = 7;
+b
+round1
+SELECT b FROM wr3.z1 WHERE id = 7;
+b
+round3
+SELECT COUNT(*) FROM wr3.z1 FORCE INDEX (kb) WHERE b LIKE 'b1%';
+COUNT(*)
+1111
+CHECK TABLE wt.z1, wr1.z1, wr3.z1;
+Table	Op	Msg_type	Msg_text
+wt.z1	check	status	OK
+wr1.z1	check	status	OK
+wr3.z1	check	status	OK
+DROP DATABASE wr1;
+DROP DATABASE wr2;
+DROP DATABASE wr3;
 # DDL on the worktree rebuilds its own files only.
 OPTIMIZE TABLE wt.z8;
 Table	Op	Msg_type	Msg_text

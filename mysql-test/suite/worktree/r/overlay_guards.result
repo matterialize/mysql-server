@@ -1,0 +1,99 @@
+# Overlay configuration guards (limits/overlay-v3.md §5.4, §11.12, §11.19,
+# §11.23) beyond worktree.overlay: unsafe redo margins at runtime, the
+# table and statement refusals, every startup refusal while overlays
+# exist, read-only and force-recovery starts (overlays readable; no
+# freeze, flatten or GC), and 64 KB pages.
+call mtr.add_suppression("innodb_force_recovery is on");
+call mtr.add_suppression("in InnoDB read-only mode");
+call mtr.add_suppression("Failed to compress the gtid_executed table");
+call mtr.add_suppression("Skip re-populating collations");
+call mtr.add_suppression("Ignored the innodb-redo-log-capacity option in the Innodb read-only mode");
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(40));
+INSERT INTO src.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 2000)
+SELECT n, CONCAT('row', n) FROM s;
+CREATE WORKTREE wt FROM src;
+#
+# 1. Runtime: a thread concurrency or a redo capacity whose redo margin
+#    is unsafe is refused (O4/O5); safe changes are not.
+SET GLOBAL innodb_thread_concurrency = 1000;
+ERROR HY000: Incorrect arguments to innodb_thread_concurrency: worktree overlays need a value > 0 with a safe redo margin
+SET GLOBAL innodb_thread_concurrency = 4;
+SET GLOBAL innodb_thread_concurrency = 8;
+SET GLOBAL innodb_thread_concurrency = 64;
+SET GLOBAL innodb_redo_log_capacity = 8388608;
+ERROR HY000: Incorrect arguments to innodb_redo_log_capacity: too small for a safe redo margin while worktree overlays exist
+SET GLOBAL innodb_thread_concurrency = 8;
+SELECT @@innodb_thread_concurrency, @@innodb_redo_log_capacity;
+@@innodb_thread_concurrency	@@innodb_redo_log_capacity
+8	67108864
+#
+# 2. Refused sources and statements (v3 §5.3, §11.23): a table with a
+#    DATA DIRECTORY, and CLONE while overlays exist.
+CREATE DATABASE src2;
+CREATE TABLE src2.d (id INT PRIMARY KEY) DATA DIRECTORY = 'MYSQL_TMP_DIR/wt_dd';
+CREATE WORKTREE wd FROM src2;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE of tables with DATA DIRECTORY'
+DROP DATABASE src2;
+INSTALL PLUGIN clone SONAME 'CLONE_PLUGIN';
+CLONE LOCAL DATA DIRECTORY = 'MYSQL_TMP_DIR/wt_clone';
+ERROR 42000: This version of MySQL doesn't yet support 'CLONE while worktree overlays exist'
+UNINSTALL PLUGIN clone;
+#
+# 3. Startup while overlays exist (§5.4, §11.12): each unsafe setting
+#    is refused before InnoDB opens a file; REFLINK mode too.
+--innodb-flush-method=nosync               refused yes, says why yes
+--innodb-flush-method=littlesync           refused yes, says why yes
+--innodb-flush-method=O_DIRECT_NO_FSYNC    refused yes, says why yes
+--innodb-doublewrite=OFF                   refused yes, says why yes
+--innodb-doublewrite=DETECT_ONLY           refused yes, says why yes
+--innodb-checksum-algorithm=none           refused yes, says why yes
+--innodb-checksum-algorithm=strict_none    refused yes, says why yes
+--innodb-thread-concurrency=0              refused yes, says why yes
+--innodb-worktree-mode=REFLINK             refused yes, says why yes
+# A safe non-default setting starts.
+# restart: --innodb-doublewrite=DETECT_AND_RECOVER
+SELECT @@innodb_doublewrite;
+@@innodb_doublewrite
+DETECT_AND_RECOVER
+SELECT COUNT(*) FROM wt.t;
+COUNT(*)
+2000
+#
+# 4. Read-only and force-recovery starts: overlays are readable, and
+#    nothing is frozen, flattened or garbage-collected (a stray layer
+#    survives until a normal start).
+# restart: --innodb-read-only
+SELECT COUNT(*), SUM(id) FROM wt.t;
+COUNT(*)	SUM(id)
+2000	2001000
+CREATE WORKTREE wr FROM src;
+Got one of the listed errors
+# restart: --innodb-force-recovery=1
+SELECT COUNT(*), SUM(id) FROM wt.t;
+COUNT(*)	SUM(id)
+2000	2001000
+CREATE WORKTREE wr FROM src;
+Got one of the listed errors
+ALTER WORKTREE wt MATERIALIZE;
+Got one of the listed errors
+stray layer after read-only and force-recovery starts: kept
+# restart
+stray layer after a normal start: removed
+#
+# 5. 64 KB pages (§5.4): CREATE WORKTREE in overlay mode is refused.
+# restart: --datadir=DD64 --innodb-page-size=64k
+SELECT @@innodb_page_size;
+@@innodb_page_size
+65536
+CREATE DATABASE a;
+CREATE TABLE a.t (id INT PRIMARY KEY);
+CREATE WORKTREE b FROM a;
+ERROR 42000: This version of MySQL doesn't yet support 'CREATE WORKTREE in overlay mode with 32 or 64 KB pages'
+# restart
+DROP DATABASE wt;
+DROP DATABASE src;
+SHOW GLOBAL STATUS LIKE 'Innodb_worktree_layers';
+Variable_name	Value
+Innodb_worktree_layers	0

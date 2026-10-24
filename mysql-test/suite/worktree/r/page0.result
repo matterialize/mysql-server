@@ -151,3 +151,33 @@ CHECK TABLE wt.big;
 Table	Op	Msg_type	Msg_text
 wt.big	check	status	OK
 DROP DATABASE wt;
+#
+# G. A 1 KB compressed worktree's page 0 lost after a crash. Compressed
+#    page 1 has no map area (the change buffer writes past the bitmap's
+#    physical extent there, as stock does), so the file is identified by
+#    InnoDB's page vote. Whatever the vote makes of it (it may restore
+#    the worktree's own page 0, or stop with the file unidentified), it
+#    never restores the source's page 0 into the worktree.
+call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wz/zc.ibd");
+CREATE DATABASE src;
+CREATE TABLE src.zc (id INT PRIMARY KEY, v VARCHAR(40), KEY (v)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO src.zc WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000) SELECT n, CONCAT('z', n) FROM s;
+CREATE WORKTREE wz FROM src;
+INSERT INTO wz.zc WITH RECURSIVE s(n) AS (SELECT 10001 UNION ALL SELECT n + 1 FROM s WHERE n < 16000) SELECT n, 'grown' FROM s;
+SET GLOBAL innodb_log_checkpoint_now = ON;
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
+SET GLOBAL innodb_checkpoint_disabled = ON;
+UPDATE wz.zc SET v = 'after-checkpoint' WHERE id = 5;
+# Kill the server
+source page 0 written into the compressed worktree: no
+# restart
+SELECT COUNT(*), SUM(v = 'grown') FROM wz.zc;
+COUNT(*)	SUM(v = 'grown')
+9000	6000
+CHECK TABLE wz.zc, src.zc;
+Table	Op	Msg_type	Msg_text
+wz.zc	check	status	OK
+src.zc	check	status	OK
+DROP DATABASE wz;
+DROP DATABASE src;

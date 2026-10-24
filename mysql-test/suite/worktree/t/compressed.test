@@ -129,6 +129,25 @@ EOF
 CHECK TABLE wt2.z1, wt2.z2, wt2.z4, wt2.z8, wt2.z16, wt2.z1_small;
 SELECT COUNT(*), SUM(b LIKE 'wb%') FROM wt2.z1 FORCE INDEX (kb);
 
+--echo # The worktree written and cloned again, three times: in overlay mode
+--echo # each clone freezes it again, and its overflow map pages stay in older
+--echo # layers (read through the stub's link, never from a layer's own holes).
+let $i = 1;
+while ($i <= 3)
+{
+  eval UPDATE wt.z1 SET b = 'round$i' WHERE id = 7;
+  eval CREATE WORKTREE wr$i FROM wt;
+  inc $i;
+}
+--source include/restart_mysqld.inc
+SELECT b FROM wr1.z1 WHERE id = 7;
+SELECT b FROM wr3.z1 WHERE id = 7;
+SELECT COUNT(*) FROM wr3.z1 FORCE INDEX (kb) WHERE b LIKE 'b1%';
+CHECK TABLE wt.z1, wr1.z1, wr3.z1;
+DROP DATABASE wr1;
+DROP DATABASE wr2;
+DROP DATABASE wr3;
+
 --echo # DDL on the worktree rebuilds its own files only.
 OPTIMIZE TABLE wt.z8;
 ALTER TABLE wt.z4 ADD COLUMN e INT, ALGORITHM=COPY;
