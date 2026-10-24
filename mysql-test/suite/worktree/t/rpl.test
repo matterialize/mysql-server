@@ -1,0 +1,119 @@
+--echo # Replication (fork-design.md §10.7). CREATE WORKTREE is logged as DDL,
+--echo # in the transaction that commits it, while the source tables are still
+--echo # blocked for writes. A replica running the fork clones its own copy of
+--echo # src at that point of the stream, so both worktrees are identical. Writes
+--echo # to wt then replicate to the replica's wt only (row- and statement-based).
+--source include/not_group_replication_plugin.inc
+--source include/rpl/init_source_replica.inc
+
+--disable_warnings
+CREATE DATABASE src;
+CREATE TABLE src.acct (id INT PRIMARY KEY, bal INT, note VARCHAR(40));
+CREATE TABLE src.log (acct INT, delta INT, KEY (acct));
+CREATE TABLE src.parts (id INT PRIMARY KEY, v INT) PARTITION BY HASH (id) PARTITIONS 4;
+CREATE TABLE src.ft (id INT PRIMARY KEY, body TEXT, FULLTEXT (body));
+CREATE TABLE src.z (id INT PRIMARY KEY, v VARCHAR(20), KEY (v)) ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1;
+CREATE TRIGGER src.log_upd AFTER UPDATE ON src.acct FOR EACH ROW
+  INSERT INTO log (acct, delta) VALUES (NEW.id, NEW.bal - OLD.bal);
+CREATE PROCEDURE src.pay(a INT, d INT) UPDATE acct SET bal = bal + d WHERE id = a;
+CREATE VIEW src.v AS SELECT a.id, a.bal, COUNT(l.acct) AS n FROM src.acct a LEFT JOIN src.log l ON l.acct = a.id GROUP BY a.id, a.bal;
+INSERT INTO src.acct WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 500) SELECT n, 1000, CONCAT('a', n) FROM s ORDER BY n;
+INSERT INTO src.parts WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 900) SELECT n, n FROM s ORDER BY n;
+INSERT INTO src.ft VALUES (1, 'apple banana'), (2, 'banana cherry'), (3, 'cherry durian');
+INSERT INTO src.z WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 900) SELECT n, CONCAT('z', n) FROM s ORDER BY n;
+--enable_warnings
+
+DELIMITER |;
+# A statement that loses an MDL deadlock to the DDL is retried, as an
+# application would.
+CREATE PROCEDURE test.burst(k INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE retry INT DEFAULT 0;
+  DECLARE CONTINUE HANDLER FOR 1205, 1213 SET retry = 1;
+  WHILE i < k DO
+    SET retry = 0;
+    UPDATE src.acct SET bal = bal + 1 WHERE id = 1 + i % 500;
+    IF retry = 0 THEN SET i = i + 1; END IF;
+  END WHILE;
+END|
+DELIMITER ;|
+--source include/rpl/sync_to_replica.inc
+
+--echo # Writes to src run on another connection while the worktree is created.
+--source include/rpl/connection_source1.inc
+send CALL test.burst(300);
+--source include/rpl/connection_source.inc
+CREATE WORKTREE wt FROM src;
+--source include/rpl/connection_source1.inc
+reap;
+
+--source include/rpl/connection_source.inc
+--echo # Writes to wt: a routine, a trigger, partitions, FULLTEXT, compressed.
+--disable_warnings
+CALL wt.pay(1, 100);
+CALL wt.pay(2, -50);
+UPDATE wt.acct SET note = 'wt only' WHERE id <= 10;
+INSERT INTO wt.parts VALUES (5001, 1), (5002, 2), (5003, 3);
+DELETE FROM wt.parts WHERE id <= 100;
+INSERT INTO wt.ft VALUES (4, 'banana wt-only');
+DELETE FROM wt.ft WHERE id = 1;
+UPDATE wt.z SET v = CONCAT('w', v) WHERE id <= 300;
+CALL src.pay(3, 7);
+--enable_warnings
+
+let $sql_src = SELECT CONCAT_WS(' ', (SELECT SHA2(GROUP_CONCAT(CONCAT_WS(',', id, bal, note) ORDER BY id), 256) FROM src.acct), (SELECT SHA2(GROUP_CONCAT(CONCAT_WS(',', acct, delta) ORDER BY acct, delta), 256) FROM src.log), (SELECT SHA2(GROUP_CONCAT(CONCAT_WS(',', id, v) ORDER BY id), 256) FROM src.parts), (SELECT SHA2(GROUP_CONCAT(CONCAT_WS(',', id, body) ORDER BY id), 256) FROM src.ft), (SELECT SHA2(GROUP_CONCAT(CONCAT_WS(',', id, v) ORDER BY id), 256) FROM src.z));
+let $sql_wt = `SELECT REPLACE("$sql_src", 'src.', 'wt.')`;
+SET SESSION group_concat_max_len = 10000000;
+let $source_src = `$sql_src`;
+let $source_wt = `$sql_wt`;
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
+SELECT COUNT(*) FROM wt.log;
+SELECT COUNT(*) FROM src.log;
+SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
+SELECT * FROM wt.v ORDER BY id LIMIT 3;
+
+--echo # The binary log has one CREATE WORKTREE and no statements creating wt's
+--echo # tables or objects one by one.
+let $datadir = `SELECT @@datadir`;
+let $binlog = query_get_value(SHOW BINARY LOG STATUS, File, 1);
+--exec $MYSQL_BINLOG --base64-output=decode-rows $datadir/$binlog > $MYSQLTEST_VARDIR/tmp/wt_binlog.sql
+let WT_BINLOG = $MYSQLTEST_VARDIR/tmp/wt_binlog.sql;
+perl;
+  open(my $f, '<', $ENV{WT_BINLOG}) or die; local $/; my $b = <$f>;
+  my $n = () = $b =~ /CREATE WORKTREE wt FROM src/g;
+  my $t = () = $b =~ /CREATE (TABLE|VIEW|TRIGGER|PROCEDURE|DEFINER)[^;]*`?wt`?\./gi;
+  print "CREATE WORKTREE events: $n, per-object CREATEs for wt: $t\n";
+EOF
+--remove_file $MYSQLTEST_VARDIR/tmp/wt_binlog.sql
+
+--source include/rpl/sync_to_replica.inc
+--echo # On the replica: identical src and wt, objects cloned by its own CREATE
+--echo # WORKTREE (the view is remapped to wt), FULLTEXT works.
+SET SESSION group_concat_max_len = 10000000;
+let $replica_src = `$sql_src`;
+let $replica_wt = `$sql_wt`;
+let $same_src = `SELECT '$source_src' = '$replica_src'`;
+let $same_wt = `SELECT '$source_wt' = '$replica_wt'`;
+let $wt_differs = `SELECT '$replica_src' <> '$replica_wt'`;
+--echo src identical on source and replica: $same_src
+--echo wt identical on source and replica: $same_wt
+--echo wt differs from src on the replica: $wt_differs
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
+SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
+SELECT VIEW_DEFINITION LIKE '%`wt`.%' AND VIEW_DEFINITION NOT LIKE '%`src`.%' AS remapped
+  FROM information_schema.VIEWS WHERE TABLE_SCHEMA = 'wt' AND TABLE_NAME = 'v';
+SELECT TRIGGER_SCHEMA, TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt';
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = 'wt';
+CHECK TABLE wt.acct, wt.log, wt.parts, wt.ft, wt.z, src.acct, src.z;
+
+--echo # Dropping the worktree replicates too.
+--source include/rpl/connection_source.inc
+DROP DATABASE wt;
+DROP DATABASE src;
+DROP PROCEDURE test.burst;
+--source include/rpl/sync_to_replica.inc
+SHOW DATABASES LIKE 'wt';
+--source include/rpl/deinit.inc

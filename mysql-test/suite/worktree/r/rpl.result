@@ -1,0 +1,121 @@
+# Replication (fork-design.md §10.7). CREATE WORKTREE is logged as DDL,
+# in the transaction that commits it, while the source tables are still
+# blocked for writes. A replica running the fork clones its own copy of
+# src at that point of the stream, so both worktrees are identical. Writes
+# to wt then replicate to the replica's wt only (row- and statement-based).
+include/rpl/init_source_replica.inc
+Warnings:
+Note	####	Sending passwords in plain text without SSL/TLS is extremely insecure.
+Note	####	Storing MySQL user name or password information in the connection metadata repository is not secure and is therefore not recommended. Please consider using the USER and PASSWORD connection options for START REPLICA; see the 'START REPLICA Syntax' in the MySQL Manual for more information.
+[connection master]
+CREATE DATABASE src;
+CREATE TABLE src.acct (id INT PRIMARY KEY, bal INT, note VARCHAR(40));
+CREATE TABLE src.log (acct INT, delta INT, KEY (acct));
+CREATE TABLE src.parts (id INT PRIMARY KEY, v INT) PARTITION BY HASH (id) PARTITIONS 4;
+CREATE TABLE src.ft (id INT PRIMARY KEY, body TEXT, FULLTEXT (body));
+CREATE TABLE src.z (id INT PRIMARY KEY, v VARCHAR(20), KEY (v)) ROW_FORMAT = COMPRESSED KEY_BLOCK_SIZE = 1;
+CREATE TRIGGER src.log_upd AFTER UPDATE ON src.acct FOR EACH ROW
+INSERT INTO log (acct, delta) VALUES (NEW.id, NEW.bal - OLD.bal);
+CREATE PROCEDURE src.pay(a INT, d INT) UPDATE acct SET bal = bal + d WHERE id = a;
+CREATE VIEW src.v AS SELECT a.id, a.bal, COUNT(l.acct) AS n FROM src.acct a LEFT JOIN src.log l ON l.acct = a.id GROUP BY a.id, a.bal;
+INSERT INTO src.acct WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 500) SELECT n, 1000, CONCAT('a', n) FROM s ORDER BY n;
+INSERT INTO src.parts WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 900) SELECT n, n FROM s ORDER BY n;
+INSERT INTO src.ft VALUES (1, 'apple banana'), (2, 'banana cherry'), (3, 'cherry durian');
+INSERT INTO src.z WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 900) SELECT n, CONCAT('z', n) FROM s ORDER BY n;
+CREATE PROCEDURE test.burst(k INT)
+BEGIN
+DECLARE i INT DEFAULT 0;
+DECLARE retry INT DEFAULT 0;
+DECLARE CONTINUE HANDLER FOR 1205, 1213 SET retry = 1;
+WHILE i < k DO
+SET retry = 0;
+UPDATE src.acct SET bal = bal + 1 WHERE id = 1 + i % 500;
+IF retry = 0 THEN SET i = i + 1; END IF;
+END WHILE;
+END|
+include/rpl/sync_to_replica.inc
+# Writes to src run on another connection while the worktree is created.
+[connection master1]
+CALL test.burst(300);
+[connection master]
+CREATE WORKTREE wt FROM src;
+[connection master1]
+[connection master]
+# Writes to wt: a routine, a trigger, partitions, FULLTEXT, compressed.
+CALL wt.pay(1, 100);
+CALL wt.pay(2, -50);
+UPDATE wt.acct SET note = 'wt only' WHERE id <= 10;
+INSERT INTO wt.parts VALUES (5001, 1), (5002, 2), (5003, 3);
+DELETE FROM wt.parts WHERE id <= 100;
+INSERT INTO wt.ft VALUES (4, 'banana wt-only');
+DELETE FROM wt.ft WHERE id = 1;
+UPDATE wt.z SET v = CONCAT('w', v) WHERE id <= 300;
+CALL src.pay(3, 7);
+SET SESSION group_concat_max_len = 10000000;
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+COUNT(*)	SUM(bal)	SUM(note = 'wt only')
+500	500050	10
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
+COUNT(*)	SUM(bal)	SUM(note = 'wt only')
+500	500307	0
+SELECT COUNT(*) FROM wt.log;
+COUNT(*)
+12
+SELECT COUNT(*) FROM src.log;
+COUNT(*)
+301
+SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
+COUNT(*)
+2
+SELECT * FROM wt.v ORDER BY id LIMIT 3;
+id	bal	n
+1	1100	2
+2	950	2
+3	1000	1
+# The binary log has one CREATE WORKTREE and no statements creating wt's
+# tables or objects one by one.
+CREATE WORKTREE events: 1, per-object CREATEs for wt: 0
+include/rpl/sync_to_replica.inc
+# On the replica: identical src and wt, objects cloned by its own CREATE
+# WORKTREE (the view is remapped to wt), FULLTEXT works.
+SET SESSION group_concat_max_len = 10000000;
+src identical on source and replica: 1
+wt identical on source and replica: 1
+wt differs from src on the replica: 1
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+COUNT(*)	SUM(bal)	SUM(note = 'wt only')
+500	500050	10
+SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
+COUNT(*)	SUM(bal)	SUM(note = 'wt only')
+500	500307	0
+SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
+COUNT(*)
+2
+SELECT VIEW_DEFINITION LIKE '%`wt`.%' AND VIEW_DEFINITION NOT LIKE '%`src`.%' AS remapped
+FROM information_schema.VIEWS WHERE TABLE_SCHEMA = 'wt' AND TABLE_NAME = 'v';
+remapped
+1
+SELECT TRIGGER_SCHEMA, TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = 'wt';
+TRIGGER_SCHEMA	TRIGGER_NAME
+wt	log_upd
+SELECT ROUTINE_SCHEMA, ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = 'wt';
+ROUTINE_SCHEMA	ROUTINE_NAME
+wt	pay
+CHECK TABLE wt.acct, wt.log, wt.parts, wt.ft, wt.z, src.acct, src.z;
+Table	Op	Msg_type	Msg_text
+wt.acct	check	status	OK
+wt.log	check	status	OK
+wt.parts	check	status	OK
+wt.ft	check	status	OK
+wt.z	check	status	OK
+src.acct	check	status	OK
+src.z	check	status	OK
+# Dropping the worktree replicates too.
+[connection master]
+DROP DATABASE wt;
+DROP DATABASE src;
+DROP PROCEDURE test.burst;
+include/rpl/sync_to_replica.inc
+SHOW DATABASES LIKE 'wt';
+Database (wt)
+include/rpl/deinit.inc

@@ -621,6 +621,9 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     return false;
   };
 
+  /* The binlog event reads src as well as creating wt (§10.7): a replica's
+  applier must not run it in parallel with transactions on either. */
+  thd->add_to_binlog_accessed_dbs(src);
   if (mysql_create_db(thd, wt, &create_info, populate)) return true;
   worktree_schema_changed(wt, true);
 

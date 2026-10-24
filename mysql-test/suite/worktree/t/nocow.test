@@ -1,0 +1,33 @@
+--echo # A filesystem without copy-on-write file clones (ext4, HFS+) is refused
+--echo # with a clear error before anything is quiesced or written, and nothing
+--echo # is left behind.
+let $datadir = `SELECT @@datadir`;
+let WT_DD = $datadir;
+perl;
+  my $a = "$ENV{WT_DD}/#reflink_check"; open(my $f, '>', $a) or die; print $f 'x'; close($f);
+  my $cmd = $^O eq 'darwin' ? "cp -c '$a' '$a.c'" : "cp --reflink=always '$a' '$a.c'";
+  my $ok = system("$cmd 2>/dev/null") == 0 ? 1 : 0; unlink($a, "$a.c");
+  open(my $o, '>', "$ENV{MYSQLTEST_VARDIR}/tmp/reflink.inc") or die;
+  print $o "let \$have_reflink = $ok;\n"; close($o);
+EOF
+--source $MYSQLTEST_VARDIR/tmp/reflink.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/reflink.inc
+if ($have_reflink)
+{
+  --skip The datadir filesystem supports reflink
+}
+
+CREATE DATABASE src;
+CREATE TABLE src.t (id INT PRIMARY KEY, v INT);
+INSERT INTO src.t VALUES (1, 1), (2, 2);
+--error ER_NOT_SUPPORTED_YET
+CREATE WORKTREE wt FROM src;
+SHOW DATABASES LIKE 'wt';
+--error 1
+--file_exists $datadir/wt
+--echo # Nothing left in src either:
+--list_files $datadir/src
+--echo # The source is untouched and writable.
+INSERT INTO src.t VALUES (3, 3);
+SELECT * FROM src.t ORDER BY id;
+DROP DATABASE src;

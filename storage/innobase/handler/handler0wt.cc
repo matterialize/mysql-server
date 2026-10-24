@@ -103,6 +103,7 @@ int reflink(const char *src, const char *dst) {
 /** Report a failed reflink; a filesystem without file clones gets an error
 that says so. */
 bool wt_reflink_error(const std::string &path) {
+  /* ENOTSUP and EOPNOTSUPP are the same value on Linux, not on macOS. */
   if (errno == EOPNOTSUPP || errno == ENOTSUP || errno == EXDEV ||
       errno == EINVAL || errno == ENOTTY) {
     const std::string what =
@@ -339,7 +340,7 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
     return true;
   }
   auto close_guard =
-      create_scope_guard([&]() { fil_close_tablespace(c->space_id); });
+      create_scope_guard([&]() { (void)fil_close_tablespace(c->space_id); });
 
   fil_space_t *space = fil_space_acquire(c->space_id);
   /* The allocator reads pages that still carry the ancestor's id. */
