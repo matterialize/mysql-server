@@ -44,6 +44,7 @@ Free Software Foundation.
 #include "log0files_governor.h"
 #include "trx0sys.h"
 #include "buf0dblwr.h"
+#include "buf0flu.h"
 #include <sys/stat.h>
 #include "fsp0fsp.h"
 #include "ha_innodb.h"
@@ -692,10 +693,21 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
     buf_block_t *block =
         buf_page_get_gen(page_id_t(s, n), page_size, RW_X_LATCH, nullptr,
                          Page_fetch::POSSIBLY_FREED, UT_LOCATION_HERE, &mtr);
-    const byte *bytes = page_size.is_compressed() ? block->page.zip.data
-                                                  : block->frame;
+    /* The crash-loop state: bytes in zip.data that the frame lacks. */
+    DBUG_EXECUTE_IF("wt_flatten_stale_zip", {
+      if (page_size.is_compressed() &&
+          page_is_uncompressed_type(block->page.zip.data))
+        block->page.zip.data[FIL_PAGE_LSN + 7] |= 1;
+    });
+    /* Test the bytes wt_mtr_log_image() logs: for an uncompressed-type page
+    of a compressed space the frame is authoritative (flush copies it over
+    zip.data), and zip.data may hold stale bytes over a zero frame. */
+    const bool zip = page_size.is_compressed() &&
+                     !page_is_uncompressed_type(block->page.zip.data);
+    const byte *bytes = zip ? block->page.zip.data : block->frame;
+    const ulint end = page_size.physical() - (zip ? 0 : FIL_PAGE_DATA_END);
     bool zero = true;
-    for (ulint i = 0; zero && i < page_size.physical(); ++i)
+    for (ulint i = FIL_PAGE_OFFSET; zero && i < end; ++i)
       zero = bytes[i] == 0;
     if (!zero) {
       fil_wt_set_present(space, n);

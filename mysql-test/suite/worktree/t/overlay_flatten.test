@@ -182,6 +182,16 @@ CHECK TABLE wo2.z;
 ALTER WORKTREE wo2 MATERIALIZE;
 SELECT COUNT(*), SUM(b LIKE 'o%'), SUM(a) FROM wo2.z;
 CHECK TABLE wo2.z, wo1.z, osrc.z;
+--echo #
+--echo # 7. In a compressed space the frame, not zip.data, holds an
+--echo #    uncompressed-type page: stale zip.data bytes over a zero frame (an
+--echo #    unused page) must not make flatten adopt a zero image (page no 0).
+SET SESSION debug = '+d,wt_flatten_stale_zip';
+ALTER WORKTREE wo1 MATERIALIZE;
+SET SESSION debug = '-d,wt_flatten_stale_zip';
+SET GLOBAL innodb_buf_flush_list_now = ON;
+SELECT COUNT(*), SUM(b LIKE 'o%'), SUM(a) FROM wo1.z;
+CHECK TABLE wo1.z;
 DROP DATABASE wo2;
 DROP DATABASE wo1;
 DROP DATABASE osrc;
