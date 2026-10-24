@@ -239,7 +239,11 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
   if (pwrite(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
       os_file_write(write1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
     return wt_os_error("write header pages of", path);
+#ifndef __linux__
+  /* Linux: made durable by one syncfs() before the commit (sql_worktree),
+  not a journal commit per file. */
   if (fsync(fd) != 0) return wt_os_error("fsync", path);
+#endif
   return false;
 }
 

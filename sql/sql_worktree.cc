@@ -626,7 +626,13 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     char dir[FN_REFLEN + 1];
     build_table_filename(dir, sizeof(dir) - 1, wt, "", "", 0);
     const int dir_fd = open(dir, O_RDONLY);
+#ifdef __linux__
+    /* Linux: the clone files' header pages too (InnoDB skips their fsync),
+    and the layer names, in one journal commit. */
+    const bool synced = dir_fd >= 0 && syncfs(dir_fd) == 0;
+#else
     const bool synced = dir_fd >= 0 && fsync(dir_fd) == 0;
+#endif
     if (dir_fd >= 0) close(dir_fd);
     if (!synced) {
       my_error(ER_ERROR_ON_WRITE, MYF(0), dir, errno, strerror(errno));
