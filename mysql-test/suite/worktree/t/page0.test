@@ -236,6 +236,9 @@ DROP DATABASE wt;
 --echo #    the worktree's own page 0, or stop with the file unidentified), it
 --echo #    never restores the source's page 0 into the worktree.
 call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wz/zc.ibd");
+# The background server may still hold the datadir lock briefly after it
+# exits; the next start retries it.
+call mtr.add_suppression("Unable to lock ./ibdata1 error: 11");
 let WZ_IBD = $datadir/wz/zc.ibd;
 let ZSRC_IBD = $datadir/src/zc.ibd;
 CREATE DATABASE src;

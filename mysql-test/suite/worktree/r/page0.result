@@ -159,6 +159,7 @@ DROP DATABASE wt;
 #    the worktree's own page 0, or stop with the file unidentified), it
 #    never restores the source's page 0 into the worktree.
 call mtr.add_suppression("Header page consists of zero bytes in datafile: ./wz/zc.ibd");
+call mtr.add_suppression("Unable to lock ./ibdata1 error: 11");
 CREATE DATABASE src;
 CREATE TABLE src.zc (id INT PRIMARY KEY, v VARCHAR(40), KEY (v)) ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=1;
 SET SESSION cte_max_recursion_depth = 100000;
