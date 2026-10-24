@@ -85,9 +85,9 @@ SET SESSION group_concat_max_len = 10000000;
 src identical on source and replica: 1
 wt identical on source and replica: 1
 wt differs from src on the replica: 1
-SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
-COUNT(*)	SUM(bal)	SUM(note = 'wt only')
-500	500050	10
+SELECT COUNT(*), SUM(bal) - (SELECT COUNT(*) FROM wt.log) AS bal_minus_log, SUM(note = 'wt only') FROM wt.acct;
+COUNT(*)	bal_minus_log	SUM(note = 'wt only')
+500	500038	10
 SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
 COUNT(*)	SUM(bal)	SUM(note = 'wt only')
 500	500307	0

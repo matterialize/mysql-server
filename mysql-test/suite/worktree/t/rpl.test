@@ -103,7 +103,7 @@ let $wt_differs = `SELECT '$replica_src' <> '$replica_wt'`;
 --echo src identical on source and replica: $same_src
 --echo wt identical on source and replica: $same_wt
 --echo wt differs from src on the replica: $wt_differs
-SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM wt.acct;
+SELECT COUNT(*), SUM(bal) - (SELECT COUNT(*) FROM wt.log) AS bal_minus_log, SUM(note = 'wt only') FROM wt.acct;
 SELECT COUNT(*), SUM(bal), SUM(note = 'wt only') FROM src.acct;
 SELECT COUNT(*) FROM wt.ft WHERE MATCH (body) AGAINST ('banana');
 SELECT VIEW_DEFINITION LIKE '%`wt`.%' AND VIEW_DEFINITION NOT LIKE '%`src`.%' AS remapped
