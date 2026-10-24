@@ -778,14 +778,16 @@ const char *worktree_remap_dynamic_sql(THD *thd, const char *query,
 
 static bool worktree_read_only_one(THD *thd, plugin_ref plugin, void *arg) {
   handlerton *hton = plugin_data<handlerton *>(plugin);
+  const auto *change = static_cast<std::pair<dd::Object_id, bool> *>(arg);
   if (hton->state == SHOW_OPTION_YES && hton->worktree_read_only != nullptr)
-    hton->worktree_read_only(hton, thd, *static_cast<dd::Object_id *>(arg));
+    hton->worktree_read_only(hton, thd, change->first, change->second);
   return false;
 }
 
-void worktree_schema_read_only(THD *thd, dd::Object_id schema_id) {
+void worktree_schema_read_only(THD *thd, dd::Object_id schema_id, bool read_only) {
+  std::pair<dd::Object_id, bool> change{schema_id, read_only};
   plugin_foreach(thd, worktree_read_only_one, MYSQL_STORAGE_ENGINE_PLUGIN,
-                 &schema_id);
+                 &change);
 }
 
 bool worktree_tables_op(THD *thd, const char *db, bool refresh) {

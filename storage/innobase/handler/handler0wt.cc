@@ -1660,8 +1660,10 @@ so both files carry the key encrypted under the same master key. */
 }
 
 void innobase_worktree_read_only(handlerton *, THD *thd,
-                                 dd::Object_id schema_id) {
-  if (!srv_wt_overlay) return;
+                                 dd::Object_id schema_id, bool read_only) {
+  /* Set only by a wait that succeeded in this read-only period. */
+  wt_schema_purged_set(schema_id, false);
+  if (!read_only || !srv_wt_overlay) return;
   /* (No error on timeout: the ALTER has committed; CREATE waits instead.) */
   if (!overlay_wait_purged(thd, trx_sys_get_next_trx_id_or_no(), false))
     wt_schema_purged_set(schema_id, true);

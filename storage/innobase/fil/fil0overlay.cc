@@ -238,9 +238,16 @@ bool fil_wt_read_chain(fil_space_t *space, page_no_t page_no,
 }
 
 bool fil_space_is_wt_overlay(space_id_t space_id) {
-  /* Opening the file reads page 0, which tells (bit 15) and attaches. */
-  if (!fil_space_open(space_id)) return false;
+  /* Reflink mode (or read-only) writes no overlay. */
+  if (!srv_wt_overlay && !wt_overlays_exist()) return false;
+  /* A discarded table has no tablespace (fil_space_open assumes one). */
   fil_space_t *space = fil_space_acquire_silent(space_id);
+  if (space == nullptr) return false;
+  const bool has_file = !space->files.empty();
+  fil_space_release(space);
+  /* Opening the file reads page 0, which tells (bit 15) and attaches. */
+  if (!has_file || !fil_space_open(space_id)) return false;
+  space = fil_space_acquire_silent(space_id);
   if (space == nullptr) return false;
   const bool overlay = space->wt_ov != nullptr ||
                        (space->flags & FSP_FLAGS_MASK_WT_OVERLAY) != 0;

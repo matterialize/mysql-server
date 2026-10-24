@@ -89,7 +89,8 @@ class Sql_cmd_materialize_worktree final : public Sql_cmd_ddl {
 */
 bool worktree_tables_op(THD *thd, const char *db, bool refresh);
 
-/** Tell the engines that a schema became read-only (committed). */
-void worktree_schema_read_only(THD *thd, dd::Object_id schema_id);
+/** Tell the engines that a schema became read-only (after the commit) or
+is about to become writable. */
+void worktree_schema_read_only(THD *thd, dd::Object_id schema_id, bool read_only);
 
 #endif /* SQL_WORKTREE_INCLUDED */

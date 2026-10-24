@@ -845,10 +845,11 @@ void innobase_register_trx(handlerton *hton, THD *thd, trx_t *trx);
 /** CREATE WORKTREE: see clone_table_t in handler.h. */
 /** Overlay refresh (ALTER SCHEMA ... READ ONLY = 0): freeze the table's
 live-linked files (limits/overlay-v3-addendum.md A2). */
-/** ALTER SCHEMA ... READ ONLY = 1 committed: wait for purge of its history
-once (overlay mode). */
+/** ALTER SCHEMA ... READ ONLY changes: after READ ONLY = 1 committed, wait
+for purge of its history once; before READ ONLY = 0, forget that (overlay
+mode). */
 void innobase_worktree_read_only(handlerton *hton, THD *thd,
-                                 dd::Object_id schema_id);
+                                 dd::Object_id schema_id, bool read_only);
 bool innobase_worktree_refresh(handlerton *hton, THD *thd,
                                const dd::Table &table);
 
