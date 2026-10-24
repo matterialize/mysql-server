@@ -677,8 +677,11 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
     log_free_check();
     mtr_t mtr;
     mtr.start();
-    buf_block_t *block = buf_page_get(page_id_t(s, n), page_size, RW_X_LATCH,
-                                      UT_LOCATION_HERE, &mtr);
+    /* Every page of the range, free ones too (their content is whatever the
+    layer holds; a page reused later is initialised). */
+    buf_block_t *block =
+        buf_page_get_gen(page_id_t(s, n), page_size, RW_X_LATCH, nullptr,
+                         Page_fetch::POSSIBLY_FREED, UT_LOCATION_HERE, &mtr);
     const byte *bytes = page_size.is_compressed() ? block->page.zip.data
                                                   : block->frame;
     bool zero = true;

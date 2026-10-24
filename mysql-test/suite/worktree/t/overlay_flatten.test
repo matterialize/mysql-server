@@ -138,6 +138,26 @@ SELECT id, LENGTH(b), LEFT(b, 10) FROM wt.t WHERE id IN (200, 400, 4000) ORDER B
 SELECT COUNT(*) FROM wt.t WHERE MATCH (v) AGAINST ('narwhal');
 CHECK TABLE wt.t;
 
+--echo #
+--echo # 5. Flatten adopts free pages too (pages the worktree freed, read from
+--echo #    its layer): a depth-cap flatten on a replica hit them first.
+CREATE DATABASE fsrc;
+CREATE TABLE fsrc.f (id INT PRIMARY KEY, v VARCHAR(200), KEY k (v(50)));
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO fsrc.f WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+  SELECT n, REPEAT('f', 150) FROM s;
+CREATE WORKTREE wf FROM fsrc;
+--echo # (index k's pages read in from the layer, then freed untouched)
+SELECT COUNT(*) FROM wf.f FORCE INDEX (k) WHERE v LIKE 'f%';
+ALTER TABLE wf.f DROP INDEX k, ALGORITHM = INPLACE;
+DELETE FROM wf.f WHERE id > 1000;
+--source include/wait_innodb_all_purged.inc
+ALTER WORKTREE wf MATERIALIZE;
+SELECT COUNT(*), SUM(LENGTH(v)) FROM wf.f;
+CHECK TABLE wf.f;
+DROP DATABASE wf;
+DROP DATABASE fsrc;
+
 DROP DATABASE wt3;
 DROP DATABASE wt2;
 DROP DATABASE wt;

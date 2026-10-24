@@ -182,6 +182,30 @@ COUNT(*)
 CHECK TABLE wt.t;
 Table	Op	Msg_type	Msg_text
 wt.t	check	status	OK
+#
+# 5. Flatten adopts free pages too (pages the worktree freed, read from
+#    its layer): a depth-cap flatten on a replica hit them first.
+CREATE DATABASE fsrc;
+CREATE TABLE fsrc.f (id INT PRIMARY KEY, v VARCHAR(200), KEY k (v(50)));
+SET SESSION cte_max_recursion_depth = 100000;
+INSERT INTO fsrc.f WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 20000)
+SELECT n, REPEAT('f', 150) FROM s;
+CREATE WORKTREE wf FROM fsrc;
+# (index k's pages read in from the layer, then freed untouched)
+SELECT COUNT(*) FROM wf.f FORCE INDEX (k) WHERE v LIKE 'f%';
+COUNT(*)
+20000
+ALTER TABLE wf.f DROP INDEX k, ALGORITHM = INPLACE;
+DELETE FROM wf.f WHERE id > 1000;
+ALTER WORKTREE wf MATERIALIZE;
+SELECT COUNT(*), SUM(LENGTH(v)) FROM wf.f;
+COUNT(*)	SUM(LENGTH(v))
+1000	150000
+CHECK TABLE wf.f;
+Table	Op	Msg_type	Msg_text
+wf.f	check	status	OK
+DROP DATABASE wf;
+DROP DATABASE fsrc;
 DROP DATABASE wt3;
 DROP DATABASE wt2;
 DROP DATABASE wt;
