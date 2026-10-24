@@ -31,6 +31,7 @@ call mtr.add_suppression("innodb_force_recovery is on");
 call mtr.add_suppression("in InnoDB read-only mode");
 call mtr.add_suppression("Skipped updating resource group metadata in InnoDB read only mode");
 call mtr.add_suppression("Failed to compress the gtid_executed table");
+call mtr.add_suppression("Error persisting GTIDs to table");
 
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
