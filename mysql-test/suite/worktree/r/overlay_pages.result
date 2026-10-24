@@ -154,7 +154,7 @@ CREATE WORKTREE w7b FROM src;
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 # Kill the server
 copies of src/s9 page 0: pre-freeze yes, post-freeze 0
-startup with a torn page 0 and only a pre-freeze copy: failed yes, says why no
+startup with a torn page 0 and only a pre-freeze copy: failed yes, says why yes
 # restart
 SELECT COUNT(*), SUM(v = 'pre') FROM src.s9;
 COUNT(*)	SUM(v = 'pre')
@@ -168,7 +168,7 @@ COUNT(*)	SUM(v = 'pre')
 SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 UPDATE w1.t SET v = 'redo' WHERE id <= 50;
 # Kill the server
-startup without the layer: failed yes, names the layer no
+startup without the layer: failed yes, names the layer yes
 # restart
 SELECT COUNT(*), SUM(v = 'redo') FROM w1.t;
 COUNT(*)	SUM(v = 'redo')

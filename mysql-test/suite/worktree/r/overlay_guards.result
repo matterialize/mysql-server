@@ -8,6 +8,7 @@ call mtr.add_suppression("in InnoDB read-only mode");
 call mtr.add_suppression("Failed to compress the gtid_executed table");
 call mtr.add_suppression("Skip re-populating collations");
 call mtr.add_suppression("Ignored the innodb-redo-log-capacity option in the Innodb read-only mode");
+call mtr.add_suppression("Skipped updating resource group metadata in InnoDB read only mode");
 SET SESSION cte_max_recursion_depth = 100000;
 CREATE DATABASE src;
 CREATE TABLE src.t (id INT PRIMARY KEY, v VARCHAR(40));

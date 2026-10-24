@@ -737,12 +737,6 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
   */
   if (trans_commit_stmt(thd) || trans_commit(thd)) return true;
 
-  /* Overlay worktrees: purge of the schema's old history can be waited for
-  now, once, instead of at each CREATE WORKTREE from it. */
-  if ((create_info->used_fields & HA_CREATE_USED_READ_ONLY) &&
-      !schema_read_only && create_info->schema_read_only)
-    worktree_schema_read_only(thd, schema_id, true);
-
   /*
     Change collation options if the current database is being
     altered and the clause is explicitly submitted in the ALTER
@@ -769,6 +763,15 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
       tdc_remove_table(thd, TDC_RT_REMOVE_ALL, table->db, table->table_name,
                        false);
     }
+  }
+
+  /* Overlay worktrees: purge of the schema's old history can be waited for
+  now, once, instead of at each CREATE WORKTREE from it. Purge opens the
+  tables (MDL), so the statement's locks go first: it has committed. */
+  if ((create_info->used_fields & HA_CREATE_USED_READ_ONLY) &&
+      !schema_read_only && create_info->schema_read_only) {
+    thd->mdl_context.release_transactional_locks();
+    worktree_schema_read_only(thd, schema_id, true);
   }
 
   my_ok(thd, 1);
