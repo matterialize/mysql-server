@@ -1499,6 +1499,9 @@ A2). @return true on timeout (error reported) */
 read-only (in memory: a restart forgets them). */
 std::mutex wt_purged_mutex;
 std::set<dd::Object_id> wt_purged_schemas;
+/** Reflink mode: for a read-only schema, the transaction number its first
+CREATE WORKTREE saw; all of its history is older. */
+std::map<dd::Object_id, trx_id_t> wt_purge_targets;
 
 bool wt_schema_purged(dd::Object_id schema_id) {
   const std::lock_guard<std::mutex> guard(wt_purged_mutex);
@@ -1511,7 +1514,40 @@ void wt_schema_purged_set(dd::Object_id schema_id, bool purged) {
     wt_purged_schemas.insert(schema_id);
   } else {
     wt_purged_schemas.erase(schema_id);
+    wt_purge_targets.erase(schema_id);
   }
+}
+
+/** What purge has applied, as purge_sys->done records it in debug builds
+(limit, or iter while limit is unset), read with no batch in flight:
+stopping purge waits for the running one. */
+trx_id_t wt_purge_done() {
+  trx_purge_stop();
+  rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
+  const trx_id_t done = purge_sys->limit.trx_no != 0 ? purge_sys->limit.trx_no
+                                                     : purge_sys->iter.trx_no;
+  rw_lock_s_unlock(&purge_sys->latch);
+  trx_purge_run();
+  return done;
+}
+
+/** Reflink mode: has purge passed every transaction that can have written
+the read-only schema? Checked without waiting, once per statement, and
+remembered once true (wt_schema_purged). */
+bool wt_purged_probe(THD *thd, dd::Object_id schema_id) {
+  static thread_local std::pair<const THD *, query_id_t> probed{nullptr, 0};
+  if (probed.first == thd && probed.second == thd->query_id) return false;
+  probed = {thd, thd->query_id};
+  trx_id_t target;
+  {
+    const std::lock_guard<std::mutex> guard(wt_purged_mutex);
+    target = wt_purge_targets.emplace(schema_id, trx_sys_get_next_trx_id_or_no())
+                 .first->second;
+  }
+  if (trx_sys->rseg_history_len.load() != 0 && wt_purge_done() < target)
+    return false;
+  wt_schema_purged_set(schema_id, true);
+  return true;
 }
 
 bool overlay_wait_purged(THD *thd, trx_id_t target, bool report = true) {
@@ -1519,16 +1555,7 @@ bool overlay_wait_purged(THD *thd, trx_id_t target, bool report = true) {
                         std::chrono::seconds(thd_lock_wait_timeout(thd));
   for (;;) {
     if (trx_sys->rseg_history_len.load() == 0) return false;
-    /* What purge has applied, as purge_sys->done records it in debug builds
-    (limit, or iter while limit is unset), read with no batch in flight:
-    stopping purge waits for the running one. */
-    trx_purge_stop();
-    rw_lock_s_lock(&purge_sys->latch, UT_LOCATION_HERE);
-    const trx_id_t done = purge_sys->limit.trx_no != 0 ? purge_sys->limit.trx_no
-                                                       : purge_sys->iter.trx_no;
-    rw_lock_s_unlock(&purge_sys->latch);
-    trx_purge_run();
-    if (done >= target) return false;
+    if (wt_purge_done() >= target) return false;
     if (std::chrono::steady_clock::now() > deadline || thd_killed(thd)) {
       if (report) my_error(ER_LOCK_WAIT_TIMEOUT, MYF(0));
       return true;
@@ -1630,7 +1657,8 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   if (overlay && !wt_images_margin.exchange(true))
     log_files_thread_concurrency_updated(*log_sys);
   if (overlay && overlay_check_config()) return true;
-  const bool src_read_only = overlay && schema_read_only(thd, src_dd);
+  const bool read_only = schema_read_only(thd, src_dd);
+  const bool src_read_only = overlay && read_only;
 
   trx_t *trx = check_trx_exists(thd);
   innobase_register_trx(hton, thd, trx);
@@ -1793,11 +1821,19 @@ so both files carry the key encrypted under the same master key. */
     }
   }
 
+  /* Purge can't write a read-only source whose history it has passed, so it
+  needn't be stopped: stopping it for every table waited for purge batches,
+  much of a create's time under write load (milestone 5, F3). */
+  bool purged = read_only && wt_schema_purged(src_dd.schema_id());
+  if (read_only && !purged && !overlay)
+    purged = wt_purged_probe(thd, src_dd.schema_id());
+
   /* Quiesce (§12.2 phase 2): no .cfg/.cfp is written. User writes are blocked
   by MDL; stop purge (instance-wide, reference counted, so keep it short),
   then snapshot every file of this table. */
   {
-    const bool purge_stopped = trx_purge_state() != PURGE_STATE_DISABLED;
+    const bool purge_stopped =
+        !purged && trx_purge_state() != PURGE_STATE_DISABLED;
     if (purge_stopped) trx_purge_stop();
     auto purge_guard = create_scope_guard([&]() {
       if (purge_stopped) trx_purge_run();
