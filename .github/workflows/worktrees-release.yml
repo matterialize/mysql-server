@@ -1,0 +1,43 @@
+name: Worktrees Linux x86_64 release
+# Builds the worktrees branch for Linux x86_64, runs the worktree suite on the
+# runner's ext4 disk (overlay mode), and attaches the tarball to a release.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the tarball to (e.g. 9.7.4-wt1)
+        required: true
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    env:
+      NAME: mysql-${{ inputs.tag }}-linux-x86_64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Install toolchain
+        run: scripts/ci/bootstrap.sh && sudo apt-get install -y --no-install-recommends libaio-dev libudev-dev
+      - name: Build
+        run: >
+          scripts/ci/build.sh release -DWITH_UNIT_TESTS=OFF -DWITH_ROUTER=OFF -DWITH_NDB=OFF
+          -DWITH_ZLIB=bundled -DWITH_SSL=system
+      - name: Worktree suite (overlay mode on ext4)
+        run: scripts/ci/mtr.sh --suite=worktree --parallel=4 --force --max-test-fail=0
+      - name: Package
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/$NAME" --strip
+          rm -rf "$RUNNER_TEMP/$NAME/mysql-test"
+          tar -czf "$NAME.tar.gz" -C "$RUNNER_TEMP" "$NAME"
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release upload "$TAG" "$NAME.tar.gz" --clobber -R "$GITHUB_REPOSITORY"
