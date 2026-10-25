@@ -1,0 +1,39 @@
+# Overlay mode: a DROP DATABASE (which runs layer GC) while a CREATE
+# WORKTREE has linked its new layer but its clone's header doesn't name
+# it yet. The layer is a GC root until then (milestone 5); before, GC
+# deleted it and the create failed.
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB;
+INSERT INTO g.t VALUES (1, 1), (2, 2);
+ALTER SCHEMA g READ ONLY = 1;
+CREATE WORKTREE victim FROM g;
+SET DEBUG_SYNC = 'wt_after_layer_link SIGNAL linked WAIT_FOR go';
+CREATE WORKTREE f1 FROM g;
+SET DEBUG_SYNC = 'now WAIT_FOR linked';
+DROP DATABASE victim;
+SET DEBUG_SYNC = 'now SIGNAL go';
+SELECT * FROM f1.t ORDER BY id;
+id	v
+1	1
+2	2
+UPDATE f1.t SET v = 10 WHERE id = 1;
+SELECT * FROM f1.t ORDER BY id;
+id	v
+1	10
+2	2
+SELECT * FROM g.t ORDER BY id;
+id	v
+1	1
+2	2
+# restart
+SELECT * FROM f1.t ORDER BY id;
+id	v
+1	10
+2	2
+CHECK TABLE f1.t;
+Table	Op	Msg_type	Msg_text
+f1.t	check	status	OK
+SET DEBUG_SYNC = 'RESET';
+DROP DATABASE f1;
+ALTER SCHEMA g READ ONLY = 0;
+DROP DATABASE g;

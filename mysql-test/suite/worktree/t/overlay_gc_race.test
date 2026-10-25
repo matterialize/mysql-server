@@ -1,0 +1,40 @@
+--echo # Overlay mode: a DROP DATABASE (which runs layer GC) while a CREATE
+--echo # WORKTREE has linked its new layer but its clone's header doesn't name
+--echo # it yet. The layer is a GC root until then (milestone 5); before, GC
+--echo # deleted it and the create failed.
+--source include/have_debug_sync.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if (!$overlay)
+{
+  --skip Needs overlay mode (no reflink, or innodb_worktree_mode=OVERLAY)
+}
+
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB;
+INSERT INTO g.t VALUES (1, 1), (2, 2);
+ALTER SCHEMA g READ ONLY = 1;
+CREATE WORKTREE victim FROM g;
+connect (con1, localhost, root,,);
+SET DEBUG_SYNC = 'wt_after_layer_link SIGNAL linked WAIT_FOR go';
+send CREATE WORKTREE f1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR linked';
+DROP DATABASE victim;
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection default;
+SELECT * FROM f1.t ORDER BY id;
+UPDATE f1.t SET v = 10 WHERE id = 1;
+SELECT * FROM f1.t ORDER BY id;
+SELECT * FROM g.t ORDER BY id;
+--source include/restart_mysqld.inc
+SELECT * FROM f1.t ORDER BY id;
+CHECK TABLE f1.t;
+
+SET DEBUG_SYNC = 'RESET';
+disconnect con1;
+DROP DATABASE f1;
+ALTER SCHEMA g READ ONLY = 0;
+DROP DATABASE g;

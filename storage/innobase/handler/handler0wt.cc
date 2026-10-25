@@ -318,6 +318,8 @@ struct Space_clone {
   shares it with other creates (a read-only source linked live). */
   fil_space_t *slot{};
   bool slot_shared{};
+  /* The layer this clone pinned for GC (wt_pinned_layers), if any. */
+  std::string pinned;
   /* Reflink mode: the source's pages 0 and 1 (page 1 decrypted) as cloned. */
   std::vector<byte> head;
 };
@@ -366,6 +368,10 @@ bool prepare_clone(trx_t *trx, dict_table_t *src, const std::string &name,
 /** Overlay mode: excludes GC and other freezes during F0-F6, and guards the
 per-space operation slots (limits/overlay-v3.md §7.1). */
 std::mutex wt_layer_mutex;
+
+/** Layers just linked by a CREATE WORKTREE in progress, before its clone's
+header names them: GC roots. Protected by wt_layer_mutex. */
+std::set<std::string> wt_pinned_layers;
 
 /** Take the operation slot of a space (v3 I8), waiting up to
 lock_wait_timeout. @return true on timeout (error reported) */
@@ -1055,11 +1061,19 @@ bool overlay_snapshot(Space_clone *c, bool live) {
   if (live) {
     const std::string layer = wt_layer_path(uuid);
     if (!layer_dir_ready()) return wt_os_error("create", WT_LAYER_DIR);
+    /* Until the clone's header pages name it (publish_clone), nothing on
+    disk does: a GC run by a concurrent DROP would delete it. */
+    {
+      const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+      wt_pinned_layers.insert(uuid);
+    }
+    c->pinned = uuid;
     if (link(c->src_path.c_str(), layer.c_str()) != 0)
       return wt_os_error("hard-link the source as layer", layer);
     wt_layer_names.fetch_add(1);
     /* Made durable once for all tables before the commit (sql_worktree). */
     DBUG_EXECUTE_IF("wt_crash_after_layer_link", DBUG_SUICIDE(););
+    DEBUG_SYNC(current_thd, "wt_after_layer_link");
   }
 
   const int dst = open(c->tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
@@ -1796,6 +1810,12 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
     if (has_fts) fts_hold(fts_src, false);
   });
   auto slot_guard = create_scope_guard([&]() {
+    /* By now each clone's header names its layer, or it is rolled back. */
+    {
+      const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+      for (const auto &c : clones) wt_pinned_layers.erase(c.pinned);
+      for (const auto &a : aux) wt_pinned_layers.erase(a.clone.pinned);
+    }
     for (auto &c : clones) {
       if (c.slot != nullptr) wt_op_release(c.slot, c.slot_shared);
     }
@@ -2012,7 +2032,7 @@ bool innobase_worktree_materialize(handlerton *, THD *thd,
 }
 
 bool innobase_worktree_compact(handlerton *, THD *thd, const dd::Table &table) {
-  if (srv_wt_overlay || srv_read_only_mode || srv_force_recovery > 0) return false;
+  if (srv_read_only_mode || srv_force_recovery > 0) return false;
   trx_t *trx = check_trx_exists(thd);
   std::vector<dict_table_t *> opened;
   std::vector<MDL_ticket *> mdls;
@@ -2022,7 +2042,14 @@ bool innobase_worktree_compact(handlerton *, THD *thd, const dd::Table &table) {
   });
   if (wt_tables_of(thd, table, &opened, &mdls)) return true;
   for (dict_table_t *t : opened) {
-    if (dict_table_is_file_per_table(t)) wt_compact_space(trx, t->space);
+    if (!dict_table_is_file_per_table(t)) continue;
+    if (srv_wt_overlay) {
+      /* Overlay files are never shared clones: just write out what the
+      refresh left dirty now, not in the first CREATE WORKTREE after it. */
+      std::ignore = wt_flush_space(t->space, trx);
+    } else {
+      wt_compact_space(trx, t->space);
+    }
   }
   return false;
 }
@@ -2091,6 +2118,16 @@ void innobase_wt_gc(bool startup) {
     return;
   }
   const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+  const auto gc_start = std::chrono::steady_clock::now();
+  size_t gc_files = 0;
+  auto gc_log = create_scope_guard([&]() {
+    const double secs = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - gc_start)
+                            .count();
+    if (secs > 0.5)
+      ib::info() << "Worktree GC: read " << gc_files << " file heads in " << secs
+                 << " s";
+  });
   /* Layer files and their inodes. */
   std::map<std::string, ino_t> layers;
   if (DIR *d = opendir(WT_LAYER_DIR); d != nullptr) {
@@ -2129,6 +2166,7 @@ void innobase_wt_gc(bool startup) {
         std::vector<byte> head;
         page_size_t size(univ_page_size);
         ino_t ino;
+        ++gc_files;
         if (!wt_read_head(path, &head, &size, &ino)) continue;
         if (has_suffix(name, ".ibd"))
           ibds.emplace_back(ino, fsp_header_get_space_id(head.data()));
@@ -2149,6 +2187,8 @@ void innobase_wt_gc(bool startup) {
     }
     closedir(d);
   }
+  /* Layers of creates in progress are roots too. */
+  todo.insert(todo.end(), wt_pinned_layers.begin(), wt_pinned_layers.end());
   /* Reachable layers, transitively; fail-safe on any bad link (v3 §9). */
   std::set<std::string> reached;
   while (!todo.empty() && !unsafe) {
