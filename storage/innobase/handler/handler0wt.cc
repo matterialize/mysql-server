@@ -144,6 +144,11 @@ quiesced or written, so an unsupported filesystem fails cleanly. The probe is
 not in the new schema's directory: a crash before the unlink would leave a file
 there that the DDL log does not know, and rolling back the schema would fail. */
 bool probe_reflink(THD *thd) {
+  /* The filesystem doesn't change under a running server, and the probe's
+  file operations, once per table, contended with each other in concurrent
+  creates. */
+  static std::atomic<bool> works{false};
+  if (works.load()) return false;
   const std::string a = "#wt_probe_" + std::to_string(thd_get_thread_id(thd));
   const std::string b = a + ".clone";
   unlink(a.c_str());
@@ -158,6 +163,7 @@ bool probe_reflink(THD *thd) {
   unlink(a.c_str());
   unlink(b.c_str());
   errno = err;
+  if (ret == 0) works.store(true);
   return ret != 0 && wt_reflink_error(b);
 }
 
@@ -190,7 +196,7 @@ then carry the new space id and no map, and write_overflow() completes them */
 bool rewrite_header_pages(const std::string &path, space_id_t space_id,
                           space_id_t src_space_id, const page_size_t &page_size,
                           const Encryption_metadata &enc, const wt_map_t &map,
-                          bool *overflow) {
+                          const std::vector<byte> &head, bool *overflow) {
   int fd = open(path.c_str(), O_RDWR);
   if (fd < 0) return wt_os_error("open", path);
   auto guard = create_scope_guard([fd]() { close(fd); });
@@ -205,11 +211,15 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
   auto free_guard = create_scope_guard([pages]() { ut::aligned_free(pages); });
   byte *page0 = pages;
   byte *page1 = pages + len;
-  IORequest read1(IORequest::READ);
-  if (enc.can_encrypt()) read1.get_encryption_info().set(enc);
-  if (pread(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
-      os_file_read(read1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
-    return wt_os_error("read header pages of", path);
+  if (!head.empty()) {
+    memcpy(pages, head.data(), 2 * len);
+  } else {
+    IORequest read1(IORequest::READ);
+    if (enc.can_encrypt()) read1.get_encryption_info().set(enc);
+    if (pread(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
+        os_file_read(read1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
+      return wt_os_error("read header pages of", path);
+  }
   ut_a(fsp_header_get_space_id(page0) == src_space_id);
   ut_a(fil_page_get_type(page1) == FIL_PAGE_IBUF_BITMAP);
 
@@ -248,8 +258,19 @@ bool rewrite_header_pages(const std::string &path, space_id_t space_id,
 
   IORequest write1(IORequest::WRITE);
   if (enc.can_encrypt()) write1.get_encryption_info().set(enc);
-  if (pwrite(fd, page0, len, 0) != static_cast<ssize_t>(len) ||
-      os_file_write(write1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
+  {
+#ifdef __APPLE__
+    /* APFS serializes the first write to a clone (it takes private
+    references on the shared extents) and degrades when many threads try at
+    once: 50 concurrent creates were 2.6 times slower than one after the
+    other (milestone 5). Take turns. */
+    static std::mutex first_write_mutex;
+    const std::lock_guard<std::mutex> guard(first_write_mutex);
+#endif
+    if (pwrite(fd, page0, len, 0) != static_cast<ssize_t>(len))
+      return wt_os_error("write header pages of", path);
+  }
+  if (os_file_write(write1, path.c_str(), file, page1, len, len) != DB_SUCCESS)
     return wt_os_error("write header pages of", path);
 #ifndef __linux__
   /* Linux: made durable by one syncfs() before the commit (sql_worktree),
@@ -295,6 +316,8 @@ struct Space_clone {
   wt_link_t link;
   /* The source's operation slot, while this clone holds it. */
   fil_space_t *slot{};
+  /* Reflink mode: the source's pages 0 and 1 (page 1 decrypted) as cloned. */
+  std::vector<byte> head;
 };
 
 /** Phase 1 (before the quiesce): new identities and the DDL log entries that
@@ -1087,6 +1110,18 @@ bool snapshot_clone(THD *thd, trx_t *trx, Space_clone *c) {
   }
   if (reflink(c->src_path.c_str(), c->tmp_path.c_str()) != 0)
     return wt_reflink_error(c->tmp_path);
+  /* Its header pages, read now (still quiesced) from the source, whose
+  pages are cached; read back from the new clone, a fresh inode, they would
+  miss the cache. */
+  fil_space_t *src = fil_space_acquire(space);
+  const page_size_t page_size(src->flags);
+  const Encryption_metadata enc = src->m_encryption_metadata;
+  fil_space_release(src);
+  const ulint len = page_size.physical();
+  auto pages = static_cast<byte *>(ut::aligned_alloc(2 * len, len));
+  auto free_guard = create_scope_guard([pages]() { ut::aligned_free(pages); });
+  if (read_header_pages(c->src_path, page_size, enc, pages)) return true;
+  c->head.assign(pages, pages + 2 * len);
   return false;
 }
 
@@ -1208,7 +1243,7 @@ bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
 
   bool overflow;
   if (rewrite_header_pages(c->tmp_path, c->space_id, c->src->space, page_size,
-                           enc, map, &overflow))
+                           enc, map, c->head, &overflow))
     return true;
   if (overflow && write_overflow(trx, c, fsp_flags, map)) return true;
   DBUG_EXECUTE_IF("wt_crash_after_page0", DBUG_SUICIDE(););
