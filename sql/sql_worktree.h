@@ -82,12 +82,18 @@ class Sql_cmd_materialize_worktree final : public Sql_cmd_ddl {
   bool execute(THD *thd) override;
 };
 
+enum class Worktree_op { REFRESH, MATERIALIZE, COMPACT };
+
 /**
   For every table of schema db: the engine's worktree refresh (before a
-  read-only schema becomes writable) or materialize operation.
+  read-only schema becomes writable), materialize or compact operation.
   @retval true failure, my_error() was called
 */
-bool worktree_tables_op(THD *thd, const char *db, bool refresh);
+bool worktree_tables_op(THD *thd, const char *db, Worktree_op op);
+
+/** After ALTER SCHEMA db READ ONLY = 1 has committed: compact the schema's
+fragmented table files (errors become warnings; the ALTER has committed). */
+void worktree_schema_compact(THD *thd, const char *db);
 
 /** Tell the engines that a schema became read-only (after the commit) or
 is about to become writable. */

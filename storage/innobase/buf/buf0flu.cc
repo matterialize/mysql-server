@@ -432,6 +432,9 @@ void buf_flush_insert_into_flush_list(
   block->page.set_oldest_lsn(lsn);
 
   UT_LIST_ADD_FIRST(buf_pool->flush_list, &block->page);
+  if (block->page.get_space() != nullptr) {
+    block->page.get_space()->wt_n_dirty.fetch_add(1);
+  }
 
   incr_flush_list_size_in_bytes(block, buf_pool);
 
@@ -593,6 +596,7 @@ void buf_flush_remove(buf_page_t *bpage) {
   }
 
   ut_d(bpage->in_flush_list = false);
+  if (bpage->get_space() != nullptr) bpage->get_space()->wt_n_dirty.fetch_sub(1);
 
   buf_pool->stat.flush_list_bytes -= bpage->size.physical();
 

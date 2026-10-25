@@ -1,0 +1,95 @@
+--echo # Reflink mode: when a schema becomes read-only, its table files that a
+--echo # write while shared with clones fragmented are rewritten contiguously
+--echo # (milestone 5, F2: on APFS the first write to a clone of a fragmented
+--echo # file costs per extent, so every later CREATE WORKTREE was slow).
+--source include/have_debug.inc
+--source include/not_valgrind.inc
+--source include/have_innodb_16k.inc
+let $overlay = `SELECT @@innodb_worktree_mode = 'OVERLAY'`;
+if ($overlay)
+{
+  --skip Reflink mode only (overlay files are never shared clones)
+}
+let $datadir = `SELECT @@datadir`;
+let MYSQLD_DATADIR = $datadir;
+
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT, pad CHAR(200), KEY (v));
+INSERT INTO g.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 60000)
+  SELECT n, n, REPEAT('p', 200) FROM s;
+CREATE TABLE g.small (id INT PRIMARY KEY, v INT);
+INSERT INTO g.small VALUES (1, 1), (2, 2);
+ALTER SCHEMA g READ ONLY = 1;
+CREATE WORKTREE wt_before FROM g;
+
+--echo #
+--echo # 1. A refresh writing scattered pages while "before" shares them: the
+--echo #    read-only transition rewrites g.t (fragmented), not g.small.
+ALTER SCHEMA g READ ONLY = 0;
+UPDATE g.t SET v = v + 1000000 WHERE id % 50 = 0;
+UPDATE g.small SET v = v + 10;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+ALTER SCHEMA g READ ONLY = 1;
+let SEARCH_FILE = $MYSQLTEST_VARDIR/log/mysqld.1.err;
+let SEARCH_PATTERN = Worktree compaction of ./g/t.ibd: more than 64 extents, rewritten contiguously;
+--source include/search_pattern.inc
+let SEARCH_PATTERN = Worktree compaction of ./g/small.ibd;
+--source include/search_pattern.inc
+CREATE WORKTREE wt_after FROM g;
+SELECT COUNT(*), SUM(v > 1000000) FROM g.t;
+SELECT COUNT(*), SUM(v > 1000000) FROM wt_after.t;
+SELECT COUNT(*), SUM(v > 1000000) FROM wt_before.t;
+SELECT * FROM wt_after.small ORDER BY id;
+SELECT * FROM wt_before.small ORDER BY id;
+CHECK TABLE g.t, wt_after.t, wt_before.t;
+UPDATE wt_after.t SET v = 0 WHERE id = 1;
+SELECT v FROM g.t WHERE id = 1;
+SELECT v FROM wt_after.t WHERE id = 1;
+
+--echo #
+--echo # 2. The compacted file is the one InnoDB uses: a later refresh writes
+--echo #    it, and its writes survive a restart.
+ALTER SCHEMA g READ ONLY = 0;
+UPDATE g.t SET v = -1 WHERE id = 2;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+--source include/restart_mysqld.inc
+SELECT v FROM g.t WHERE id = 2;
+CHECK TABLE g.t;
+
+--echo #
+--echo # 3. Crashes inside the compaction (after the ALTER committed): the
+--echo #    schema is read-only, the data intact, no temporary file left.
+let $points = wt_crash_compact_before_rename wt_crash_compact_after_rename;
+while ($points)
+{
+  let $point = `SELECT SUBSTRING_INDEX('$points', ' ', 1)`;
+  let $points = `SELECT TRIM(SUBSTR('$points', LENGTH('$point') + 1))`;
+  --disable_query_log
+  UPDATE g.t SET v = v + 1 WHERE id % 40 = 0;
+  SET GLOBAL innodb_buf_flush_list_now = ON;
+  CREATE WORKTREE pin FROM g;
+  UPDATE g.t SET v = v + 1 WHERE id % 40 = 1;
+  SET GLOBAL innodb_buf_flush_list_now = ON;
+  --enable_query_log
+  --echo # $point
+  --source include/expect_crash.inc
+  eval SET SESSION debug = '+d,$point';
+  --error CR_SERVER_LOST
+  ALTER SCHEMA g READ ONLY = 1;
+  --source include/start_mysqld.inc
+  SELECT options FROM information_schema.schemata_extensions WHERE schema_name = 'g';
+  SELECT COUNT(*), SUM(v) FROM g.t;
+  CHECK TABLE g.t;
+  --list_files $datadir/g *.wttmp
+  CREATE WORKTREE c FROM g;
+  SELECT COUNT(*), SUM(v) FROM c.t;
+  DROP DATABASE c;
+  DROP DATABASE pin;
+  ALTER SCHEMA g READ ONLY = 0;
+}
+
+ALTER SCHEMA g READ ONLY = 0;
+DROP DATABASE g;
+DROP DATABASE wt_before;
+DROP DATABASE wt_after;

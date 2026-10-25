@@ -858,6 +858,11 @@ standalone stock-format files (limits/overlay-v3.md §8). */
 bool innobase_worktree_materialize(handlerton *hton, THD *thd,
                                    const dd::Table &table);
 
+/** Reflink mode, after a schema became read-only: rewrite the table's
+fragmented files contiguously (milestone 5, F2). */
+bool innobase_worktree_compact(handlerton *hton, THD *thd,
+                               const dd::Table &table);
+
 /** Overlay layer GC (limits/overlay-v3.md §9) and live-link marking. */
 void innobase_wt_gc(bool startup);
 

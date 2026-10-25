@@ -516,6 +516,10 @@ struct fil_space_t {
   /** Overlay mode: bumped by every freeze (v3 §8 generation check). */
   uint64_t wt_gen{};
 
+  /** Pages of this space in the flush lists, so that CREATE WORKTREE can skip
+  scanning them when there are none (buf_LRU_flush_space()). */
+  std::atomic_size_t wt_n_dirty{};
+
   /** Throttles writing to log a message about long waiting for file to perform
   rename. */
   ib::Throttler m_prevent_file_open_wait_message_throttler;

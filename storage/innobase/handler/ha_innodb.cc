@@ -5507,6 +5507,7 @@ static int innodb_init(void *p) {
   innobase_hton->worktree_refresh = innobase_worktree_refresh;
   innobase_hton->worktree_read_only = innobase_worktree_read_only;
   innobase_hton->worktree_materialize = innobase_worktree_materialize;
+  innobase_hton->worktree_compact = innobase_worktree_compact;
 
   /* Initialize handler clone interfaces for. */
 

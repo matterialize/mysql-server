@@ -14,9 +14,11 @@ Free Software Foundation.
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/statvfs.h>
 #ifdef __APPLE__
 #include <sys/clonefile.h>
 #elif defined(__linux__)
+#include <linux/fiemap.h>
 #include <linux/fs.h>
 #include <sys/ioctl.h>
 #endif
@@ -364,6 +366,163 @@ bool wt_op_acquire(THD *thd, fil_space_t *space, uint8_t op) {
 void wt_op_release(fil_space_t *space) {
   const std::lock_guard<std::mutex> guard(wt_layer_mutex);
   space->wt_op = 0;
+}
+
+/** Write a space's dirty pages and fsync its file, for a space nothing can
+modify meanwhile. buf_LRU_flush_or_remove_pages(BUF_REMOVE_FLUSH_WRITE) scans
+every flush list and waits for every pending write of the instance, per
+table: seconds per create after a refresh or under write load (milestone 5,
+F2/F3). @return true on interruption (error reported) */
+bool wt_flush_space(space_id_t id, trx_t *trx) {
+  fil_space_t *space = fil_space_acquire(id);
+  const bool interrupted = buf_LRU_flush_space(space, trx);
+  fil_space_release(space);
+  if (interrupted) {
+    my_error(ER_QUERY_INTERRUPTED, MYF(0));
+    return true;
+  }
+  fil_flush(id);
+  return false;
+}
+
+/** The number of extents of a file, counted up to limit + 1, or -1 if the
+filesystem can't tell. */
+long wt_file_extents(int fd, off_t size, long limit) {
+#ifdef __APPLE__
+  long n = 0;
+  for (off_t off = 0; off < size && n <= limit; ++n) {
+    log2phys l2p{};
+    l2p.l2p_contigbytes = size - off;
+    l2p.l2p_devoffset = off;
+    if (fcntl(fd, F_LOG2PHYS_EXT, &l2p) != 0 || l2p.l2p_contigbytes <= 0)
+      return -1;
+    off += l2p.l2p_contigbytes;
+  }
+  return n;
+#elif defined(__linux__)
+  (void)size;
+  (void)limit;
+  fiemap fm{};
+  fm.fm_length = FIEMAP_MAX_OFFSET;
+  if (ioctl(fd, FS_IOC_FIEMAP, &fm) != 0) return -1;
+  return fm.fm_mapped_extents;
+#else
+  return -1;
+#endif
+}
+
+/** Plain-copy a file (never a clone: the point is new contiguous blocks)
+and fsync the copy. @return false on error (errno set) */
+bool wt_copy_file(const std::string &from, const std::string &to) {
+  const int in = open(from.c_str(), O_RDONLY);
+  if (in < 0) return false;
+  auto in_guard = create_scope_guard([in]() { close(in); });
+  const int out = open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0640);
+  if (out < 0) return false;
+  auto out_guard = create_scope_guard([out]() { close(out); });
+  std::vector<byte> buf(4 << 20);
+  for (off_t off = 0;;) {
+    const ssize_t n = pread(in, buf.data(), buf.size(), off);
+    if (n < 0) return false;
+    if (n == 0) break;
+    if (pwrite(out, buf.data(), n, off) != n) return false;
+    off += n;
+  }
+  return fsync(out) == 0;
+}
+
+/** Reflink mode: rewrite a fragmented file of a read-only schema
+contiguously. Writing a file that clones share splits its extents, and on
+APFS the first write to a clone (CREATE WORKTREE writes page 0 of each)
+costs about 6 us per extent of its source, so a refresh in place made every
+later create slow, for good (milestone 5, F2). The copy has the same bytes,
+so readers and clones taken meanwhile see the same data either way.
+Problems are only logged: this is an optimization. */
+void wt_compact_space(trx_t *trx, space_id_t id) {
+  fil_space_t *space = fil_space_acquire(id);
+  char *p = fil_space_get_first_path(id);
+  const std::string path(p), tmp = path + ".compact.wttmp";
+  const std::string dir = path.substr(0, path.rfind('/'));
+  ut::free(p);
+  auto release = create_scope_guard([space]() { fil_space_release(space); });
+
+  /* Nothing writes the read-only source but purge and change buffer
+  merges: stop one, do the other, and flush (the refresh's writes split the
+  extents only once they reach the file). A write slipping in anyway shows
+  in the counters checked under the gate, and the copy is retried. */
+  trx_purge_stop();
+  auto purge_guard = create_scope_guard([]() { trx_purge_run(); });
+  const auto flush = [&]() {
+    while (ibuf_merge_space(id) != 0) {
+    }
+    if (buf_LRU_flush_space(space, trx)) return false;
+    fil_flush(id);
+    return true;
+  };
+  if (!flush()) return;
+
+  const int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) return;
+  struct stat st;
+  const bool have_size = fstat(fd, &st) == 0;
+  /* Contiguous enough: at most one extent per MiB (at least 64). */
+  const long limit = std::max<long>(64, have_size ? st.st_size >> 20 : 0);
+  const long extents = have_size ? wt_file_extents(fd, st.st_size, limit) : -1;
+  close(fd);
+  if (extents <= limit) return;
+
+  struct statvfs vfs;
+  if (statvfs(dir.c_str(), &vfs) != 0 ||
+      static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize <
+          static_cast<uint64_t>(st.st_size) + (1ULL << 30)) {
+    ib::warn() << "Worktree compaction of " << path
+               << " skipped: not enough free space";
+    return;
+  }
+
+  for (int attempt = 1; attempt <= 3; ++attempt) {
+    if (attempt > 1 && !flush()) return;
+    int64_t mc1, mc;
+    page_no_t size1, size;
+    fil_wt_counters(id, &mc1, &size1);
+    unlink(tmp.c_str());
+    if (!wt_copy_file(path, tmp)) {
+      ib::warn() << "Worktree compaction of " << path << " skipped: copy failed: "
+                 << strerror(errno);
+      unlink(tmp.c_str());
+      return;
+    }
+    if (!fil_wt_gate_close(id, std::chrono::seconds(10), &mc, &size)) {
+      fil_wt_gate_open(id);
+      unlink(tmp.c_str());
+      continue;
+    }
+    if (space->wt_n_dirty.load() != 0 || mc != mc1 || size != size1 ||
+        !fil_wt_flush_gated(id)) {
+      fil_wt_gate_open(id);
+      unlink(tmp.c_str());
+      continue;
+    }
+    DBUG_EXECUTE_IF("wt_crash_compact_before_rename", DBUG_SUICIDE(););
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+      fil_wt_gate_open(id);
+      unlink(tmp.c_str());
+      ib::warn() << "Worktree compaction of " << path << " skipped: rename: "
+                 << strerror(errno);
+      return;
+    }
+    if (sync_dir(dir.c_str()) != 0)
+      ib::fatal(UT_LOCATION_HERE) << "fsync of " << dir << " failed in a compaction";
+    DBUG_EXECUTE_IF("wt_crash_compact_after_rename", DBUG_SUICIDE(););
+    /* The old inode must get no more writes: they would be lost. */
+    if (!fil_wt_reopen_same_gated(id))
+      ib::fatal(UT_LOCATION_HERE) << "Cannot reopen " << path << " after compaction";
+    fil_wt_gate_open(id);
+    ib::info() << "Worktree compaction of " << path << ": more than " << limit
+               << " extents, rewritten contiguously";
+    return;
+  }
+  ib::warn() << "Worktree compaction of " << path << " skipped: the file kept changing";
 }
 
 /** Read two header pages of a file, page 1 through the tablespace key. */
@@ -895,8 +1054,7 @@ bool snapshot_clone(THD *thd, trx_t *trx, Space_clone *c) {
   const space_id_t space = c->src->space;
   while (ibuf_merge_space(space) != 0) {
   }
-  buf_LRU_flush_or_remove_pages(space, BUF_REMOVE_FLUSH_WRITE, trx);
-  fil_flush(space);
+  if (wt_flush_space(space, trx)) return true;
 
   /* The SDI root also has segment headers carrying the space id. */
   mtr_t mtr;
@@ -1032,9 +1190,7 @@ bool write_overflow(trx_t *trx, Space_clone *c, uint32_t fsp_flags,
   fil_space_release(space);
   if (!ok) return wt_error("CREATE WORKTREE: index count too large for the page size");
 
-  buf_LRU_flush_or_remove_pages(c->space_id, BUF_REMOVE_FLUSH_WRITE, trx);
-  fil_flush(c->space_id);
-  return false;
+  return wt_flush_space(c->space_id, trx);
 }
 
 bool publish_clone(THD *thd, trx_t *trx, dd::Object_id src_dd_table_id,
@@ -1768,6 +1924,22 @@ bool innobase_worktree_materialize(handlerton *, THD *thd,
   return false;
 }
 
+bool innobase_worktree_compact(handlerton *, THD *thd, const dd::Table &table) {
+  if (srv_wt_overlay || srv_read_only_mode || srv_force_recovery > 0) return false;
+  trx_t *trx = check_trx_exists(thd);
+  std::vector<dict_table_t *> opened;
+  std::vector<MDL_ticket *> mdls;
+  auto close = create_scope_guard([&]() {
+    for (auto *t : opened) dd_table_close(t, thd, nullptr, false);
+    for (auto *m : mdls) dd_mdl_release(thd, &m);
+  });
+  if (wt_tables_of(thd, table, &opened, &mdls)) return true;
+  for (dict_table_t *t : opened) {
+    if (dict_table_is_file_per_table(t)) wt_compact_space(trx, t->space);
+  }
+  return false;
+}
+
 std::atomic<bool> wt_gc_wanted{false};
 
 namespace {
@@ -1808,7 +1980,29 @@ bool has_suffix(const std::string &name, const char *suffix) {
 }  // namespace
 
 void innobase_wt_gc(bool startup) {
-  if (!srv_wt_overlay) return;
+  if (!srv_wt_overlay) {
+    /* Reflink mode has no layers: only a compaction's copy, left over by a
+    crash before its rename (overlay mode removes it with the .wttmp files
+    below). */
+    if (!startup || srv_force_recovery > 0) return;
+    DIR *d = opendir(".");
+    if (d == nullptr) return;
+    while (dirent *e = readdir(d)) {
+      const std::string dir = e->d_name;
+      if (dir == "." || dir == "..") continue;
+      DIR *sd = opendir(dir.c_str());
+      if (sd == nullptr) continue;
+      while (dirent *f = readdir(sd)) {
+        const std::string name = f->d_name, path = dir + "/" + name;
+        if (!has_suffix(name, ".compact.wttmp")) continue;
+        ib::info() << "Removing " << path << " (an interrupted compaction)";
+        unlink(path.c_str());
+      }
+      closedir(sd);
+    }
+    closedir(d);
+    return;
+  }
   const std::lock_guard<std::mutex> guard(wt_layer_mutex);
   /* Layer files and their inodes. */
   std::map<std::string, ino_t> layers;
@@ -1837,7 +2031,8 @@ void innobase_wt_gc(bool startup) {
       while (dirent *f = readdir(sd)) {
         const std::string name = f->d_name, path = dir + "/" + name;
         if (startup && srv_force_recovery == 0 && has_suffix(name, ".wttmp")) {
-          ib::info() << "Removing " << path << " (an interrupted freeze)";
+          ib::info() << "Removing " << path
+                     << " (an interrupted freeze or compaction)";
           unlink(path.c_str());
           continue;
         }

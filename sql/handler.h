@@ -3040,6 +3040,11 @@ struct handlerton {
   nullptr. */
   worktree_table_op_t worktree_materialize;
 
+  /** After a schema became read-only (reflink worktrees): rewrite a
+  table's fragmented files contiguously, so clones of them stay cheap; or
+  nullptr. Reports problems as warnings only. */
+  worktree_table_op_t worktree_compact;
+
   /** ALTER SCHEMA ... READ ONLY changes; or nullptr. */
   worktree_schema_op_t worktree_read_only;
 

@@ -1,0 +1,115 @@
+# Reflink mode: when a schema becomes read-only, its table files that a
+# write while shared with clones fragmented are rewritten contiguously
+# (milestone 5, F2: on APFS the first write to a clone of a fragmented
+# file costs per extent, so every later CREATE WORKTREE was slow).
+SET SESSION cte_max_recursion_depth = 100000;
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT, pad CHAR(200), KEY (v));
+INSERT INTO g.t WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 60000)
+SELECT n, n, REPEAT('p', 200) FROM s;
+CREATE TABLE g.small (id INT PRIMARY KEY, v INT);
+INSERT INTO g.small VALUES (1, 1), (2, 2);
+ALTER SCHEMA g READ ONLY = 1;
+CREATE WORKTREE wt_before FROM g;
+#
+# 1. A refresh writing scattered pages while "before" shares them: the
+#    read-only transition rewrites g.t (fragmented), not g.small.
+ALTER SCHEMA g READ ONLY = 0;
+UPDATE g.t SET v = v + 1000000 WHERE id % 50 = 0;
+UPDATE g.small SET v = v + 10;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+ALTER SCHEMA g READ ONLY = 1;
+Pattern "Worktree compaction of ./g/t.ibd: more than 64 extents, rewritten contiguously" found
+Pattern "Worktree compaction of ./g/small.ibd" not found
+CREATE WORKTREE wt_after FROM g;
+SELECT COUNT(*), SUM(v > 1000000) FROM g.t;
+COUNT(*)	SUM(v > 1000000)
+60000	1200
+SELECT COUNT(*), SUM(v > 1000000) FROM wt_after.t;
+COUNT(*)	SUM(v > 1000000)
+60000	1200
+SELECT COUNT(*), SUM(v > 1000000) FROM wt_before.t;
+COUNT(*)	SUM(v > 1000000)
+60000	0
+SELECT * FROM wt_after.small ORDER BY id;
+id	v
+1	11
+2	12
+SELECT * FROM wt_before.small ORDER BY id;
+id	v
+1	1
+2	2
+CHECK TABLE g.t, wt_after.t, wt_before.t;
+Table	Op	Msg_type	Msg_text
+g.t	check	status	OK
+wt_after.t	check	status	OK
+wt_before.t	check	status	OK
+UPDATE wt_after.t SET v = 0 WHERE id = 1;
+SELECT v FROM g.t WHERE id = 1;
+v
+1
+SELECT v FROM wt_after.t WHERE id = 1;
+v
+0
+#
+# 2. The compacted file is the one InnoDB uses: a later refresh writes
+#    it, and its writes survive a restart.
+ALTER SCHEMA g READ ONLY = 0;
+UPDATE g.t SET v = -1 WHERE id = 2;
+SET GLOBAL innodb_buf_flush_list_now = ON;
+# restart
+SELECT v FROM g.t WHERE id = 2;
+v
+-1
+CHECK TABLE g.t;
+Table	Op	Msg_type	Msg_text
+g.t	check	status	OK
+#
+# 3. Crashes inside the compaction (after the ALTER committed): the
+#    schema is read-only, the data intact, no temporary file left.
+# wt_crash_compact_before_rename
+SET SESSION debug = '+d,wt_crash_compact_before_rename';
+ALTER SCHEMA g READ ONLY = 1;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT options FROM information_schema.schemata_extensions WHERE schema_name = 'g';
+OPTIONS
+READ ONLY=1
+SELECT COUNT(*), SUM(v) FROM g.t;
+COUNT(*)	SUM(v)
+60000	3000032997
+CHECK TABLE g.t;
+Table	Op	Msg_type	Msg_text
+g.t	check	status	OK
+CREATE WORKTREE c FROM g;
+SELECT COUNT(*), SUM(v) FROM c.t;
+COUNT(*)	SUM(v)
+60000	3000032997
+DROP DATABASE c;
+DROP DATABASE pin;
+ALTER SCHEMA g READ ONLY = 0;
+# wt_crash_compact_after_rename
+SET SESSION debug = '+d,wt_crash_compact_after_rename';
+ALTER SCHEMA g READ ONLY = 1;
+ERROR HY000: Lost connection to MySQL server during query
+# restart
+SELECT options FROM information_schema.schemata_extensions WHERE schema_name = 'g';
+OPTIONS
+READ ONLY=1
+SELECT COUNT(*), SUM(v) FROM g.t;
+COUNT(*)	SUM(v)
+60000	3000035997
+CHECK TABLE g.t;
+Table	Op	Msg_type	Msg_text
+g.t	check	status	OK
+CREATE WORKTREE c FROM g;
+SELECT COUNT(*), SUM(v) FROM c.t;
+COUNT(*)	SUM(v)
+60000	3000035997
+DROP DATABASE c;
+DROP DATABASE pin;
+ALTER SCHEMA g READ ONLY = 0;
+ALTER SCHEMA g READ ONLY = 0;
+DROP DATABASE g;
+DROP DATABASE wt_before;
+DROP DATABASE wt_after;

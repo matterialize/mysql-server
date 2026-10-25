@@ -59,6 +59,17 @@ These are low-level functions
 constexpr uint32_t BUF_LRU_OLD_MIN_LEN = 8 * 1024 / 16;
 #endif /* !UNIV_HOTBACKUP */
 
+/** Flushes the dirty pages of a tablespace, for a caller that keeps them
+from being modified meanwhile (CREATE WORKTREE). Unlike BUF_REMOVE_FLUSH_WRITE
+it scans nothing when the space has no dirty pages, and waits only for the
+space's own writes rather than for every pending write of the instance.
+Does not fsync the file.
+@param[in]  space  tablespace
+@param[in]  trx    to check if the operation must be interrupted
+@return true if interrupted with pages left dirty */
+[[nodiscard]] bool buf_LRU_flush_space(struct fil_space_t *space,
+                                       const trx_t *trx);
+
 /** Flushes all dirty pages or removes all pages belonging to a given
 tablespace. A PROBLEM: if readahead is being started, what guarantees
 that it will not try to read in pages after this operation has completed?

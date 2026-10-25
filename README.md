@@ -36,13 +36,22 @@ port    = 3306
 innodb_buffer_pool_size = 8G
 # Required for overlay mode (see "Modes" below); harmless in reflink mode.
 innodb_thread_concurrency = 64
+# Many agents writing at once fill a small redo log quickly.
+innodb_redo_log_capacity = 4G
+# Each worktree table is an open file: size these for every live worktree
+# (see "Open files" below). 20000 covers ~100 worktrees of a 180-table schema.
+open_files_limit = 65536
+innodb_open_files = 20000
+table_open_cache = 20000
+table_definition_cache = 20000
 EOF
 ~/mysql-wt/bin/mysqld --defaults-file=~/mysql-wt/my.cnf --initialize-insecure
+ulimit -n 65536   # the shell's limit caps open_files_limit; macOS defaults to 256
 ~/mysql-wt/bin/mysqld --defaults-file=~/mysql-wt/my.cnf &
 ~/mysql-wt/bin/mysql -uroot -S /tmp/mysql-wt.sock
 ```
 
-(Write real paths in `my.cnf`. MySQL doesn't expand `~` there.)
+(Write real paths in `my.cnf`. MySQL doesn't expand `~` there.) The macOS build has no X Plugin, so leave out `mysqlx` options or write them as `loose-mysqlx...`.
 
 ### Docker
 
@@ -84,6 +93,8 @@ CREATE WORKTREE agent_1_experiment FROM agent_1;
 DROP DATABASE agent_1_experiment;
 ```
 
+Many agents can create worktrees at the same time. Creates from a read-only source run in parallel. Creates from a writable source take turns, since each one briefly blocks writes to the source.
+
 **Refreshing golden.** Make it writable, apply your changes and make it read-only again:
 
 ```sql
@@ -94,7 +105,7 @@ ALTER SCHEMA golden READ ONLY = 1;
 
 Existing worktrees keep the data they were created with. New worktrees get the refreshed data. To move a worktree to the new data, drop it and create it again.
 
-If you'd rather build each refresh off to the side, make it a worktree. Run `CREATE WORKTREE golden_v2 FROM golden`, load into `golden_v2`, set it `READ ONLY = 1`, point new worktrees at it, then drop the old golden. Old worktrees keep working after their source is dropped.
+If you'd rather build each refresh off to the side, make it a worktree. Run `CREATE WORKTREE golden_v2 FROM golden`, load into `golden_v2`, set it `READ ONLY = 1`, point new worktrees at it, then drop the old golden. A read-only schema can't be dropped, so run `ALTER SCHEMA golden READ ONLY = 0` before `DROP DATABASE golden`. Old worktrees keep working after their source is dropped.
 
 **What a worktree copies:** every table (with its data, indexes, `AUTO_INCREMENT`, foreign keys, FULLTEXT indexes, encrypted and `ROW_FORMAT=COMPRESSED` tables, partitions), plus views, stored procedures and functions, triggers and events. Inside copied objects, references to `golden.x` are rewritten to the worktree when the worktree has `x`. Copied events start `DISABLED`. Grants are not copied, because they are per schema. Grant access to `agent_%` patterns if you want one grant to cover every worktree.
 
@@ -129,7 +140,8 @@ Overlay mode enforces settings that keep its crash recovery sound, and refuses `
 
 - **Disk usage:** `du` and `ls` show each worktree at full size, because shared blocks are counted once per file. Use `df` to see real usage.
 - **Memory:** worktrees don't share buffer-pool pages with their source or with each other. A hot page read in 50 worktrees is cached 50 times. Size `innodb_buffer_pool_size` for the combined working set.
-- **Open files:** every worktree table is a tablespace. For many worktrees, raise `open_files_limit`, `table_open_cache`, `innodb_open_files` and `table_definition_cache` (to at least 1.2 × the total number of tables).
+- **Open files:** every worktree table is a tablespace file (one per table, plus one per partition and about a dozen per FULLTEXT index). A trial with a 180-table schema held about 180 open files per worktree. Set `innodb_open_files`, `table_open_cache` and `table_definition_cache` to at least 1.2 × (files per worktree × live worktrees, golden included), and `open_files_limit` above that. Raise the shell's limit (`ulimit -n`) before starting `mysqld`, because it caps `open_files_limit`.
+- **Redo log:** with dozens of agents writing at once, a 1 GB redo log fills fast and writers wait for checkpoints (`Threads are unable to reserve space in redo log` in the error log). Use `innodb_redo_log_capacity = 4G` or more.
 - **Not supported (refused before anything changes):** non-InnoDB tables, tables in shared or general tablespaces (only `innodb_file_per_table` tables), `DATA DIRECTORY` tables, `COMPRESSION=` (page compression), schemas with JavaScript libraries, system schemas, and a server in `--read-only` mode. On overlay tables, `DISCARD/IMPORT TABLESPACE`, `FLUSH TABLES ... FOR EXPORT` and the clone plugin are refused.
 - **Schema names in your SQL:** only references inside copied views, routines, triggers and events are rewritten. If application SQL hard-codes `golden.table`, it still reads golden. Use unqualified names, or `DATABASE()`.
 - Windows isn't supported.

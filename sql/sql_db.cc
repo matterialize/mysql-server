@@ -707,7 +707,7 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
     freeze them before the schema can be written (refresh). */
     if (schema_read_only && !create_info->schema_read_only) {
       worktree_schema_read_only(thd, schema_id, false);
-      if (worktree_tables_op(thd, db, true)) return true;
+      if (worktree_tables_op(thd, db, Worktree_op::REFRESH)) return true;
     }
     schema->set_read_only(create_info->schema_read_only);
   }
@@ -772,6 +772,7 @@ bool mysql_alter_db(THD *thd, const char *db, HA_CREATE_INFO *create_info) {
       !schema_read_only && create_info->schema_read_only) {
     thd->mdl_context.release_transactional_locks();
     worktree_schema_read_only(thd, schema_id, true);
+    worktree_schema_compact(thd, db);
   }
 
   my_ok(thd, 1);

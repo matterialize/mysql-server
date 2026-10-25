@@ -113,6 +113,41 @@ SHOW TABLES FROM d1;
 SELECT * FROM d1.t ORDER BY id;
 SELECT * FROM g.t ORDER BY id;
 
+--echo #
+--echo # 5. Writable source, create paused holding its source locks: views,
+--echo #    routines and events of the source are dropped and replaced
+--echo #    meanwhile. The worktree gets the objects as the create listed them.
+CREATE VIEW g.v AS SELECT id FROM g.t;
+CREATE VIEW g.v2 AS SELECT v FROM g.t;
+CREATE FUNCTION g.f() RETURNS INT DETERMINISTIC RETURN 1;
+CREATE PROCEDURE g.p() SELECT 1;
+CREATE EVENT g.e ON SCHEDULE EVERY 1 DAY DISABLE DO SELECT 1;
+connection con1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+send CREATE WORKTREE e1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+connection con2;
+DROP VIEW g.v;
+CREATE OR REPLACE VIEW g.v2 AS SELECT id + 100 AS x FROM g.t;
+DROP FUNCTION g.f;
+CREATE FUNCTION g.f() RETURNS INT DETERMINISTIC RETURN 2;
+DROP PROCEDURE g.p;
+DROP EVENT g.e;
+connection default;
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection default;
+SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.views
+  WHERE TABLE_SCHEMA = 'e1' ORDER BY TABLE_NAME;
+SELECT ROUTINE_NAME, ROUTINE_DEFINITION FROM information_schema.routines
+  WHERE ROUTINE_SCHEMA = 'e1' ORDER BY ROUTINE_NAME;
+SELECT EVENT_NAME, STATUS FROM information_schema.events WHERE EVENT_SCHEMA = 'e1';
+SELECT * FROM e1.v ORDER BY id;
+SELECT e1.f();
+CALL e1.p();
+
 SET DEBUG_SYNC = 'RESET';
 disconnect con1;
 disconnect con2;
@@ -125,4 +160,5 @@ DROP DATABASE b2;
 DROP DATABASE b3;
 DROP DATABASE c1;
 DROP DATABASE d1;
+DROP DATABASE e1;
 DROP DATABASE g;

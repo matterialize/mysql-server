@@ -12047,6 +12047,22 @@ bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link) {
   return success;
 }
 
+bool fil_wt_reopen_same_gated(space_id_t space_id) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  fil_node_t &file = shard->get_space_by_id(space_id)->files.front();
+  bool success = true;
+  if (file.is_open) {
+    os_file_close(file.handle);
+    file.handle = os_file_create(innodb_data_file_key, file.name, OS_FILE_OPEN,
+                                 OS_DATA_FILE, srv_read_only_mode, &success);
+    if (!success) file.is_open = false;
+  }
+  file.flush_counter = file.modification_counter;
+  shard->mutex_release();
+  return success;
+}
+
 void fil_wt_clear_overlay_flag(space_id_t space_id) {
   auto shard = fil_system->shard_by_id(space_id);
   shard->mutex_acquire();

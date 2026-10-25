@@ -844,7 +844,8 @@ void worktree_schema_read_only(THD *thd, dd::Object_id schema_id, bool read_only
                  &change);
 }
 
-bool worktree_tables_op(THD *thd, const char *db, bool refresh) {
+bool worktree_tables_op(THD *thd, const char *db, Worktree_op op) {
+  const bool refresh = op == Worktree_op::REFRESH;
   dd::cache::Dictionary_client &dc = *thd->dd_client();
   const dd::cache::Dictionary_client::Auto_releaser releaser(&dc);
   if (dd::mdl_lock_schema(thd, db, MDL_TRANSACTION)) return true;  // DD lookups
@@ -854,8 +855,10 @@ bool worktree_tables_op(THD *thd, const char *db, bool refresh) {
     my_error(ER_BAD_DB_ERROR, MYF(0), db);
     return true;
   }
-  /* The caller holds the schema name lock: no table of it can be created,
-  dropped or altered meanwhile, so the fetched objects stay valid. */
+  /* The caller holds the schema name lock, or (compact) the schema is
+  read-only, so no table of it can be created, dropped or altered meanwhile
+  and the fetched objects stay valid. */
+  if (op == Worktree_op::COMPACT && !schema->read_only()) return false;
   std::vector<const dd::Table *> tables, visible;
   if (dc.fetch_schema_components(schema, &tables)) return true;
   std::vector<std::string> names;
@@ -865,18 +868,34 @@ bool worktree_tables_op(THD *thd, const char *db, bool refresh) {
     names.emplace_back(t->name().c_str());
   }
   /* Refresh freezes (writes blocked, like a freeze for CREATE WORKTREE);
-  materialize flattens, which allows reads and writes (overlay-v3 §8). */
+  materialize flattens, which allows reads and writes (overlay-v3 §8);
+  compact swaps files with the same content under the engine's I/O gate. */
   if (lock_tables(thd, in_schema(db, names),
                   refresh ? MDL_SHARED_NO_WRITE : MDL_SHARED_READ))
     return true;
   for (const dd::Table *table : visible) {
     handlerton *hton = nullptr;
     if (dd::table_storage_engine(thd, table, &hton)) return true;
-    const worktree_table_op_t op =
-        refresh ? hton->worktree_refresh : hton->worktree_materialize;
-    if (op != nullptr && op(hton, thd, *table)) return true;
+    const worktree_table_op_t fn =
+        refresh ? hton->worktree_refresh
+        : op == Worktree_op::MATERIALIZE ? hton->worktree_materialize
+                                         : hton->worktree_compact;
+    if (fn != nullptr && fn(hton, thd, *table)) return true;
   }
   return false;
+}
+
+void worktree_schema_compact(THD *thd, const char *db) {
+  /* Only an optimization: a lock timeout or the like just skips it. */
+  Dummy_error_handler error_handler;
+  thd->push_internal_handler(&error_handler);
+  const bool failed = worktree_tables_op(thd, db, Worktree_op::COMPACT);
+  thd->pop_internal_handler();
+  if (failed) {
+    push_warning_printf(thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+                        "Worktree compaction of schema '%s' skipped", db);
+  }
+  thd->mdl_context.release_transactional_locks();
 }
 
 bool Sql_cmd_materialize_worktree::execute(THD *thd) {
@@ -884,7 +903,7 @@ bool Sql_cmd_materialize_worktree::execute(THD *thd) {
   if (check_access(thd, ALTER_ACL, db, nullptr, nullptr, true, false))
     return true;
   if (lock_schema_name(thd, db)) return true;
-  if (worktree_tables_op(thd, db, false)) return true;
+  if (worktree_tables_op(thd, db, Worktree_op::MATERIALIZE)) return true;
   my_ok(thd);
   return false;
 }

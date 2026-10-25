@@ -971,6 +971,25 @@ static void buf_LRU_remove_pages(
   }
 }
 
+bool buf_LRU_flush_space(fil_space_t *space, const trx_t *trx) {
+  if (space->wt_n_dirty.load() == 0) {
+#ifdef UNIV_DEBUG
+    for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+      ut_a(buf_pool_get_dirty_pages_count(buf_pool_from_array(i), space->id,
+                                          nullptr) == 0);
+    }
+#endif /* UNIV_DEBUG */
+    return false;
+  }
+  /* A page leaves the flush list when its write completes, so once no page
+  of the space is left in any flush list its writes are done. */
+  for (ulint i = 0; i < srv_buf_pool_instances; i++) {
+    buf_flush_dirty_pages(buf_pool_from_array(i), space->id, nullptr, true, trx,
+                          false);
+  }
+  return space->wt_n_dirty.load() != 0;
+}
+
 void buf_LRU_flush_or_remove_pages(space_id_t id, buf_remove_t buf_remove,
                                    const trx_t *trx, bool strict) {
   /* Before we attempt to drop pages one by one we first

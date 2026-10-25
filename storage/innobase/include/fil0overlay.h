@@ -219,4 +219,8 @@ bool fil_wt_flush_gated(space_id_t space_id);
 chain (F5a, F5b, F5d). */
 bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link);
 
+/** Swap the space's handle to the file now at its path, which has the same
+content (worktree compaction). */
+bool fil_wt_reopen_same_gated(space_id_t space_id);
+
 #endif /* fil0overlay_h */
