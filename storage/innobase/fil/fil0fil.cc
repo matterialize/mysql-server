@@ -12047,6 +12047,13 @@ bool fil_wt_reopen_gated(space_id_t space_id, const wt_link_t &link) {
   return success;
 }
 
+void fil_wt_clear_overlay_flag(space_id_t space_id) {
+  auto shard = fil_system->shard_by_id(space_id);
+  shard->mutex_acquire();
+  shard->get_space_by_id(space_id)->flags &= ~FSP_FLAGS_MASK_WT_OVERLAY;
+  shard->mutex_release();
+}
+
 void fil_wt_detach(space_id_t space_id) {
   auto shard = fil_system->shard_by_id(space_id);
   shard->mutex_acquire();

@@ -699,11 +699,18 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
           page_is_uncompressed_type(block->page.zip.data))
         block->page.zip.data[FIL_PAGE_LSN + 7] |= 1;
     });
+    DBUG_EXECUTE_IF("wt_flatten_stale_zip_index", {
+      if (page_size.is_compressed() &&
+          fil_page_get_type(block->frame) == FIL_PAGE_TYPE_ALLOCATED &&
+          mach_read_from_4(block->frame + FIL_PAGE_OFFSET) == 0)
+        mach_write_to_2(block->page.zip.data + FIL_PAGE_TYPE, FIL_PAGE_INDEX);
+    });
     /* Test the bytes wt_mtr_log_image() logs: for an uncompressed-type page
-    of a compressed space the frame is authoritative (flush copies it over
-    zip.data), and zip.data may hold stale bytes over a zero frame. */
+    of a compressed space the frame is authoritative (flush types the page by
+    its frame and copies it over zip.data), and zip.data may hold stale bytes,
+    type included, over a zero frame. */
     const bool zip = page_size.is_compressed() &&
-                     !page_is_uncompressed_type(block->page.zip.data);
+                     !page_is_uncompressed_type(block->frame);
     const byte *bytes = zip ? block->page.zip.data : block->frame;
     const ulint end = page_size.physical() - (zip ? 0 : FIL_PAGE_DATA_END);
     bool zero = true;
@@ -782,6 +789,7 @@ bool overlay_flatten(THD *thd, trx_t *trx, dict_table_t *table) {
     mlog_write_ulint(b0->frame + FSP_HEADER_OFFSET + FSP_SPACE_FLAGS,
                      fsp_header_get_flags(b0->frame) & ~FSP_FLAGS_MASK_WT_OVERLAY,
                      MLOG_4BYTES, &mtr);
+    fil_wt_clear_overlay_flag(s);
     mtr.commit();
   }
   DBUG_EXECUTE_IF("wt_crash_flatten_after_clear", DBUG_SUICIDE(););

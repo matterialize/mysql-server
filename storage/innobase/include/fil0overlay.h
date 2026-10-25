@@ -191,6 +191,10 @@ struct mtr_t;
 record; flatten adopts chain pages with it). */
 void wt_mtr_log_image(mtr_t *mtr, const buf_block_t *block);
 
+/** Flatten step 4 (v3 §8): clear the overlay flag in memory, with page 0's
+under the same space X lock (fsp checks that the two agree). */
+void fil_wt_clear_overlay_flag(space_id_t space_id);
+
 /** Flatten's last step (v3 §8 step 5): the space is no longer an overlay.
 Detach its chain and drop its map. */
 void fil_wt_detach(space_id_t space_id);

@@ -688,9 +688,9 @@ void wt_mtr_log_image(mtr_t *mtr, const buf_block_t *block) {
   const page_size_t &size = block->page.size;
   byte *log_ptr = nullptr;
   if (!mlog_open(mtr, 30, log_ptr)) return;
-  if (size.is_compressed() && !page_is_uncompressed_type(block->page.zip.data)) {
+  if (size.is_compressed() && !page_is_uncompressed_type(block->frame)) {
     /* A compressed B-tree or BLOB page: its content is zip.data, which has
-    no FIL trailer (addendum A1). */
+    no FIL trailer (addendum A1). Typed by the frame, as flush does. */
     const ulint len = size.physical() - 4;
     log_ptr = mlog_write_initial_log_record_low(
         MLOG_WT_ZIP_IMAGE, block->page.id.space(), block->page.id.page_no(),

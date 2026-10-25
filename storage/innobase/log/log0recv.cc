@@ -2185,8 +2185,12 @@ static const byte *recv_parse_or_apply_log_rec_body(
       if (page_zip != nullptr) {
         ut_a(4 + len == page_zip_get_size(page_zip));
         memcpy(page_zip->data + 4, ptr, len);
+        /* Fill the frame as buf_zip_decompress() does on a read: flush
+        types the page by its frame. */
         if (page != nullptr && fil_page_index_page_check(page_zip->data)) {
           ut_a(page_zip_decompress(page_zip, page, true));
+        } else if (page != nullptr) {
+          memcpy(page, page_zip->data, page_zip_get_size(page_zip));
         }
       }
       ptr += len;
