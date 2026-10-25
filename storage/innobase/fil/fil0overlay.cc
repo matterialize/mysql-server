@@ -211,11 +211,18 @@ bool fil_wt_overlay_attach(fil_space_t *space, const wt_link_t &link,
   for (page_no_t p : {page_no_t{0}, page_no_t{1}}) {
     if (p < ov->presence.size()) ov->presence[p] = WT_PRESENT;
   }
-  /* Only durable bytes may later read as "local, non-zero" (v3 §6.1 step 2). */
+  /* Only durable bytes may later read as "local, non-zero" (v3 §6.1 step 2).
+  A file whose only data is pages 0 and 1 (always local) has none to make
+  durable: a new clone, whose open under the dictionary mutex fsynced it
+  while every concurrent create waited (milestone 5). */
+  bool only_header = true;
+  for (size_t p = 2; only_header && p < ov->presence.size(); ++p) {
+    only_header = ov->presence[p] == WT_ABSENT;
+  }
   DBUG_EXECUTE_IF("wt_crash_attach_before_fsync", {
     if (recv_recovery_is_on()) DBUG_SUICIDE();
   });
-  (void)fsync(raw);
+  if (!only_header) (void)fsync(raw);
   space->wt_ov = ov;
   wt_overlay_spaces.fetch_add(1);
   return true;

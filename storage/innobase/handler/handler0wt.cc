@@ -314,8 +314,10 @@ struct Space_clone {
   bool overlay{};
   bool src_read_only{};
   wt_link_t link;
-  /* The source's operation slot, while this clone holds it. */
+  /* The source's operation slot, while this clone holds it, and whether it
+  shares it with other creates (a read-only source linked live). */
   fil_space_t *slot{};
+  bool slot_shared{};
   /* Reflink mode: the source's pages 0 and 1 (page 1 decrypted) as cloned. */
   std::vector<byte> head;
 };
@@ -367,13 +369,17 @@ std::mutex wt_layer_mutex;
 
 /** Take the operation slot of a space (v3 I8), waiting up to
 lock_wait_timeout. @return true on timeout (error reported) */
-bool wt_op_acquire(THD *thd, fil_space_t *space, uint8_t op) {
+bool wt_op_acquire(THD *thd, fil_space_t *space, uint8_t op, bool shared = false) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::seconds(thd_lock_wait_timeout(thd));
   for (;;) {
     {
       const std::lock_guard<std::mutex> guard(wt_layer_mutex);
-      if (space->wt_op == 0) {
+      if (shared && space->wt_op == 0) {
+        ++space->wt_op_shared;
+        return false;
+      }
+      if (!shared && space->wt_op == 0 && space->wt_op_shared == 0) {
         space->wt_op = op;
         return false;
       }
@@ -386,8 +392,12 @@ bool wt_op_acquire(THD *thd, fil_space_t *space, uint8_t op) {
   }
 }
 
-void wt_op_release(fil_space_t *space) {
+void wt_op_release(fil_space_t *space, bool shared = false) {
   const std::lock_guard<std::mutex> guard(wt_layer_mutex);
+  if (shared) {
+    --space->wt_op_shared;
+    return;
+  }
   space->wt_op = 0;
 }
 
@@ -1099,10 +1109,16 @@ bool snapshot_clone(THD *thd, trx_t *trx, Space_clone *c) {
       fil_space_release(src);
       if (full && overlay_flatten(thd, trx, c->src)) return true;
     }
-    /* The slot is held through phase 3 (v3 I8: no flatten meanwhile). */
+    /* The slot is held through phase 3 (v3 I8: no flatten meanwhile).
+    Creates linking a read-only source live share it: each links its own
+    layer name and changes nothing they share. Taking turns per table made
+    50 concurrent creates from one golden take minutes on ext4. */
     fil_space_t *src = fil_space_acquire(c->src->space);
-    const bool busy = wt_op_acquire(thd, src, 1);
-    if (!busy) c->slot = src;
+    const bool busy = wt_op_acquire(thd, src, 1, c->src_read_only);
+    if (!busy) {
+      c->slot = src;
+      c->slot_shared = c->src_read_only;
+    }
     fil_space_release(src);
     if (busy) return true;
     if (c->src_read_only) return overlay_snapshot(c, true);
@@ -1781,10 +1797,10 @@ bool innobase_clone_table(handlerton *hton, THD *thd, const dd::Table &src_dd,
   });
   auto slot_guard = create_scope_guard([&]() {
     for (auto &c : clones) {
-      if (c.slot != nullptr) wt_op_release(c.slot);
+      if (c.slot != nullptr) wt_op_release(c.slot, c.slot_shared);
     }
     for (auto &a : aux) {
-      if (a.clone.slot != nullptr) wt_op_release(a.clone.slot);
+      if (a.clone.slot != nullptr) wt_op_release(a.clone.slot, a.clone.slot_shared);
     }
   });
   DBUG_EXECUTE_IF("wt_crash_after_ddl_log", DBUG_SUICIDE(););

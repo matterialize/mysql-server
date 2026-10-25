@@ -513,6 +513,11 @@ struct fil_space_t {
   1 freeze or create, 2 flatten. Protected by wt_layer_mutex. */
   uint8_t wt_op{};
 
+  /** Overlay mode: creates from a read-only source holding the slot
+  together; they exclude freeze and flatten, not each other (milestone 5).
+  Protected by wt_layer_mutex. */
+  uint32_t wt_op_shared{};
+
   /** Overlay mode: bumped by every freeze (v3 §8 generation check). */
   uint64_t wt_gen{};
 
