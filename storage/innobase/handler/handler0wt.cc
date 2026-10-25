@@ -443,6 +443,7 @@ long wt_file_extents(int fd, off_t size, long limit) {
   (void)limit;
   fiemap fm{};
   fm.fm_length = FIEMAP_MAX_OFFSET;
+  fm.fm_flags = FIEMAP_FLAG_SYNC;  // CoW writes count once written back
   if (ioctl(fd, FS_IOC_FIEMAP, &fm) != 0) return -1;
   return fm.fm_mapped_extents;
 #else
