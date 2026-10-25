@@ -22,7 +22,6 @@ INSERT INTO wt.d VALUES (4, REPEAT('n', 70000), REPEAT('N', 70000), NULL);
 UPDATE src.d SET b = REPEAT('S', 250000) WHERE id = 3;
 DELETE FROM src.d WHERE id = 1;
 # Purge frees the old LOB pages on each side, in its own file.
-SET GLOBAL innodb_purge_run_now = ON;
 SELECT id, LENGTH(t), LENGTH(b), LENGTH(j->>'$.k'), SHA2(t, 256), SHA2(b, 256) FROM src.d ORDER BY id;
 id	LENGTH(t)	LENGTH(b)	LENGTH(j->>'$.k')	SHA2(t, 256)	SHA2(b, 256)
 2	20000	NULL	NULL	49a82a41772cfafe8b77be495a8d2fea49cd67100810a2911c12b524d6bf8b51	NULL

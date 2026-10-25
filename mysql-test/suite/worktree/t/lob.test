@@ -23,7 +23,13 @@ UPDATE src.d SET b = REPEAT('S', 250000) WHERE id = 3;
 DELETE FROM src.d WHERE id = 1;
 
 --echo # Purge frees the old LOB pages on each side, in its own file.
-SET GLOBAL innodb_purge_run_now = ON;
+# Debug builds force purge; release builds purge on their own (same result).
+--disable_query_log
+if (`SELECT VERSION() LIKE '%debug%'`)
+{
+  SET GLOBAL innodb_purge_run_now = ON;
+}
+--enable_query_log
 --source include/wait_innodb_all_purged.inc
 
 SELECT id, LENGTH(t), LENGTH(b), LENGTH(j->>'$.k'), SHA2(t, 256), SHA2(b, 256) FROM src.d ORDER BY id;
