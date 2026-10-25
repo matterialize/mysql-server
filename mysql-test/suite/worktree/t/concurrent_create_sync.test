@@ -1,0 +1,128 @@
+--echo # CREATE WORKTREE locking: creates from a read-only source run in parallel;
+--echo # creates from a writable source wait their turn instead of deadlocking.
+--source include/have_debug_sync.inc
+--source include/have_innodb_16k.inc
+
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB;
+INSERT INTO g.t VALUES (1, 1), (2, 2);
+connect (con1, localhost, root,,);
+connect (con2, localhost, root,,);
+connect (con3, localhost, root,,);
+
+--echo #
+--echo # 1. Read-only source: with one create paused holding its source locks,
+--echo #    two more from the same source complete.
+ALTER SCHEMA g READ ONLY = 1;
+connection con1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+send CREATE WORKTREE a1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+connection con2;
+CREATE WORKTREE a2 FROM g;
+connection con3;
+CREATE WORKTREE a3 FROM g;
+connection default;
+SELECT * FROM a3.t ORDER BY id;
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+SELECT * FROM a1.t ORDER BY id;
+
+--echo #
+--echo # 2. Writable source: the second and third creates wait for the first
+--echo #    (for its turn), then succeed.
+connection default;
+ALTER SCHEMA g READ ONLY = 0;
+connection con1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+send CREATE WORKTREE b1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+connection con2;
+send CREATE WORKTREE b2 FROM g;
+connection con3;
+send CREATE WORKTREE b3 FROM g;
+connection default;
+let $wait_condition = SELECT COUNT(*) = 2 FROM information_schema.processlist
+  WHERE info LIKE 'CREATE WORKTREE b%' AND state = 'Waiting for locking service lock';
+--source include/wait_condition.inc
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection con2;
+reap;
+connection con3;
+reap;
+connection default;
+SELECT COUNT(*) AS writable_source_worktrees FROM information_schema.schemata
+  WHERE schema_name LIKE 'b%';
+
+--echo #
+--echo # 3. A read-only create racing ALTER SCHEMA READ ONLY = 0: the ALTER
+--echo #    waits for the create's IX lock; the create finishes on the
+--echo #    read-only state.
+ALTER SCHEMA g READ ONLY = 1;
+connection con1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+send CREATE WORKTREE c1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+connection con2;
+send ALTER SCHEMA g READ ONLY = 0;
+connection default;
+let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist
+  WHERE info LIKE 'ALTER SCHEMA g%' AND state = 'Waiting for schema metadata lock';
+--source include/wait_condition.inc
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection con2;
+reap;
+connection default;
+SELECT * FROM c1.t ORDER BY id;
+SELECT schema_name, options FROM information_schema.schemata_extensions
+  WHERE schema_name = 'g';
+
+--echo #
+--echo # 4. Writable source, create paused holding its source locks: CREATE
+--echo #    TABLE in the source still runs (the worktree has the tables as of
+--echo #    the lock), a writer waits for the create instead of deadlocking.
+ALTER SCHEMA g READ ONLY = 0;
+connection con1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+send CREATE WORKTREE d1 FROM g;
+connection default;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+connection con2;
+CREATE TABLE g.n (id INT PRIMARY KEY);
+connection con3;
+send UPDATE g.t SET v = v + 10;
+connection default;
+let $wait_condition = SELECT COUNT(*) = 1 FROM information_schema.processlist
+  WHERE info LIKE 'UPDATE g.t%' AND state = 'Waiting for table metadata lock';
+--source include/wait_condition.inc
+SET DEBUG_SYNC = 'now SIGNAL go';
+connection con1;
+reap;
+connection con3;
+reap;
+connection default;
+SHOW TABLES FROM d1;
+SELECT * FROM d1.t ORDER BY id;
+SELECT * FROM g.t ORDER BY id;
+
+SET DEBUG_SYNC = 'RESET';
+disconnect con1;
+disconnect con2;
+disconnect con3;
+DROP DATABASE a1;
+DROP DATABASE a2;
+DROP DATABASE a3;
+DROP DATABASE b1;
+DROP DATABASE b2;
+DROP DATABASE b3;
+DROP DATABASE c1;
+DROP DATABASE d1;
+DROP DATABASE g;

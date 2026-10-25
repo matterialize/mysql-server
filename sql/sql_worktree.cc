@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -51,6 +52,7 @@
 #include "sql/sql_error.h"
 #include "sql/system_variables.h"
 #include "sql/handler.h"
+#include "sql/debug_sync.h"
 #include "sql/mdl.h"
 #include "sql/mysqld.h"
 #include "sql/error_handler.h"
@@ -352,15 +354,37 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
   const dd::cache::Dictionary_client::Auto_releaser releaser(thd->dd_client());
   dd::cache::Dictionary_client &dc = *thd->dd_client();
 
-  /* S lock on the source schema: no table can be created, dropped, renamed
-  or altered in it until we commit (all DDL takes IX on the schema). */
-  MDL_request schema_req;
-  MDL_REQUEST_INIT(&schema_req, MDL_key::SCHEMA, mdl_name(thd, src), "",
-                   MDL_SHARED, MDL_TRANSACTION);
-  if (thd->mdl_context.acquire_lock(&schema_req,
-                                    thd->variables.lock_wait_timeout) ||
-      dd::mdl_lock_schema(thd, src, MDL_TRANSACTION))  // IX for DD lookups
-    return true;
+  /* Only IX on the source schema, like any DDL. An S lock (to stop DDL in
+  the source) deadlocked: S + IX conflicts with another create's S + IX, and
+  with the IX a writer's FK check takes while it holds a table lock we wait
+  for (milestone 5, F1). A read-only source can't change anyway: DDL in it
+  is refused, and ALTER SCHEMA needs an X lock our IX blocks, so creates from
+  it run in parallel. Creates from a writable source take turns on a
+  per-source lock (each freezes the source), and its tables are locked
+  until the set is stable, below. */
+  bool src_read_only;
+  {
+    MDL_ticket *probe = nullptr;
+    if (dd::mdl_lock_schema(thd, src, MDL_EXPLICIT, &probe)) return true;
+    bool failed;
+    {
+      const dd::cache::Dictionary_client::Auto_releaser probe_releaser(&dc);
+      const dd::Schema *s = nullptr;
+      failed = dc.acquire(src, &s);
+      src_read_only = s != nullptr && s->read_only();
+    }
+    thd->mdl_context.release_lock(probe);
+    if (failed) return true;
+  }
+  if (!src_read_only) {
+    MDL_request turn_req;
+    MDL_REQUEST_INIT(&turn_req, MDL_key::LOCKING_SERVICE, "mysql_worktree",
+                     mdl_name(thd, src), MDL_EXCLUSIVE, MDL_TRANSACTION);
+    if (thd->mdl_context.acquire_lock(&turn_req,
+                                      thd->variables.lock_wait_timeout))
+      return true;
+  }
+  if (dd::mdl_lock_schema(thd, src, MDL_TRANSACTION)) return true;  // DD lookups
 
   const dd::Schema *src_schema = nullptr;
   if (dc.acquire(src, &src_schema)) return true;
@@ -368,9 +392,14 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     my_error(ER_BAD_DB_ERROR, MYF(0), src);
     return true;
   }
+  /* Made writable since the probe: take the writable path instead. */
+  if (src_read_only && !src_schema->read_only()) {
+    my_error(ER_LOCK_DEADLOCK, MYF(0));
+    return true;
+  }
 
   /* Views, routines and events are cloned with `src.` references remapped
-(fork-design.md §10.6); the S lock above keeps them stable. */
+(fork-design.md §10.6), as of this point. */
   std::vector<const dd::View *> views;
   std::vector<const dd::Routine *> routines;
   std::vector<const dd::Event *> events;
@@ -403,15 +432,38 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
     if (check_definer(thd, e->definer_user(), e->definer_host())) return true;
   }
 
-  std::vector<std::string> names;
-  {
+  const auto list_tables = [&](std::vector<std::string> *out) -> bool {
     std::vector<const dd::Table *> tables;
     if (dc.fetch_schema_components(src_schema, &tables)) return true;
+    out->clear();
     for (const dd::Table *t : tables) {
       if (t->hidden() != dd::Abstract_table::HT_VISIBLE) continue;
-      names.emplace_back(t->name().c_str());
+      out->emplace_back(t->name().c_str());
     }
+    std::sort(out->begin(), out->end());
+    return false;
+  };
+
+  /* Block writers to the source tables for the whole statement. Waiting for
+  the lock also waits for open transactions that wrote them to finish. SRO
+  is compatible with itself, so creates from a read-only source don't
+  serialize here; a writable source keeps SNW (it may be frozen). Tables
+  created, dropped or renamed meanwhile change the list: lock until the list
+  is stable, so the worktree has every table the source has at that point. */
+  std::vector<std::string> names, listed;
+  if (list_tables(&listed)) return true;
+  for (int round = 0; names != listed; ++round) {
+    if (round == 10) {
+      my_error(ER_LOCK_DEADLOCK, MYF(0));
+      return true;
+    }
+    names = listed;
+    if (lock_tables(thd, in_schema(src, names),
+                    src_read_only ? MDL_SHARED_READ_ONLY : MDL_SHARED_NO_WRITE) ||
+        list_tables(&listed))
+      return true;
   }
+  DEBUG_SYNC(thd, "wt_create_after_source_lock");
 
   /* Every source table must be fully readable: table-level SELECT, not just
   some columns (a clone exposes all of them). */
@@ -429,10 +481,6 @@ bool Sql_cmd_create_worktree::execute(THD *thd) {
       return true;
     }
   }
-
-  /* Block writers to the source tables for the whole statement. Waiting for
-  SNW also waits for open transactions that wrote them to finish. */
-  if (lock_tables(thd, in_schema(src, names), MDL_SHARED_NO_WRITE)) return true;
 
   std::vector<const dd::Table *> src_tables;
   for (const auto &name : names) {

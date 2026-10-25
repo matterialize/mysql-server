@@ -1,0 +1,87 @@
+# CREATE WORKTREE locking: creates from a read-only source run in parallel;
+# creates from a writable source wait their turn instead of deadlocking.
+CREATE DATABASE g;
+CREATE TABLE g.t (id INT PRIMARY KEY, v INT) ENGINE = InnoDB;
+INSERT INTO g.t VALUES (1, 1), (2, 2);
+#
+# 1. Read-only source: with one create paused holding its source locks,
+#    two more from the same source complete.
+ALTER SCHEMA g READ ONLY = 1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+CREATE WORKTREE a1 FROM g;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+CREATE WORKTREE a2 FROM g;
+CREATE WORKTREE a3 FROM g;
+SELECT * FROM a3.t ORDER BY id;
+id	v
+1	1
+2	2
+SET DEBUG_SYNC = 'now SIGNAL go';
+SELECT * FROM a1.t ORDER BY id;
+id	v
+1	1
+2	2
+#
+# 2. Writable source: the second and third creates wait for the first
+#    (for its turn), then succeed.
+ALTER SCHEMA g READ ONLY = 0;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+CREATE WORKTREE b1 FROM g;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+CREATE WORKTREE b2 FROM g;
+CREATE WORKTREE b3 FROM g;
+SET DEBUG_SYNC = 'now SIGNAL go';
+SELECT COUNT(*) AS writable_source_worktrees FROM information_schema.schemata
+WHERE schema_name LIKE 'b%';
+writable_source_worktrees
+3
+#
+# 3. A read-only create racing ALTER SCHEMA READ ONLY = 0: the ALTER
+#    waits for the create's IX lock; the create finishes on the
+#    read-only state.
+ALTER SCHEMA g READ ONLY = 1;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+CREATE WORKTREE c1 FROM g;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+ALTER SCHEMA g READ ONLY = 0;
+SET DEBUG_SYNC = 'now SIGNAL go';
+SELECT * FROM c1.t ORDER BY id;
+id	v
+1	1
+2	2
+SELECT schema_name, options FROM information_schema.schemata_extensions
+WHERE schema_name = 'g';
+SCHEMA_NAME	OPTIONS
+g	
+#
+# 4. Writable source, create paused holding its source locks: CREATE
+#    TABLE in the source still runs (the worktree has the tables as of
+#    the lock), a writer waits for the create instead of deadlocking.
+ALTER SCHEMA g READ ONLY = 0;
+SET DEBUG_SYNC = 'wt_create_after_source_lock SIGNAL held WAIT_FOR go';
+CREATE WORKTREE d1 FROM g;
+SET DEBUG_SYNC = 'now WAIT_FOR held';
+CREATE TABLE g.n (id INT PRIMARY KEY);
+UPDATE g.t SET v = v + 10;
+SET DEBUG_SYNC = 'now SIGNAL go';
+SHOW TABLES FROM d1;
+Tables_in_d1
+t
+SELECT * FROM d1.t ORDER BY id;
+id	v
+1	1
+2	2
+SELECT * FROM g.t ORDER BY id;
+id	v
+1	11
+2	12
+SET DEBUG_SYNC = 'RESET';
+DROP DATABASE a1;
+DROP DATABASE a2;
+DROP DATABASE a3;
+DROP DATABASE b1;
+DROP DATABASE b2;
+DROP DATABASE b3;
+DROP DATABASE c1;
+DROP DATABASE d1;
+DROP DATABASE g;

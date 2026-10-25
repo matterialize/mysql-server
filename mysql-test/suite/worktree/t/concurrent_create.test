@@ -1,0 +1,158 @@
+--echo # Concurrent CREATE WORKTREE from one source: none deadlocks. Each create
+--echo # used to take S then IX on the source schema, so two creates holding S
+--echo # waited on each other's IX (ERROR 1213 for all but two of them).
+--source include/have_innodb_16k.inc
+
+CREATE DATABASE g;
+CREATE TABLE g.p (id INT PRIMARY KEY, v INT) ENGINE = InnoDB;
+CREATE TABLE g.c (id INT PRIMARY KEY, p_id INT, KEY (p_id),
+  FOREIGN KEY (p_id) REFERENCES g.p (id)) ENGINE = InnoDB;
+CREATE TABLE g.l (id INT PRIMARY KEY, b LONGBLOB) ENGINE = InnoDB;
+INSERT INTO g.p VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+INSERT INTO g.c VALUES (1, 1), (2, 2), (3, 4);
+INSERT INTO g.l VALUES (1, REPEAT('x', 100000));
+CREATE VIEW g.v AS SELECT SUM(v) AS s FROM g.p;
+delimiter |;
+CREATE PROCEDURE g.move(n INT)
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < n DO
+    START TRANSACTION;
+    UPDATE p SET v = v - 1 WHERE id = 1 + i % 4;
+    UPDATE p SET v = v + 1 WHERE id = 1 + (i + 1) % 4;
+    COMMIT;
+    SET i = i + 1;
+  END WHILE;
+END|
+delimiter ;|
+
+let $n = 8;
+let $i = 1;
+while ($i <= $n)
+{
+  connect (con$i, localhost, root,,);
+  inc $i;
+}
+
+--echo #
+--echo # 1. Read-only source: 8 creates at once all succeed.
+ALTER SCHEMA g READ ONLY = 1;
+--disable_query_log
+let $i = 1;
+while ($i <= $n)
+{
+  connection con$i;
+  send_eval CREATE WORKTREE ro$i FROM g;
+  inc $i;
+}
+let $i = 1;
+while ($i <= $n)
+{
+  connection con$i;
+  reap;
+  inc $i;
+}
+connection default;
+let $i = 1;
+while ($i <= $n)
+{
+  let $ok = `SELECT (SELECT s FROM ro$i.v) = 100 AND (SELECT COUNT(*) FROM ro$i.c) = 3
+    AND (SELECT LENGTH(b) FROM ro$i.l) = 100000`;
+  if (!$ok)
+  {
+    --die worktree ro$i differs from its source
+  }
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) AS read_only_worktrees FROM information_schema.schemata
+  WHERE schema_name LIKE 'ro%';
+INSERT INTO ro1.c VALUES (4, 3);
+--error ER_NO_REFERENCED_ROW_2
+INSERT INTO ro2.c VALUES (4, 9);
+SELECT (SELECT COUNT(*) FROM ro1.c), (SELECT COUNT(*) FROM ro2.c),
+  (SELECT COUNT(*) FROM g.c);
+
+--echo #
+--echo # 2. Writable source under writes: 8 creates at once all succeed, each
+--echo #    sees a committed state (the writer keeps SUM(v) at 100).
+ALTER SCHEMA g READ ONLY = 0;
+connect (writer, localhost, root,, g);
+send CALL move(3000);
+connection default;
+--disable_query_log
+let $i = 1;
+while ($i <= $n)
+{
+  connection con$i;
+  send_eval CREATE WORKTREE rw$i FROM g;
+  inc $i;
+}
+let $i = 1;
+while ($i <= $n)
+{
+  connection con$i;
+  reap;
+  inc $i;
+}
+connection writer;
+reap;
+connection default;
+let $i = 1;
+while ($i <= $n)
+{
+  let $ok = `SELECT (SELECT s FROM rw$i.v) = 100 AND (SELECT COUNT(*) FROM rw$i.c) = 3`;
+  if (!$ok)
+  {
+    --die worktree rw$i is not a committed state of its source
+  }
+  inc $i;
+}
+--enable_query_log
+SELECT COUNT(*) AS writable_source_worktrees FROM information_schema.schemata
+  WHERE schema_name LIKE 'rw%';
+SELECT s FROM g.v;
+CHECK TABLE rw1.p, rw1.c, rw1.l, rw8.p, rw8.c, rw8.l;
+
+--echo #
+--echo # 3. Mixed: creates from a worktree and from its source at once.
+--disable_query_log
+let $i = 1;
+while ($i <= 4)
+{
+  connection con$i;
+  send_eval CREATE WORKTREE mx$i FROM ro1;
+  inc $i;
+}
+while ($i <= $n)
+{
+  connection con$i;
+  send_eval CREATE WORKTREE mx$i FROM g;
+  inc $i;
+}
+let $i = 1;
+while ($i <= $n)
+{
+  connection con$i;
+  reap;
+  inc $i;
+}
+--enable_query_log
+connection default;
+SELECT COUNT(*) AS mixed_worktrees FROM information_schema.schemata
+  WHERE schema_name LIKE 'mx%';
+SELECT (SELECT COUNT(*) FROM mx1.c), (SELECT COUNT(*) FROM mx8.c);
+
+--disable_query_log
+let $i = 1;
+while ($i <= $n)
+{
+  disconnect con$i;
+  eval DROP DATABASE ro$i;
+  eval DROP DATABASE rw$i;
+  eval DROP DATABASE mx$i;
+  inc $i;
+}
+--enable_query_log
+disconnect writer;
+DROP DATABASE g;
