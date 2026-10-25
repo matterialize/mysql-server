@@ -105,6 +105,8 @@ ALTER SCHEMA golden READ ONLY = 1;
 
 Existing worktrees keep the data they were created with. New worktrees get the refreshed data. To move a worktree to the new data, drop it and create it again.
 
+In reflink mode, `READ ONLY = 1` after a refresh also rewrites, contiguously, any of golden's table files that the refresh fragmented. A refresh writes golden in place while worktrees share its blocks, and on APFS every later `CREATE WORKTREE` would pay for each fragment. The rewrite takes about as long as copying those files. Until the worktrees created before the refresh are dropped, the rewritten files no longer share blocks with them, so they take that much extra disk. A file is skipped (with a note in the error log) when the disk lacks room for it.
+
 If you'd rather build each refresh off to the side, make it a worktree. Run `CREATE WORKTREE golden_v2 FROM golden`, load into `golden_v2`, set it `READ ONLY = 1`, point new worktrees at it, then drop the old golden. A read-only schema can't be dropped, so run `ALTER SCHEMA golden READ ONLY = 0` before `DROP DATABASE golden`. Old worktrees keep working after their source is dropped.
 
 **What a worktree copies:** every table (with its data, indexes, `AUTO_INCREMENT`, foreign keys, FULLTEXT indexes, encrypted and `ROW_FORMAT=COMPRESSED` tables, partitions), plus views, stored procedures and functions, triggers and events. Inside copied objects, references to `golden.x` are rewritten to the worktree when the worktree has `x`. Copied events start `DISABLED`. Grants are not copied, because they are per schema. Grant access to `agent_%` patterns if you want one grant to cover every worktree.
