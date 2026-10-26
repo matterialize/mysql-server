@@ -236,10 +236,11 @@ SET SESSION cte_max_recursion_depth = 100000;
 INSERT INTO src.s9 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 3000)
   SELECT n, 'pre' FROM s;
 SET GLOBAL innodb_buf_flush_list_now = ON;
+# The page cleaner's batches reuse the doublewrite area holding that copy.
+SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 let WT_S = `SELECT SPACE FROM INFORMATION_SCHEMA.INNODB_TABLESPACES WHERE NAME = 'src/s9'`;
 SET GLOBAL innodb_checkpoint_disabled = ON;
 CREATE WORKTREE w7b FROM src;
-SET GLOBAL innodb_page_cleaner_disabled_debug = ON;
 --source include/kill_mysqld.inc
 perl;
   require $ENV{WT_PAGES};

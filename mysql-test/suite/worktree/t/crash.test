@@ -36,6 +36,11 @@ if ($overlay)
 --echo # Each one must leave no schema, directory, InnoDB table or object behind.
 --disable_query_log
 --disable_result_log
+# A fresh server: a reflink probe that succeeded earlier (another test on
+# this server) is not run again, so its crash point would not be reached.
+--source include/restart_mysqld.inc
+--disable_query_log
+--disable_result_log
 let $n_points = 0;
 while ($points)
 {
